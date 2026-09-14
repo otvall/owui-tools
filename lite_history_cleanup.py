@@ -1,7 +1,7 @@
 """
 title: Lite History Cleanup
-description: Keeps conversation text and removes historical native Tool messages from Router context.
-version: 0.16.0
+description: Keeps conversation text and removes historical native Tool messages from model context.
+version: 0.16.1
 required_open_webui_version: 0.11.1
 """
 
@@ -49,7 +49,7 @@ class Filter:
     class Valves(BaseModel):
         priority: int = Field(
             default=-80,
-            description="Run after Lite Previous Tool Context.",
+            description="In the Router chain, run after Lite Previous Tool Context.",
         )
         debug: bool = Field(default=False, description="Enable debug logs.")
 
@@ -61,13 +61,9 @@ class Filter:
             log.warning("[LITE_HISTORY_CLEANUP] " + message, *args)
 
     async def inlet(self, body: dict) -> dict:
-        metadata = body.get("metadata")
-        if not isinstance(metadata, dict) or not metadata.get(
-            "lite_previous_tool_context_applied"
-        ):
-            raise ValueError(
-                "Lite History Cleanup requires Lite Previous Tool Context earlier in the filter chain"
-            )
+        metadata = body.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            raise TypeError("Lite History Cleanup metadata must be an object")
         messages = body.get("messages")
         if not isinstance(messages, list):
             raise TypeError("Lite History Cleanup messages must be a list")
@@ -82,7 +78,6 @@ class Filter:
             and not is_tool_image_message(message)
         ]
         body["messages"] = [*historical_text, *messages[current_start:]]
-        metadata["lite_router_user_index"] = len(historical_text)
         metadata[APPLIED_KEY] = True
         self._debug(
             "messages before=%s after=%s current_user=%s",

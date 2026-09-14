@@ -226,6 +226,35 @@ class SkillPromptFilterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(prompts), 1)
 
 
+class StandaloneHistoryCleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runs_without_other_router_filters(self):
+        body = {
+            "messages": previous_turn()
+            + [
+                {"role": "user", "content": "Current question"},
+                assistant(call("current", "current_tool")),
+                result("current", "CURRENT_RESULT"),
+            ]
+        }
+
+        await cleanup_filter.Filter().inlet(body)
+
+        self.assertTrue(body["metadata"]["lite_history_cleanup_applied"])
+        self.assertIn(
+            "Found documents: first, second.",
+            [message.get("content") for message in body["messages"]],
+        )
+        self.assertEqual(
+            [
+                message["tool_call_id"]
+                for message in body["messages"]
+                if message.get("role") == "tool"
+            ],
+            ["current"],
+        )
+        self.assertNotIn("TOOL_RESULT_42", json.dumps(body["messages"]))
+
+
 class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.metadata = registry_metadata()
