@@ -166,6 +166,33 @@ class PreviousToolContextTests(unittest.TestCase):
         self.assertEqual(len(self.record(messages)["tool_exchanges"]), 3)
 
 
+class StandalonePreviousToolContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_runs_without_registry_and_works_with_cleanup(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "Find a document"},
+                assistant(call("lookup", "search", query="report")),
+                result("lookup", "DOCUMENT_42"),
+                {"role": "assistant", "content": "Document found"},
+                {"role": "user", "content": "Open it"},
+            ]
+        }
+
+        await previous_filter.Filter().inlet(body)
+
+        record = unpack_record(body["messages"])
+        self.assertEqual(len(record["tool_exchanges"]), 1)
+        self.assertEqual(record["tool_exchanges"][0]["executor"], {"kind": "model"})
+        self.assertTrue(body["metadata"]["lite_previous_tool_context_applied"])
+        self.assertNotIn("lite_unfiltered_messages", body["metadata"])
+
+        await cleanup_filter.Filter().inlet(body)
+        self.assertIsNotNone(unpack_record(body["messages"]))
+        self.assertFalse(
+            any(message.get("role") == "tool" for message in body["messages"])
+        )
+
+
 class SkillPromptFilterTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         skills_api.get_skill_by_id = AsyncMock(

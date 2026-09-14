@@ -1,7 +1,7 @@
 """
 title: Lite Previous Tool Context
-description: Adds the previous request's completed Tool calls to Router context as reference data.
-version: 0.16.0
+description: Adds the previous request's completed Tool calls to any model context as reference data.
+version: 0.16.2
 required_open_webui_version: 0.11.1
 """
 
@@ -105,7 +105,11 @@ def last_user_index(messages: list[dict]) -> int:
 
 
 def context_message(
-    messages: list[dict], *, user_index: int, registry: dict[str, AgentSpec]
+    messages: list[dict],
+    *,
+    user_index: int,
+    registry: dict[str, AgentSpec],
+    root_executor_kind: str = "orchestrator",
 ) -> dict | None:
     if user_index < 0:
         return None
@@ -115,7 +119,7 @@ def context_message(
     previous = messages[previous_user:user_index]
     calls = {}
     exchanges = []
-    executor = {"kind": "orchestrator"}
+    executor = {"kind": root_executor_kind}
     for message in previous:
         if message.get("role") == "assistant":
             for call in message.get("tool_calls") or []:
@@ -162,7 +166,7 @@ class Filter:
     class Valves(BaseModel):
         priority: int = Field(
             default=-90,
-            description="Run after Lite Subagent Registry and before history cleanup.",
+            description="In the Router chain, run after Registry and before cleanup.",
         )
         enabled: bool = Field(
             default=True,
@@ -178,11 +182,9 @@ class Filter:
             log.warning("[LITE_PREVIOUS_TOOLS] " + message, *args)
 
     async def inlet(self, body: dict) -> dict:
-        metadata = body.get("metadata")
-        if not isinstance(metadata, dict) or not metadata.get("lite_registry_applied"):
-            raise ValueError(
-                "Lite Previous Tool Context requires Lite Subagent Registry earlier in the filter chain"
-            )
+        metadata = body.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            raise TypeError("Lite Previous Tool Context metadata must be an object")
         messages = body.get("messages")
         if not isinstance(messages, list):
             raise TypeError("Lite Previous Tool Context messages must be a list")
@@ -202,13 +204,16 @@ class Filter:
         # History Cleanup removes native historical Tool messages from the
         # orchestrator request. Keep a request-scoped copy so the Router can
         # still select native history for the chosen subagent.
-        metadata[RAW_MESSAGES_KEY] = copy.deepcopy(messages)
+        is_router_request = bool(metadata.get("lite_registry_applied"))
+        if is_router_request:
+            metadata[RAW_MESSAGES_KEY] = copy.deepcopy(messages)
         current_user = last_user_index(messages)
         context = (
             context_message(
                 messages,
                 user_index=current_user,
                 registry=agent_registry(metadata),
+                root_executor_kind="orchestrator" if is_router_request else "model",
             )
             if self.valves.enabled
             else None
