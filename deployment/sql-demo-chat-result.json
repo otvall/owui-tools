@@ -1,0 +1,168 @@
+{
+  "id": "73a0038f-8482-4c92-92d4-0475da5925fa",
+  "user_id": "0b25fd69-2bf4-436b-99ca-863e5766c263",
+  "title": "Покажи пример цепочки SQL → визуализация на демонстрационных данных.\n1. Вызови get_demo_sql_data ровно один раз: это реальный SELECT по отдельной SQLite-базе с вымышленными продажами.\n2. Передай все полученные rows без изменения чисел в plot_sql_chart: rows_json — JSON-массив строк, x_column=\"day\", y_columns=[\"online\",\"stores\",\"partners\"], title=\"Продажи по каналам (демо)\", y_label=\"Выручка (тыс. руб.)\". На одном графике нужны три кривые.\n3. После вызова кратко объясни по-русски: данные демонстрационные, каждый элемент y_columns даёт отдельную кривую; названия в легенде скрывают и показывают кривые без повторного SQL или запроса к модели, а таблица под графиком показывает исходные строки. Не выводи HTML и не создавай другой график. Не вызывай другие инструменты.",
+  "chat": {
+    "title": "Покажи пример цепочки SQL → визуализация на демонстрационных данных.\n1. Вызови get_demo_sql_data ровно один раз: это реальный SELECT по отдельной SQLite-базе с вымышленными продажами.\n2. Передай все полученные rows без изменения чисел в plot_sql_chart: rows_json — JSON-массив строк, x_column=\"day\", y_columns=[\"online\",\"stores\",\"partners\"], title=\"Продажи по каналам (демо)\", y_label=\"Выручка (тыс. руб.)\". На одном графике нужны три кривые.\n3. После вызова кратко объясни по-русски: данные демонстрационные, каждый элемент y_columns даёт отдельную кривую; названия в легенде скрывают и показывают кривые без повторного SQL или запроса к модели, а таблица под графиком показывает исходные строки. Не выводи HTML и не создавай другой график. Не вызывай другие инструменты.",
+    "models": [
+      "openai/gpt-4.1-mini"
+    ],
+    "params": {
+      "function_calling": "native",
+      "max_tokens": 2000
+    },
+    "toolIds": [
+      "sql_charts_demo"
+    ],
+    "history": {
+      "currentId": "34630c7d-65f7-4e7f-90a0-c63c20e4eb9d",
+      "messages": {
+        "4e445f5f-0aae-4e11-9a93-0e8fa8991c9f": {
+          "id": "4e445f5f-0aae-4e11-9a93-0e8fa8991c9f",
+          "parentId": null,
+          "childrenIds": [
+            "34630c7d-65f7-4e7f-90a0-c63c20e4eb9d"
+          ],
+          "role": "user",
+          "content": "Покажи пример цепочки SQL → визуализация на демонстрационных данных.\n1. Вызови get_demo_sql_data ровно один раз: это реальный SELECT по отдельной SQLite-базе с вымышленными продажами.\n2. Передай все полученные rows без изменения чисел в plot_sql_chart: rows_json — JSON-массив строк, x_column=\"day\", y_columns=[\"online\",\"stores\",\"partners\"], title=\"Продажи по каналам (демо)\", y_label=\"Выручка (тыс. руб.)\". На одном графике нужны три кривые.\n3. После вызова кратко объясни по-русски: данные демонстрационные, каждый элемент y_columns даёт отдельную кривую; названия в легенде скрывают и показывают кривые без повторного SQL или запроса к модели, а таблица под графиком показывает исходные строки. Не выводи HTML и не создавай другой график. Не вызывай другие инструменты.",
+          "timestamp": 1788968658,
+          "models": [
+            "openai/gpt-4.1-mini"
+          ]
+        },
+        "34630c7d-65f7-4e7f-90a0-c63c20e4eb9d": {
+          "id": "34630c7d-65f7-4e7f-90a0-c63c20e4eb9d",
+          "parentId": "4e445f5f-0aae-4e11-9a93-0e8fa8991c9f",
+          "childrenIds": [],
+          "role": "assistant",
+          "content": "Данные на графике демонстрационные. Каждый элемент из массива y_columns (online, stores, partners) даёт отдельную кривую на одном графике. Легенда позволяет скрывать и показывать нужные кривые без повторного запроса к базе или к модели. Под графиком доступна таблица с исходными строками запросa, в каждой строке — выручка по каналам за конкретный день.",
+          "timestamp": 1788968658,
+          "model": "openai/gpt-4.1-mini",
+          "done": true,
+          "output": [
+            {
+              "type": "function_call",
+              "id": "call_uU9xtlXJvnNujXcYczyfhm4c",
+              "call_id": "call_uU9xtlXJvnNujXcYczyfhm4c",
+              "name": "get_demo_sql_data",
+              "arguments": "{}",
+              "status": "completed"
+            },
+            {
+              "type": "function_call_output",
+              "id": "fco_fabf9aa5bc05493791e2c0e4",
+              "call_id": "call_uU9xtlXJvnNujXcYczyfhm4c",
+              "output": [
+                {
+                  "type": "input_text",
+                  "text": "{\n  \"source\": \"Fictional in-memory SQLite demo, not production data\",\n  \"sql\": \"SELECT day,\\n  SUM(CASE WHEN channel = 'Онлайн' THEN revenue ELSE 0 END) AS online,\\n  SUM(CASE WHEN channel = 'Магазины' THEN revenue ELSE 0 END) AS stores,\\n  SUM(CASE WHEN channel = 'Партнёры' THEN revenue ELSE 0 END) AS partners\\nFROM sales GROUP BY day ORDER BY day\",\n  \"rows\": [\n    {\n      \"day\": \"2026-09-01\",\n      \"online\": 120.0,\n      \"stores\": 95.0,\n      \"partners\": 55.0\n    },\n    {\n      \"day\": \"2026-09-02\",\n      \"online\": 145.0,\n      \"stores\": 102.0,\n      \"partners\": 70.0\n    },\n    {\n      \"day\": \"2026-09-03\",\n      \"online\": 132.0,\n      \"stores\": 118.0,\n      \"partners\": 62.0\n    },\n    {\n      \"day\": \"2026-09-04\",\n      \"online\": 178.0,\n      \"stores\": 110.0,\n      \"partners\": 88.0\n    },\n    {\n      \"day\": \"2026-09-05\",\n      \"online\": 165.0,\n      \"stores\": 138.0,\n      \"partners\": 94.0\n    },\n    {\n      \"day\": \"2026-09-06\",\n      \"online\": 210.0,\n      \"stores\": 152.0,\n      \"partners\": 105.0\n    },\n    {\n      \"day\": \"2026-09-07\",\n      \"online\": 235.0,\n      \"stores\": 160.0,\n      \"partners\": 128.0\n    }\n  ],\n  \"x_column\": \"day\",\n  \"y_columns\": [\n    \"online\",\n    \"stores\",\n    \"partners\"\n  ],\n  \"y_label\": \"Выручка, тыс. ₽\"\n}"
+                }
+              ],
+              "status": "completed"
+            },
+            {
+              "type": "function_call",
+              "id": "call_DfCsbSTWtTs1Az5HVREFkOnH",
+              "call_id": "call_DfCsbSTWtTs1Az5HVREFkOnH",
+              "name": "plot_sql_chart",
+              "arguments": "{\"rows_json\": \"[{\\\"day\\\":\\\"2026-09-01\\\",\\\"online\\\":120,\\\"stores\\\":95,\\\"partners\\\":55},{\\\"day\\\":\\\"2026-09-02\\\",\\\"online\\\":145,\\\"stores\\\":102,\\\"partners\\\":70},{\\\"day\\\":\\\"2026-09-03\\\",\\\"online\\\":132,\\\"stores\\\":118,\\\"partners\\\":62},{\\\"day\\\":\\\"2026-09-04\\\",\\\"online\\\":178,\\\"stores\\\":110,\\\"partners\\\":88},{\\\"day\\\":\\\"2026-09-05\\\",\\\"online\\\":165,\\\"stores\\\":138,\\\"partners\\\":94},{\\\"day\\\":\\\"2026-09-06\\\",\\\"online\\\":210,\\\"stores\\\":152,\\\"partners\\\":105},{\\\"day\\\":\\\"2026-09-07\\\",\\\"online\\\":235,\\\"stores\\\":160,\\\"partners\\\":128}]\", \"x_column\": \"day\", \"y_columns\": [\"online\", \"stores\", \"partners\"], \"title\": \"\\u041f\\u0440\\u043e\\u0434\\u0430\\u0436\\u0438 \\u043f\\u043e \\u043a\\u0430\\u043d\\u0430\\u043b\\u0430\\u043c (\\u0434\\u0435\\u043c\\u043e)\", \"y_label\": \"\\u0412\\u044b\\u0440\\u0443\\u0447\\u043a\\u0430 (\\u0442\\u044b\\u0441. \\u0440\\u0443\\u0431.)\"}",
+              "status": "completed"
+            },
+            {
+              "type": "function_call_output",
+              "id": "fco_57723e22f40f4183b854c6bf",
+              "call_id": "call_DfCsbSTWtTs1Az5HVREFkOnH",
+              "output": [
+                {
+                  "type": "input_text",
+                  "text": "{\n  \"status\": \"success\",\n  \"code\": \"ui_component\",\n  \"message\": \"plot_sql_chart: Embedded UI result is active and visible to the user.\"\n}"
+                }
+              ],
+              "status": "completed",
+              "embeds": [
+                "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>SQL → интерактивный график</title>\n<style>\n*{box-sizing:border-box}body{margin:0;padding:8px;background:transparent;font:14px/1.5 system-ui;color:#e7efff}\nmain{padding:22px;border:1px solid #33445e;border-radius:22px;background:#111d30;max-width:950px;margin:auto}\n.eyebrow{font-size:11px;letter-spacing:.13em;color:#8de4cc}h1{margin:8px 0 4px;font-size:23px;line-height:1.25}\n.muted{color:#a9bbd5;font-size:12px}#legend{display:flex;flex-wrap:wrap;gap:8px;margin:18px 0 8px}\nbutton{color:#e7efff;background:#1c2c45;border:1px solid #465a79;padding:8px 12px;border-radius:10px;cursor:pointer;font:inherit}\nbutton[aria-pressed=false]{opacity:.45;text-decoration:line-through}button:focus-visible{outline:2px solid white}\n.dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:8px}\nsvg{display:block;width:100%;height:auto;overflow:visible}svg text{fill:#a9bbd5;font:12px system-ui}\nsvg .point{cursor:crosshair}svg .point:focus{outline:none;stroke:white;stroke-width:4}\n#tooltip{min-height:26px;padding:6px 0;color:#d7e5fa}#status{margin-top:6px}\ndetails{margin-top:12px;border-top:1px solid #33445e;padding-top:10px}summary{cursor:pointer;color:#a9bbd5}\n.table-wrap{max-height:220px;overflow:auto}table{width:100%;border-collapse:collapse;font-size:12px}\nth,td{text-align:right;white-space:nowrap;padding:8px;border-bottom:1px solid #2b3d58}th:first-child,td:first-child{text-align:left}\n@media(max-width:460px){main{padding:14px}h1{font-size:19px}}\n</style></head><body><main id=\"card\">\n<div class=\"eyebrow\">SQL → ДАННЫЕ → RICH UI</div><h1 id=\"title\"></h1>\n<div class=\"muted\" id=\"subtitle\"></div><div id=\"legend\" aria-label=\"Видимость кривых\"></div>\n<svg id=\"chart\" viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Линейный график с общей шкалой\"></svg>\n<div id=\"tooltip\" role=\"status\" aria-live=\"polite\">Наведите на точку, чтобы увидеть значения.</div>\n<div class=\"muted\" id=\"status\" aria-live=\"polite\"></div>\n<details><summary>Исходные данные SQL</summary><div class=\"table-wrap\"><table id=\"table\"></table></div></details>\n<div class=\"muted\" style=\"margin-top:12px\">Общая шкала Y фиксирована · легенда скрывает кривые · null = разрыв линии</div>\n</main><script id=\"chart-data\" type=\"application/json\">{\"title\": \"\\u041f\\u0440\\u043e\\u0434\\u0430\\u0436\\u0438 \\u043f\\u043e \\u043a\\u0430\\u043d\\u0430\\u043b\\u0430\\u043c (\\u0434\\u0435\\u043c\\u043e)\", \"yLabel\": \"\\u0412\\u044b\\u0440\\u0443\\u0447\\u043a\\u0430 (\\u0442\\u044b\\u0441. \\u0440\\u0443\\u0431.)\", \"labels\": [\"2026-09-01\", \"2026-09-02\", \"2026-09-03\", \"2026-09-04\", \"2026-09-05\", \"2026-09-06\", \"2026-09-07\"], \"series\": [{\"name\": \"online\", \"values\": [120, 145, 132, 178, 165, 210, 235]}, {\"name\": \"stores\", \"values\": [95, 102, 118, 110, 138, 152, 160]}, {\"name\": \"partners\", \"values\": [55, 70, 62, 88, 94, 105, 128]}]}</script>\n<script>\n(() => {\nconst d=JSON.parse(document.getElementById('chart-data').textContent), $=id=>document.getElementById(id);\nconst colors=['#82a6ff','#72e3c0','#ffbe77','#e794ee','#fff18c','#79daee','#fb8f9d','#c1b8ff'];\nconst visible=d.series.map(()=>true), names={online:'Онлайн',stores:'Магазины',partners:'Партнёры'};\nconst label=s=>names[s.name]||s.name, fmt=v=>v===null?'нет данных':Number(v).toLocaleString('ru-RU',{maximumFractionDigits:3});\nconst all=d.series.flatMap(s=>s.values.filter(v=>v!==null));\nlet low=Math.min(0,...all), high=Math.max(0,...all); if(low===high){high=low+1;}\nconst pad=(high-low)*.1; high+=pad;if(low<0)low-=pad;\nconst X=i=>60+(d.labels.length===1?305:i/(d.labels.length-1)*610),Y=v=>245-(v-low)/(high-low)*205;\nfunction node(tag,attrs={},text){const e=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const[k,v]of Object.entries(attrs))e.setAttribute(k,v);if(text!==undefined)e.textContent=text;return e;}\nfunction height(){parent.postMessage({type:'iframe:height',height:Math.ceil($('card').getBoundingClientRect().height+16)},'*');}\nfunction tip(i){$('tooltip').textContent=d.labels[i]+'  ·  '+d.series.filter((s,j)=>visible[j]).map(s=>label(s)+': '+fmt(s.values[i])).join('  ·  ');}\nfunction draw(){\n const svg=$('chart');svg.replaceChildren();\n svg.append(node('text',{x:60,y:18},d.yLabel));\n for(let i=0;i<=4;i++){const v=low+(high-low)*i/4,y=Y(v);svg.append(node('line',{x1:60,y1:y,x2:670,y2:y,stroke:'#30435d','stroke-dasharray':'3 4'}),node('text',{x:50,y:y+4,'text-anchor':'end'},fmt(v)));}\n const step=Math.max(1,Math.ceil(d.labels.length/7));\n d.labels.forEach((v,i)=>{if(i%step===0||i===d.labels.length-1)svg.append(node('text',{x:X(i),y:274,'text-anchor':'middle'},v));});\n d.series.forEach((s,j)=>{if(!visible[j])return;let path='',fresh=true;\n s.values.forEach((v,i)=>{if(v===null){fresh=true;return;}path+=(fresh?'M':'L')+X(i)+','+Y(v)+' ';fresh=false;});\n svg.append(node('path',{d:path,fill:'none',stroke:colors[j],'stroke-width':3,'stroke-linejoin':'round','data-series':s.name}));\n s.values.forEach((v,i)=>{if(v===null)return;const p=node('circle',{cx:X(i),cy:Y(v),r:4.5,fill:colors[j],class:'point',tabindex:0,'aria-label':d.labels[i]+' '+label(s)+' '+fmt(v)});p.append(node('title',{},d.labels[i]+' · '+label(s)+': '+fmt(v)));p.addEventListener('mouseenter',()=>tip(i));p.addEventListener('focus',()=>tip(i));svg.append(p);});\n });\n $('status').textContent='Показано кривых: '+visible.filter(Boolean).length+' из '+d.series.length+' · '+d.labels.length+' точек в каждом ряду';\n if(!visible.some(Boolean))$('tooltip').textContent='Все кривые скрыты. Нажмите название в легенде.';\n requestAnimationFrame(height);\n}\n$('title').textContent=d.title;$('subtitle').textContent='Ось X: упорядоченные категории · '+d.yLabel;\nd.series.forEach((s,j)=>{const b=document.createElement('button');b.type='button';b.setAttribute('aria-pressed','true');b.setAttribute('aria-label',label(s));const dot=document.createElement('span');dot.className='dot';dot.style.background=colors[j];b.append(dot,document.createTextNode(label(s)));b.addEventListener('click',()=>{visible[j]=!visible[j];b.setAttribute('aria-pressed',String(visible[j]));$('tooltip').textContent=label(s)+(visible[j]?' — показана':' — скрыта');draw();});$('legend').append(b);});\nconst head=document.createElement('tr');['Дата / X',...d.series.map(label)].forEach(v=>{const c=document.createElement('th');c.textContent=v;head.append(c);});$('table').append(head);\nd.labels.forEach((v,i)=>{const row=document.createElement('tr');[v,...d.series.map(s=>fmt(s.values[i]))].forEach(v=>{const c=document.createElement('td');c.textContent=v;row.append(c);});$('table').append(row);});\nnew ResizeObserver(height).observe($('card'));window.addEventListener('load',height);draw();\n})();\n</script></body></html>"
+              ]
+            },
+            {
+              "type": "message",
+              "id": "msg_ba761d6afcbf4ad3a5f65440",
+              "status": "completed",
+              "role": "assistant",
+              "content": [
+                {
+                  "type": "output_text",
+                  "text": "Данные на графике демонстрационные. Каждый элемент из массива y_columns (online, stores, partners) даёт отдельную кривую на одном графике. Легенда позволяет скрывать и показывать нужные кривые без повторного запроса к базе или к модели. Под графиком доступна таблица с исходными строками запросa, в каждой строке — выручка по каналам за конкретный день."
+                }
+              ]
+            }
+          ],
+          "usage": {
+            "prompt_tokens": 1324,
+            "completion_tokens": 92,
+            "total_tokens": 3110,
+            "cost": 0.0016232,
+            "is_byok": false,
+            "prompt_tokens_details": {
+              "cached_tokens": 0,
+              "cache_write_tokens": 0,
+              "audio_tokens": 0,
+              "video_tokens": 0
+            },
+            "cost_details": {
+              "upstream_inference_cost": 0.0006768,
+              "upstream_inference_prompt_cost": 0.0005296,
+              "upstream_inference_completions_cost": 0.0001472
+            },
+            "completion_tokens_details": {
+              "reasoning_tokens": 0,
+              "image_tokens": 0,
+              "audio_tokens": 0
+            },
+            "input_tokens": 2794,
+            "output_tokens": 316
+          }
+        }
+      }
+    },
+    "messages": [
+      {
+        "id": "4e445f5f-0aae-4e11-9a93-0e8fa8991c9f",
+        "parentId": null,
+        "childrenIds": [
+          "34630c7d-65f7-4e7f-90a0-c63c20e4eb9d"
+        ],
+        "role": "user",
+        "content": "Покажи пример цепочки SQL → визуализация на демонстрационных данных.\n1. Вызови get_demo_sql_data ровно один раз: это реальный SELECT по отдельной SQLite-базе с вымышленными продажами.\n2. Передай все полученные rows без изменения чисел в plot_sql_chart: rows_json — JSON-массив строк, x_column=\"day\", y_columns=[\"online\",\"stores\",\"partners\"], title=\"Продажи по каналам (демо)\", y_label=\"Выручка (тыс. руб.)\". На одном графике нужны три кривые.\n3. После вызова кратко объясни по-русски: данные демонстрационные, каждый элемент y_columns даёт отдельную кривую; названия в легенде скрывают и показывают кривые без повторного SQL или запроса к модели, а таблица под графиком показывает исходные строки. Не выводи HTML и не создавай другой график. Не вызывай другие инструменты.",
+        "timestamp": 1788968658,
+        "models": [
+          "openai/gpt-4.1-mini"
+        ]
+      },
+      {
+        "id": "34630c7d-65f7-4e7f-90a0-c63c20e4eb9d",
+        "parentId": "4e445f5f-0aae-4e11-9a93-0e8fa8991c9f",
+        "childrenIds": [],
+        "role": "assistant",
+        "content": "",
+        "timestamp": 1788968658,
+        "model": "openai/gpt-4.1-mini",
+        "done": false
+      }
+    ],
+    "tags": [],
+    "files": [],
+    "timestamp": 1788968658000
+  },
+  "updated_at": 1788968665,
+  "created_at": 1788968658,
+  "share_id": null,
+  "archived": false,
+  "pinned": false,
+  "meta": {},
+  "variables": {},
+  "folder_id": null,
+  "tasks": null,
+  "summary": null,
+  "current_message_id": "34630c7d-65f7-4e7f-90a0-c63c20e4eb9d",
+  "context_usage": null
+}

@@ -1,0 +1,107 @@
+{
+  "source_url": "https://github.com/open-webui/open-webui/blob/v0.11.1/backend/open_webui/utils/misc.py",
+  "output": [
+    {
+      "type": "function_call",
+      "call_id": "route",
+      "name": "view_skill",
+      "arguments": "{\"id\": \"route-a\"}",
+      "status": "completed"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "route",
+      "output": [
+        {
+          "type": "input_text",
+          "text": "routing instructions"
+        }
+      ]
+    },
+    {
+      "type": "function_call",
+      "call_id": "delegate",
+      "name": "lite_delegate",
+      "arguments": "{\"agent_id\": \"agent-a\"}",
+      "status": "completed"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "delegate",
+      "output": [
+        {
+          "type": "input_text",
+          "text": "{\"__lite_delegate__\": \"v2\", \"agent_id\": \"agent-a\"}"
+        }
+      ]
+    },
+    {
+      "type": "function_call",
+      "call_id": "lookup",
+      "name": "lookup",
+      "arguments": "{}",
+      "status": "completed"
+    },
+    {
+      "type": "function_call_output",
+      "call_id": "lookup",
+      "output": [
+        {
+          "type": "input_text",
+          "text": "TOOL_RESULT_42"
+        }
+      ]
+    }
+  ],
+  "messages": [
+    {
+      "role": "user",
+      "content": "Find the answer"
+    },
+    {
+      "role": "assistant",
+      "content": "",
+      "tool_calls": [
+        {
+          "id": "route",
+          "type": "function",
+          "function": {
+            "name": "view_skill",
+            "arguments": "{\"id\": \"route-a\"}"
+          }
+        },
+        {
+          "id": "delegate",
+          "type": "function",
+          "function": {
+            "name": "lite_delegate",
+            "arguments": "{\"agent_id\": \"agent-a\"}"
+          }
+        },
+        {
+          "id": "lookup",
+          "type": "function",
+          "function": {
+            "name": "lookup",
+            "arguments": "{}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "route",
+      "content": "routing instructions"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "delegate",
+      "content": "{\"__lite_delegate__\": \"v2\", \"agent_id\": \"agent-a\"}"
+    },
+    {
+      "role": "tool",
+      "tool_call_id": "lookup",
+      "content": "TOOL_RESULT_42"
+    }
+  ]
+}

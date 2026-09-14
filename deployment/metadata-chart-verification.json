@@ -1,0 +1,150 @@
+[
+  {
+    "title": "Metadata: SQL -> график",
+    "chat_id": "b8a705aa-5fdf-4f5c-9d74-9a3d866315b0",
+    "message_id": "ebb27bb5-c3c6-4c35-ba10-b0ae8f0995eb",
+    "url": "http://localhost:3000/c/b8a705aa-5fdf-4f5c-9d74-9a3d866315b0",
+    "calls": [
+      {
+        "type": "function_call",
+        "id": "call_vt5PQE6xOcNoBxJGcoLyefAd",
+        "call_id": "call_vt5PQE6xOcNoBxJGcoLyefAd",
+        "name": "load_demo_sql_metadata",
+        "arguments": "{\"scenario\": \"valid\"}",
+        "status": "completed"
+      },
+      {
+        "type": "function_call",
+        "id": "call_QLK6tTcxAaj0QxvLQC4fiEyZ",
+        "call_id": "call_QLK6tTcxAaj0QxvLQC4fiEyZ",
+        "name": "plot_metadata_chart",
+        "arguments": "{\"dataset_id\": \"ds_ad041d48f8264e28\", \"x_column\": \"day\", \"y_columns\": [\"online\", \"stores\", \"partners\"]}",
+        "status": "completed"
+      }
+    ],
+    "outputs": [
+      {
+        "type": "function_call_output",
+        "id": "fco_a38edbdf5dd94536af5fdae3",
+        "call_id": "call_vt5PQE6xOcNoBxJGcoLyefAd",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "{\n  \"status\": \"ready\",\n  \"dataset_id\": \"ds_ad041d48f8264e28\",\n  \"row_count\": 7,\n  \"columns\": [\n    {\n      \"name\": \"day\",\n      \"type\": \"date\"\n    },\n    {\n      \"name\": \"online\",\n      \"type\": \"number\",\n      \"unit\": \"тыс. руб.\"\n    },\n    {\n      \"name\": \"stores\",\n      \"type\": \"number\",\n      \"unit\": \"тыс. руб.\"\n    },\n    {\n      \"name\": \"partners\",\n      \"type\": \"number\",\n      \"unit\": \"тыс. руб.\"\n    }\n  ],\n  \"is_demo\": true,\n  \"scope\": \"current_request_only\",\n  \"next_action\": \"Call plot_metadata_chart sequentially in this same request. Do not pass rows.\"\n}"
+          }
+        ],
+        "status": "completed"
+      },
+      {
+        "type": "function_call_output",
+        "id": "fco_29017460e53e41bc8ea1e0f4",
+        "call_id": "call_QLK6tTcxAaj0QxvLQC4fiEyZ",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "{\n  \"status\": \"success\",\n  \"code\": \"CHART_READY\",\n  \"dataset_id\": \"ds_ad041d48f8264e28\",\n  \"row_count\": 7,\n  \"series_count\": 3,\n  \"message\": \"The complete interactive chart has ALREADY been embedded by this tool. You have NOT received the raw SQL rows. Do not generate HTML, code, charts, sample values or guessed numbers. No extra text is needed; if a text response is required, say only Готово. For an explicit error-recovery test, you may briefly name the previous error code.\",\n  \"browser_render_verified\": false\n}"
+          }
+        ],
+        "status": "completed",
+        "embeds": [
+          "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>SQL → интерактивный график</title>\n<style>\n*{box-sizing:border-box}body{margin:0;padding:8px;background:#fff;font:13px/1.5 system-ui;color:#374151}\nmain{padding:12px;background:#fff;max-width:950px;margin:auto}\n#legend{display:flex;justify-content:center;flex-wrap:wrap;gap:8px;margin:0 0 8px}\nbutton{color:#374151;background:transparent;border:0;padding:5px 10px;cursor:pointer;font:inherit}\nbutton[aria-pressed=false]{opacity:.35;text-decoration:line-through}button:focus-visible{outline:2px solid #2563eb}\n.dot{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:7px}\nsvg{display:block;width:100%;height:auto;overflow:visible}svg text{fill:#6b7280;font:12px system-ui}\nsvg .point{cursor:crosshair}svg .point:focus{outline:none;stroke:#111827;stroke-width:3}\n</style></head><body><main id=\"card\">\n<div id=\"legend\" aria-label=\"Видимость кривых\"></div>\n<svg id=\"chart\" viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Линейный график с общей шкалой\"></svg>\n</main><script id=\"chart-data\" type=\"application/json\">{\"title\": \"\\u0413\\u0440\\u0430\\u0444\\u0438\\u043a\", \"yLabel\": \"\\u0442\\u044b\\u0441. \\u0440\\u0443\\u0431.\", \"labels\": [\"2026-09-01\", \"2026-09-02\", \"2026-09-03\", \"2026-09-04\", \"2026-09-05\", \"2026-09-06\", \"2026-09-07\"], \"positions\": [739860, 739861, 739862, 739863, 739864, 739865, 739866], \"series\": [{\"name\": \"online\", \"values\": [120.0, 145.0, 132.0, 178.0, 165.0, 210.0, 235.0]}, {\"name\": \"stores\", \"values\": [95.0, 102.0, 118.0, 110.0, 138.0, 152.0, 160.0]}, {\"name\": \"partners\", \"values\": [55.0, 70.0, 62.0, 88.0, 94.0, 105.0, 128.0]}]}</script>\n<script>\n(() => {\nconst d=JSON.parse(document.getElementById('chart-data').textContent), $=id=>document.getElementById(id);\nconst colors=['#2563eb','#059669','#d97706','#9333ea','#be123c','#0891b2','#4f46e5','#525252'];\nconst visible=d.series.map(()=>true), names={online:'Онлайн',stores:'Магазины',partners:'Партнёры'};\nconst label=s=>names[s.name]||s.name, fmt=v=>v===null?'нет данных':Number(v).toLocaleString('ru-RU',{maximumFractionDigits:3});\nconst all=d.series.flatMap(s=>s.values.filter(v=>v!==null));\nlet low=Math.min(0,...all), high=Math.max(0,...all); if(low===high){high=low+1;}\nconst pad=(high-low)*.1; high+=pad;if(low<0)low-=pad;\nconst X=i=>60+(d.labels.length===1?305:(d.positions[i]-d.positions[0])/(d.positions[d.positions.length-1]-d.positions[0])*610),Y=v=>245-(v-low)/(high-low)*205;\nfunction node(tag,attrs={},text){const e=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const[k,v]of Object.entries(attrs))e.setAttribute(k,v);if(text!==undefined)e.textContent=text;return e;}\nfunction height(){parent.postMessage({type:'iframe:height',height:Math.ceil($('card').getBoundingClientRect().height+16)},'*');}\nfunction draw(){\n const svg=$('chart');svg.replaceChildren();svg.setAttribute('aria-label',d.title);\n svg.append(node('text',{x:60,y:18},d.yLabel));\n for(let i=0;i<=4;i++){const v=low+(high-low)*i/4,y=Y(v);svg.append(node('line',{x1:60,y1:y,x2:670,y2:y,stroke:'#e5e7eb','stroke-dasharray':'3 4'}),node('text',{x:50,y:y+4,'text-anchor':'end'},fmt(v)));}\n const step=Math.max(1,Math.ceil(d.labels.length/7));\n d.labels.forEach((v,i)=>{if(i%step===0||i===d.labels.length-1)svg.append(node('text',{x:X(i),y:274,'text-anchor':'middle'},v));});\n d.series.forEach((s,j)=>{if(!visible[j])return;let path='',fresh=true;\n s.values.forEach((v,i)=>{if(v===null){fresh=true;return;}path+=(fresh?'M':'L')+X(i)+','+Y(v)+' ';fresh=false;});\n svg.append(node('path',{d:path,fill:'none',stroke:colors[j],'stroke-width':3,'stroke-linejoin':'round','data-series':s.name}));\n s.values.forEach((v,i)=>{if(v===null)return;const p=node('circle',{cx:X(i),cy:Y(v),r:4.5,fill:colors[j],class:'point',tabindex:0,'aria-label':d.labels[i]+' '+label(s)+' '+fmt(v)});p.append(node('title',{},d.labels[i]+' · '+label(s)+': '+fmt(v)));svg.append(p);});\n });\n requestAnimationFrame(height);\n}\nd.series.forEach((s,j)=>{const b=document.createElement('button');b.type='button';b.setAttribute('aria-pressed','true');b.setAttribute('aria-label',label(s));const dot=document.createElement('span');dot.className='dot';dot.style.background=colors[j];b.append(dot,document.createTextNode(label(s)));b.addEventListener('click',()=>{visible[j]=!visible[j];b.setAttribute('aria-pressed',String(visible[j]));draw();});$('legend').append(b);});\nnew ResizeObserver(height).observe($('card'));window.addEventListener('load',height);draw();\n})();\n</script></body></html>"
+        ]
+      }
+    ],
+    "content": "Готово"
+  },
+  {
+    "title": "Metadata: ошибка и восстановление",
+    "chat_id": "f2ae88c0-57c1-4dbe-bdf8-1a0785d85b87",
+    "message_id": "45ce3fee-76b1-4558-aef7-0c3a632b62cc",
+    "url": "http://localhost:3000/c/f2ae88c0-57c1-4dbe-bdf8-1a0785d85b87",
+    "calls": [
+      {
+        "type": "function_call",
+        "id": "call_NZ48ZNOOKE5CvDYPUI8D6jPi",
+        "call_id": "call_NZ48ZNOOKE5CvDYPUI8D6jPi",
+        "name": "load_demo_sql_metadata",
+        "arguments": "{\"scenario\": \"invalid_numeric\"}",
+        "status": "completed"
+      },
+      {
+        "type": "function_call",
+        "id": "call_NFUes6o7Ydb8pN4qDxx7mJya",
+        "call_id": "call_NFUes6o7Ydb8pN4qDxx7mJya",
+        "name": "plot_metadata_chart",
+        "arguments": "{\"dataset_id\": \"ds_2a54b454a00845a2\", \"x_column\": \"day\", \"y_columns\": [\"online\", \"stores\", \"partners\"]}",
+        "status": "failed"
+      },
+      {
+        "type": "function_call",
+        "id": "call_38ibkFpwhImw1qnZBNCSffro",
+        "call_id": "call_38ibkFpwhImw1qnZBNCSffro",
+        "name": "load_demo_sql_metadata",
+        "arguments": "{\"scenario\": \"valid\"}",
+        "status": "completed"
+      },
+      {
+        "type": "function_call",
+        "id": "call_4ydK5i18n6ybQ7aCrpRLMYUd",
+        "call_id": "call_4ydK5i18n6ybQ7aCrpRLMYUd",
+        "name": "plot_metadata_chart",
+        "arguments": "{\"dataset_id\": \"ds_6db946fd85514201\", \"x_column\": \"day\", \"y_columns\": [\"online\", \"stores\", \"partners\"]}",
+        "status": "completed"
+      }
+    ],
+    "outputs": [
+      {
+        "type": "function_call_output",
+        "id": "fco_82fb9b3d7a094f2696490a61",
+        "call_id": "call_NZ48ZNOOKE5CvDYPUI8D6jPi",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "{\n  \"status\": \"ready\",\n  \"dataset_id\": \"ds_2a54b454a00845a2\",\n  \"row_count\": 7,\n  \"columns\": [\n    {\n      \"name\": \"day\",\n      \"type\": \"date\"\n    },\n    {\n      \"name\": \"online\",\n      \"type\": \"number\",\n      \"unit\": \"тыс. руб.\"\n    },\n    {\n      \"name\": \"stores\",\n      \"type\": \"number\",\n      \"unit\": \"тыс. руб.\"\n    },\n    {\n      \"name\": \"partners\",\n      \"type\": \"number\",\n      \"unit\": \"тыс. руб.\"\n    }\n  ],\n  \"is_demo\": true,\n  \"scope\": \"current_request_only\",\n  \"next_action\": \"Call plot_metadata_chart sequentially in this same request. Do not pass rows.\"\n}"
+          }
+        ],
+        "status": "completed"
+      },
+      {
+        "type": "function_call_output",
+        "id": "fco_b72b36dfb26b4042a1f888e1",
+        "call_id": "call_NFUes6o7Ydb8pN4qDxx7mJya",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "{\n  \"status\": \"error\",\n  \"code\": \"NON_NUMERIC_VALUE\",\n  \"message\": \"В числовой колонке обнаружено не число.\",\n  \"suggested_action\": \"Исправьте тип в SQL/адаптере: int или float; пропуск — null. Не заменяйте ошибку нулём.\",\n  \"details\": {\n    \"row_index\": 3,\n    \"column\": \"stores\",\n    \"received_type\": \"str\"\n  },\n  \"chart_created\": false\n}"
+          }
+        ],
+        "status": "failed"
+      },
+      {
+        "type": "function_call_output",
+        "id": "fco_c257172f2fab4f92bf60a2f7",
+        "call_id": "call_38ibkFpwhImw1qnZBNCSffro",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "{\n  \"status\": \"ready\",\n  \"dataset_id\": \"ds_6db946fd85514201\",\n  \"row_count\": 7,\n  \"columns\": [\n    {\n      \"name\": \"day\",\n      \"type\": \"date\"\n    },\n    {\n      \"name\": \"online\",\n      \"type\": \"number\",\n      \"unit\": \"тыс. руб.\"\n    },\n    {\n      \"name\": \"stores\",\n      \"type\": \"number\",\n      \"unit\": \"тыс. руб.\"\n    },\n    {\n      \"name\": \"partners\",\n      \"type\": \"number\",\n      \"unit\": \"тыс. руб.\"\n    }\n  ],\n  \"is_demo\": true,\n  \"scope\": \"current_request_only\",\n  \"next_action\": \"Call plot_metadata_chart sequentially in this same request. Do not pass rows.\"\n}"
+          }
+        ],
+        "status": "completed"
+      },
+      {
+        "type": "function_call_output",
+        "id": "fco_96433a4a720d45e28323318a",
+        "call_id": "call_4ydK5i18n6ybQ7aCrpRLMYUd",
+        "output": [
+          {
+            "type": "input_text",
+            "text": "{\n  \"status\": \"success\",\n  \"code\": \"CHART_READY\",\n  \"dataset_id\": \"ds_6db946fd85514201\",\n  \"row_count\": 7,\n  \"series_count\": 3,\n  \"message\": \"The complete interactive chart has ALREADY been embedded by this tool. You have NOT received the raw SQL rows. Do not generate HTML, code, charts, sample values or guessed numbers. No extra text is needed; if a text response is required, say only Готово. For an explicit error-recovery test, you may briefly name the previous error code.\",\n  \"browser_render_verified\": false\n}"
+          }
+        ],
+        "status": "completed",
+        "embeds": [
+          "<!doctype html><html lang=\"ru\"><head><meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\n<title>SQL → интерактивный график</title>\n<style>\n*{box-sizing:border-box}body{margin:0;padding:8px;background:#fff;font:13px/1.5 system-ui;color:#374151}\nmain{padding:12px;background:#fff;max-width:950px;margin:auto}\n#legend{display:flex;justify-content:center;flex-wrap:wrap;gap:8px;margin:0 0 8px}\nbutton{color:#374151;background:transparent;border:0;padding:5px 10px;cursor:pointer;font:inherit}\nbutton[aria-pressed=false]{opacity:.35;text-decoration:line-through}button:focus-visible{outline:2px solid #2563eb}\n.dot{display:inline-block;width:18px;height:3px;vertical-align:middle;margin-right:7px}\nsvg{display:block;width:100%;height:auto;overflow:visible}svg text{fill:#6b7280;font:12px system-ui}\nsvg .point{cursor:crosshair}svg .point:focus{outline:none;stroke:#111827;stroke-width:3}\n</style></head><body><main id=\"card\">\n<div id=\"legend\" aria-label=\"Видимость кривых\"></div>\n<svg id=\"chart\" viewBox=\"0 0 700 300\" role=\"img\" aria-label=\"Линейный график с общей шкалой\"></svg>\n</main><script id=\"chart-data\" type=\"application/json\">{\"title\": \"\\u0413\\u0440\\u0430\\u0444\\u0438\\u043a\", \"yLabel\": \"\\u0442\\u044b\\u0441. \\u0440\\u0443\\u0431.\", \"labels\": [\"2026-09-01\", \"2026-09-02\", \"2026-09-03\", \"2026-09-04\", \"2026-09-05\", \"2026-09-06\", \"2026-09-07\"], \"positions\": [739860, 739861, 739862, 739863, 739864, 739865, 739866], \"series\": [{\"name\": \"online\", \"values\": [120.0, 145.0, 132.0, 178.0, 165.0, 210.0, 235.0]}, {\"name\": \"stores\", \"values\": [95.0, 102.0, 118.0, 110.0, 138.0, 152.0, 160.0]}, {\"name\": \"partners\", \"values\": [55.0, 70.0, 62.0, 88.0, 94.0, 105.0, 128.0]}]}</script>\n<script>\n(() => {\nconst d=JSON.parse(document.getElementById('chart-data').textContent), $=id=>document.getElementById(id);\nconst colors=['#2563eb','#059669','#d97706','#9333ea','#be123c','#0891b2','#4f46e5','#525252'];\nconst visible=d.series.map(()=>true), names={online:'Онлайн',stores:'Магазины',partners:'Партнёры'};\nconst label=s=>names[s.name]||s.name, fmt=v=>v===null?'нет данных':Number(v).toLocaleString('ru-RU',{maximumFractionDigits:3});\nconst all=d.series.flatMap(s=>s.values.filter(v=>v!==null));\nlet low=Math.min(0,...all), high=Math.max(0,...all); if(low===high){high=low+1;}\nconst pad=(high-low)*.1; high+=pad;if(low<0)low-=pad;\nconst X=i=>60+(d.labels.length===1?305:(d.positions[i]-d.positions[0])/(d.positions[d.positions.length-1]-d.positions[0])*610),Y=v=>245-(v-low)/(high-low)*205;\nfunction node(tag,attrs={},text){const e=document.createElementNS('http://www.w3.org/2000/svg',tag);for(const[k,v]of Object.entries(attrs))e.setAttribute(k,v);if(text!==undefined)e.textContent=text;return e;}\nfunction height(){parent.postMessage({type:'iframe:height',height:Math.ceil($('card').getBoundingClientRect().height+16)},'*');}\nfunction draw(){\n const svg=$('chart');svg.replaceChildren();svg.setAttribute('aria-label',d.title);\n svg.append(node('text',{x:60,y:18},d.yLabel));\n for(let i=0;i<=4;i++){const v=low+(high-low)*i/4,y=Y(v);svg.append(node('line',{x1:60,y1:y,x2:670,y2:y,stroke:'#e5e7eb','stroke-dasharray':'3 4'}),node('text',{x:50,y:y+4,'text-anchor':'end'},fmt(v)));}\n const step=Math.max(1,Math.ceil(d.labels.length/7));\n d.labels.forEach((v,i)=>{if(i%step===0||i===d.labels.length-1)svg.append(node('text',{x:X(i),y:274,'text-anchor':'middle'},v));});\n d.series.forEach((s,j)=>{if(!visible[j])return;let path='',fresh=true;\n s.values.forEach((v,i)=>{if(v===null){fresh=true;return;}path+=(fresh?'M':'L')+X(i)+','+Y(v)+' ';fresh=false;});\n svg.append(node('path',{d:path,fill:'none',stroke:colors[j],'stroke-width':3,'stroke-linejoin':'round','data-series':s.name}));\n s.values.forEach((v,i)=>{if(v===null)return;const p=node('circle',{cx:X(i),cy:Y(v),r:4.5,fill:colors[j],class:'point',tabindex:0,'aria-label':d.labels[i]+' '+label(s)+' '+fmt(v)});p.append(node('title',{},d.labels[i]+' · '+label(s)+': '+fmt(v)));svg.append(p);});\n });\n requestAnimationFrame(height);\n}\nd.series.forEach((s,j)=>{const b=document.createElement('button');b.type='button';b.setAttribute('aria-pressed','true');b.setAttribute('aria-label',label(s));const dot=document.createElement('span');dot.className='dot';dot.style.background=colors[j];b.append(dot,document.createTextNode(label(s)));b.addEventListener('click',()=>{visible[j]=!visible[j];b.setAttribute('aria-pressed',String(visible[j]));draw();});$('legend').append(b);});\nnew ResizeObserver(height).observe($('card'));window.addEventListener('load',height);draw();\n})();\n</script></body></html>"
+        ]
+      }
+    ],
+    "content": "NON_NUMERIC_VALUE в колонке stores. Готово."
+  }
+]

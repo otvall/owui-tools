@@ -1,0 +1,55 @@
+{
+  "source": "Fictional in-memory SQLite demo, not production data",
+  "sql": "SELECT day,\n  SUM(CASE WHEN channel = 'Онлайн' THEN revenue ELSE 0 END) AS online,\n  SUM(CASE WHEN channel = 'Магазины' THEN revenue ELSE 0 END) AS stores,\n  SUM(CASE WHEN channel = 'Партнёры' THEN revenue ELSE 0 END) AS partners\nFROM sales GROUP BY day ORDER BY day",
+  "rows": [
+    {
+      "day": "2026-09-01",
+      "online": 120.0,
+      "stores": 95.0,
+      "partners": 55.0
+    },
+    {
+      "day": "2026-09-02",
+      "online": 145.0,
+      "stores": 102.0,
+      "partners": 70.0
+    },
+    {
+      "day": "2026-09-03",
+      "online": 132.0,
+      "stores": 118.0,
+      "partners": 62.0
+    },
+    {
+      "day": "2026-09-04",
+      "online": 178.0,
+      "stores": 110.0,
+      "partners": 88.0
+    },
+    {
+      "day": "2026-09-05",
+      "online": 165.0,
+      "stores": 138.0,
+      "partners": 94.0
+    },
+    {
+      "day": "2026-09-06",
+      "online": 210.0,
+      "stores": 152.0,
+      "partners": 105.0
+    },
+    {
+      "day": "2026-09-07",
+      "online": 235.0,
+      "stores": 160.0,
+      "partners": 128.0
+    }
+  ],
+  "x_column": "day",
+  "y_columns": [
+    "online",
+    "stores",
+    "partners"
+  ],
+  "y_label": "Выручка, тыс. ₽"
+}

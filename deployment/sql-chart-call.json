@@ -1,0 +1,11 @@
+{
+  "rows_json": "[{\"day\":\"2026-09-01\",\"online\":120,\"stores\":95,\"partners\":55},{\"day\":\"2026-09-02\",\"online\":145,\"stores\":102,\"partners\":70},{\"day\":\"2026-09-03\",\"online\":132,\"stores\":118,\"partners\":62},{\"day\":\"2026-09-04\",\"online\":178,\"stores\":110,\"partners\":88},{\"day\":\"2026-09-05\",\"online\":165,\"stores\":138,\"partners\":94},{\"day\":\"2026-09-06\",\"online\":210,\"stores\":152,\"partners\":105},{\"day\":\"2026-09-07\",\"online\":235,\"stores\":160,\"partners\":128}]",
+  "x_column": "day",
+  "y_columns": [
+    "online",
+    "stores",
+    "partners"
+  ],
+  "title": "Продажи по каналам (демо)",
+  "y_label": "Выручка (тыс. руб.)"
+}
