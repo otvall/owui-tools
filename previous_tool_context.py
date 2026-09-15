@@ -1,7 +1,7 @@
 """
-title: Lite Previous Tool Context
+title: Previous Tool Context
 description: Adds the previous request's completed Tool calls to any model context as reference data.
-version: 0.16.2
+version: 0.16.3
 required_open_webui_version: 0.11.1
 """
 
@@ -19,9 +19,10 @@ log = logging.getLogger(__name__)
 
 DELEGATE_VERSIONS = {"v1", "v2"}
 CONTEXT_PREFIX = "Previous request execution record (reference data):\n"
-GUIDANCE_PREFIX = "Lite previous Tool context guidance:\n"
+GUIDANCE_PREFIX = "Previous Tool context guidance:\n"
+LEGACY_GUIDANCE_PREFIX = "Lite previous Tool context guidance:\n"
 TOOL_IMAGE_TEXT = "Here are the images from the tool results above. Please analyze them."
-APPLIED_KEY = "lite_previous_tool_context_applied"
+APPLIED_KEY = "previous_tool_context_applied"
 RAW_MESSAGES_KEY = "lite_unfiltered_messages"
 
 
@@ -179,15 +180,15 @@ class Filter:
 
     def _debug(self, message: str, *args) -> None:
         if self.valves.debug:
-            log.warning("[LITE_PREVIOUS_TOOLS] " + message, *args)
+            log.warning("[PREVIOUS_TOOL_CONTEXT] " + message, *args)
 
     async def inlet(self, body: dict) -> dict:
         metadata = body.setdefault("metadata", {})
         if not isinstance(metadata, dict):
-            raise TypeError("Lite Previous Tool Context metadata must be an object")
+            raise TypeError("Previous Tool Context metadata must be an object")
         messages = body.get("messages")
         if not isinstance(messages, list):
-            raise TypeError("Lite Previous Tool Context messages must be a list")
+            raise TypeError("Previous Tool Context messages must be a list")
 
         # Make retries and manual filter re-entry idempotent.
         messages = [
@@ -198,6 +199,7 @@ class Filter:
                 and (
                     message["content"].startswith(CONTEXT_PREFIX)
                     or message["content"].startswith(GUIDANCE_PREFIX)
+                    or message["content"].startswith(LEGACY_GUIDANCE_PREFIX)
                 )
             )
         ]

@@ -1,7 +1,7 @@
 """
-title: Lite History Cleanup
+title: History Cleanup
 description: Keeps conversation text and removes historical native Tool messages from model context.
-version: 0.16.1
+version: 0.16.3
 required_open_webui_version: 0.11.1
 """
 
@@ -14,7 +14,7 @@ from pydantic import BaseModel, Field
 log = logging.getLogger(__name__)
 
 TOOL_IMAGE_TEXT = "Here are the images from the tool results above. Please analyze them."
-APPLIED_KEY = "lite_history_cleanup_applied"
+APPLIED_KEY = "history_cleanup_applied"
 
 
 def is_tool_image_message(message: dict) -> bool:
@@ -49,7 +49,7 @@ class Filter:
     class Valves(BaseModel):
         priority: int = Field(
             default=-80,
-            description="In the Router chain, run after Lite Previous Tool Context.",
+            description="In the Router chain, run after Previous Tool Context.",
         )
         debug: bool = Field(default=False, description="Enable debug logs.")
 
@@ -58,15 +58,15 @@ class Filter:
 
     def _debug(self, message: str, *args) -> None:
         if self.valves.debug:
-            log.warning("[LITE_HISTORY_CLEANUP] " + message, *args)
+            log.warning("[HISTORY_CLEANUP] " + message, *args)
 
     async def inlet(self, body: dict) -> dict:
         metadata = body.setdefault("metadata", {})
         if not isinstance(metadata, dict):
-            raise TypeError("Lite History Cleanup metadata must be an object")
+            raise TypeError("History Cleanup metadata must be an object")
         messages = body.get("messages")
         if not isinstance(messages, list):
-            raise TypeError("Lite History Cleanup messages must be a list")
+            raise TypeError("History Cleanup messages must be a list")
 
         current_user = last_user_index(messages)
         current_start = max(current_user, 0)

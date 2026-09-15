@@ -23,9 +23,9 @@ def load_module(filename, name, modules=None):
 
 
 previous_filter = load_module(
-    "lite_previous_tool_context.py", "lite_previous_tool_context_tests"
+    "previous_tool_context.py", "previous_tool_context_tests"
 )
-cleanup_filter = load_module("lite_history_cleanup.py", "lite_history_cleanup_tests")
+cleanup_filter = load_module("history_cleanup.py", "history_cleanup_tests")
 
 skills_api = types.SimpleNamespace(get_skill_by_id=AsyncMock())
 open_webui = types.ModuleType("open_webui")
@@ -183,7 +183,7 @@ class StandalonePreviousToolContextTests(unittest.IsolatedAsyncioTestCase):
         record = unpack_record(body["messages"])
         self.assertEqual(len(record["tool_exchanges"]), 1)
         self.assertEqual(record["tool_exchanges"][0]["executor"], {"kind": "model"})
-        self.assertTrue(body["metadata"]["lite_previous_tool_context_applied"])
+        self.assertTrue(body["metadata"]["previous_tool_context_applied"])
         self.assertNotIn("lite_unfiltered_messages", body["metadata"])
 
         await cleanup_filter.Filter().inlet(body)
@@ -225,7 +225,7 @@ class SkillPromptFilterTests(unittest.IsolatedAsyncioTestCase):
             (False, "Instructions route-a"),
         ):
             metadata = registry_metadata()
-            metadata["lite_history_cleanup_applied"] = True
+            metadata["history_cleanup_applied"] = True
             metadata["lite_orchestrator_skill_ids"] = ["route-a"]
             self.request.app.state.MODELS["router"]["info"]["meta"][
                 "capabilities"
@@ -239,7 +239,7 @@ class SkillPromptFilterTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_filter_is_idempotent(self):
         metadata = registry_metadata()
-        metadata["lite_history_cleanup_applied"] = True
+        metadata["history_cleanup_applied"] = True
         metadata["lite_orchestrator_skill_ids"] = ["route-a"]
         body = {"model": "router", "metadata": metadata, "messages": []}
         filter_instance = skills_filter.Filter()
@@ -251,6 +251,31 @@ class SkillPromptFilterTests(unittest.IsolatedAsyncioTestCase):
             if message.get("content", "").startswith(skills_filter.PROMPT_PREFIX)
         ]
         self.assertEqual(len(prompts), 1)
+
+
+class PreviousToolContextMigrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_removes_legacy_lite_guidance(self):
+        body = {
+            "messages": [
+                {
+                    "role": "system",
+                    "content": previous_filter.LEGACY_GUIDANCE_PREFIX + "old",
+                },
+                *previous_turn(),
+                {"role": "user", "content": "Continue"},
+            ]
+        }
+
+        await previous_filter.Filter().inlet(body)
+
+        self.assertFalse(
+            any(
+                str(message.get("content", "")).startswith(
+                    previous_filter.LEGACY_GUIDANCE_PREFIX
+                )
+                for message in body["messages"]
+            )
+        )
 
 
 class StandaloneHistoryCleanupTests(unittest.IsolatedAsyncioTestCase):
@@ -266,7 +291,7 @@ class StandaloneHistoryCleanupTests(unittest.IsolatedAsyncioTestCase):
 
         await cleanup_filter.Filter().inlet(body)
 
-        self.assertTrue(body["metadata"]["lite_history_cleanup_applied"])
+        self.assertTrue(body["metadata"]["history_cleanup_applied"])
         self.assertIn(
             "Found documents: first, second.",
             [message.get("content") for message in body["messages"]],

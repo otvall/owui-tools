@@ -1315,8 +1315,8 @@ class Pipe(PipeAdapters):
         missing_filters = [
             name
             for name, key in (
-                ("Lite Previous Tool Context", "lite_previous_tool_context_applied"),
-                ("Lite History Cleanup", "lite_history_cleanup_applied"),
+                ("Previous Tool Context", "previous_tool_context_applied"),
+                ("History Cleanup", "history_cleanup_applied"),
                 ("Lite Orchestrator Skills", "lite_orchestrator_skills_applied"),
             )
             if not runtime.metadata.get(key)

@@ -290,8 +290,8 @@ class Filter:
             "lite_base_tool_runtime",
             "lite_orchestrator_skill_context",
             "lite_unfiltered_messages",
-            "lite_previous_tool_context_applied",
-            "lite_history_cleanup_applied",
+            "previous_tool_context_applied",
+            "history_cleanup_applied",
             "lite_orchestrator_skills_applied",
         ):
             metadata.pop(key, None)

@@ -1,6 +1,6 @@
 # Lite Handoff Router для Open WebUI v0.11.1
 
-Версия комплекта: **0.16.2**.
+Версия комплекта: **0.16.3**.
 
 Логика начальной подготовки запроса разделена на четыре inlet-фильтра. Pipe
 отвечает только за runtime-маршрутизацию, capabilities выбранной модели и
@@ -12,8 +12,8 @@
 |---|---|---|
 | `lite_delegate.py` | Tool | Возвращает маркер выбора сабагента |
 | `lite_subagent_registry.py` | Filter | Строит доступный пользователю реестр агентов |
-| `lite_previous_tool_context.py` | Filter | Добавляет любой модели строковую запись Tool Calls предыдущего запроса |
-| `lite_history_cleanup.py` | Filter | Удаляет прошлые нативные Tool Calls из контекста любой модели |
+| `previous_tool_context.py` | Filter | Добавляет любой модели строковую запись Tool Calls предыдущего запроса |
+| `history_cleanup.py` | Filter | Удаляет прошлые нативные Tool Calls из контекста любой модели |
 | `lite_orchestrator_skills.py` | Filter | Строит динамический промпт Skills оркестратора |
 | `lite_handoff_router.py` | Pipe | Выбирает модель, подключает Skills, Tools и MCP, ведёт текущий handoff |
 
@@ -26,7 +26,7 @@
 1. Обновите существующие Functions из файлов:
    `lite_subagent_registry.py` и `lite_handoff_router.py`.
 2. Создайте три новые Filter Functions из файлов:
-   `lite_previous_tool_context.py`, `lite_history_cleanup.py` и
+   `previous_tool_context.py`, `history_cleanup.py` и
    `lite_orchestrator_skills.py`.
 3. Включите все четыре фильтра и прикрепите их к публичной Router Workspace
    Model, через которую пользователь начинает чат.
@@ -35,8 +35,8 @@
    | Filter | Priority |
    |---|---:|
    | Lite Subagent Registry | `-100` |
-   | Lite Previous Tool Context | `-90` |
-   | Lite History Cleanup | `-80` |
+   | Previous Tool Context | `-90` |
+   | History Cleanup | `-80` |
    | Lite Orchestrator Skills | `-70` |
 
 5. В Valves Lite Handoff Router укажите `orchestrator_model_id`, как и раньше.
@@ -71,7 +71,7 @@
 
 ## Самостоятельное использование контекстных фильтров
 
-`lite_previous_tool_context.py` и `lite_history_cleanup.py` можно прикрепить к
+`previous_tool_context.py` и `history_cleanup.py` можно прикрепить к
 любой Workspace Model. Registry, Orchestrator Skills и Router Pipe для этого не
 нужны. Если нужны одновременно строковая запись и очистка нативной истории,
 прикрепите оба фильтра с priorities `-90` и `-80` соответственно.
@@ -98,7 +98,7 @@ Tool-цепочка не повреждается.
 
 ## Контекст предыдущих инструментов
 
-Фильтр Lite Previous Tool Context по умолчанию включён. Его Valve `enabled`
+Фильтр Previous Tool Context по умолчанию включён. Его Valve `enabled`
 можно установить в `False`. В Router-цепочке даже в этом режиме фильтр сохраняет
 исходную историю только в request metadata: она нужна pipe для настраиваемой
 истории сабагента.

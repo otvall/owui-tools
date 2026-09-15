@@ -79,7 +79,7 @@ class Filter:
     class Valves(BaseModel):
         priority: int = Field(
             default=-70,
-            description="Run after Lite History Cleanup.",
+            description="Run after History Cleanup.",
         )
         debug: bool = Field(default=False, description="Enable debug logs.")
 
@@ -95,10 +95,10 @@ class Filter:
             raise ValueError("Lite Orchestrator Skills requires __request__")
         metadata = body.get("metadata")
         if not isinstance(metadata, dict) or not metadata.get(
-            "lite_history_cleanup_applied"
+            "history_cleanup_applied"
         ):
             raise ValueError(
-                "Lite Orchestrator Skills requires Lite History Cleanup earlier in the filter chain"
+                "Lite Orchestrator Skills requires History Cleanup earlier in the filter chain"
             )
         messages = body.get("messages")
         if not isinstance(messages, list):
