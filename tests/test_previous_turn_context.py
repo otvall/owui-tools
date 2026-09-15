@@ -104,6 +104,24 @@ class PreviousToolContextTests(unittest.TestCase):
         )
         return unpack_record([message]) if message else None
 
+    def test_only_v2_agent_id_marker_is_supported(self):
+        self.assertEqual(
+            previous_filter.parse_handoff(
+                {"__lite_delegate__": "v2", "agent_id": "agent-a"}
+            ),
+            "agent-a",
+        )
+        self.assertIsNone(
+            previous_filter.parse_handoff(
+                {"__lite_delegate__": "v1", "skill_id": "agent-a"}
+            )
+        )
+        self.assertIsNone(
+            previous_filter.parse_handoff(
+                {"__lite_delegate__": "v2", "skill_id": "agent-a"}
+            )
+        )
+
     def test_keeps_full_arguments_results_and_agent_identity(self):
         messages = previous_turn()
         large_result = "Результат\n" + "x" * 20000 + "\nitem42"

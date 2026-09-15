@@ -94,6 +94,19 @@ class HistoryTests(unittest.TestCase):
         self.assertCountEqual(calls, expected_ids)
         self.assertCountEqual(results, expected_ids)
 
+    def test_only_v2_agent_id_marker_is_supported(self):
+        self.assertEqual(router.HandoffMarker.parse(marker()).agent_id, "agent-a")
+        self.assertIsNone(
+            router.HandoffMarker.parse(
+                {"__lite_delegate__": "v1", "skill_id": "agent-a"}
+            )
+        )
+        self.assertIsNone(
+            router.HandoffMarker.parse(
+                {"__lite_delegate__": "v2", "skill_id": "agent-a"}
+            )
+        )
+
     def test_owui_grouped_delegate_and_child_call_preserves_result(self):
         messages = grouped_history()
         original = copy.deepcopy(messages)

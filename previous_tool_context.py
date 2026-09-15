@@ -1,7 +1,7 @@
 """
 title: Previous Tool Context
 description: Adds the previous request's completed Tool calls to any model context as reference data.
-version: 0.16.3
+version: 0.16.4
 required_open_webui_version: 0.11.1
 """
 
@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 
-DELEGATE_VERSIONS = {"v1", "v2"}
+DELEGATE_VERSION = "v2"
 CONTEXT_PREFIX = "Previous request execution record (reference data):\n"
 GUIDANCE_PREFIX = "Previous Tool context guidance:\n"
 LEGACY_GUIDANCE_PREFIX = "Lite previous Tool context guidance:\n"
@@ -45,9 +45,9 @@ def parse_handoff(value: Any) -> str | None:
             return None
     else:
         return None
-    if not isinstance(data, dict) or data.get("__lite_delegate__") not in DELEGATE_VERSIONS:
+    if not isinstance(data, dict) or data.get("__lite_delegate__") != DELEGATE_VERSION:
         return None
-    agent_id = str(data.get("agent_id") or data.get("skill_id") or "").strip()
+    agent_id = str(data.get("agent_id") or "").strip()
     return agent_id or None
 
 

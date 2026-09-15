@@ -1,7 +1,7 @@
 """
 title: Lite Handoff Router
 description: Stateless same-response subagent handoff router.
-version: 0.16.0
+version: 0.16.4
 required_open_webui_version: 0.11.1
 """
 
@@ -28,7 +28,6 @@ from starlette.responses import Response, StreamingResponse
 log = logging.getLogger(__name__)
 
 DELEGATE_VERSION = "v2"
-LEGACY_DELEGATE_VERSION = "v1"
 ACTIVE_HANDOFF_KEY = "lite_active_handoff"
 CHILD_RUNTIME_KEY = "lite_active_tool_runtime"
 BASE_RUNTIME_KEY = "lite_base_tool_runtime"
@@ -83,12 +82,9 @@ class HandoffMarker:
         else:
             return None
 
-        if not isinstance(data, dict) or data.get("__lite_delegate__") not in {
-            DELEGATE_VERSION,
-            LEGACY_DELEGATE_VERSION,
-        }:
+        if not isinstance(data, dict) or data.get("__lite_delegate__") != DELEGATE_VERSION:
             return None
-        agent_id = str(data.get("agent_id") or data.get("skill_id") or "").strip()
+        agent_id = str(data.get("agent_id") or "").strip()
         if not agent_id:
             return None
         return cls(agent_id=agent_id)
