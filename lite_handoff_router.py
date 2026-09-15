@@ -1,7 +1,7 @@
 """
 title: Lite Handoff Router
 description: Stateless same-response subagent handoff router.
-version: 0.16.5
+version: 0.17.0
 required_open_webui_version: 0.11.1
 """
 
@@ -21,7 +21,7 @@ from open_webui.models.skills import Skills
 from open_webui.models.users import Users
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.misc import remove_system_message
-from open_webui.utils.tools import get_builtin_tools, get_tools
+from open_webui.utils.tools import get_attached_knowledge, get_builtin_tools, get_tools
 from pydantic import BaseModel, Field
 from starlette.responses import Response, StreamingResponse
 
@@ -35,24 +35,16 @@ PREVIOUS_TOOL_CONTEXT_PREFIX = "Previous request execution record (reference dat
 ORCHESTRATOR_SKILL_PROMPT_PREFIX = "Lite orchestrator Skill context:\n"
 GENERIC_SKILL_PROMPT_PREFIX = "Skill context:\n"
 TOOL_IMAGE_TEXT = "Here are the images from the tool results above. Please analyze them."
-OUTER_INFERENCE_PARAMS = (
-    "temperature",
-    "top_p",
-    "min_p",
-    "max_tokens",
-    "max_completion_tokens",
-    "frequency_penalty",
-    "presence_penalty",
-    "reasoning_effort",
-    "seed",
-    "stop",
-    "logit_bias",
-    "response_format",
-    "options",
-    "think",
-    "keep_alive",
-    "previous_response_id",
+CHILD_REQUEST_ENVELOPE_KEYS = frozenset(
+    {
+        "model",
+        "messages",
+        "stream",
+        "stream_options",
+        "metadata",
+    }
 )
+BLOCKED_CHILD_BUILTIN_TOOLS = frozenset({"delegate_task", "timer"})
 
 
 def normalize_ids(values) -> list[str]:
@@ -638,6 +630,66 @@ class ModelCapabilityResolver:
         return (meta.get("capabilities") or {}).get("builtin_tools", True) is not False
 
     @staticmethod
+    def knowledge_context(runtime_model: dict, metadata: dict) -> str:
+        meta = (runtime_model or {}).get("info", {}).get("meta", {}) or {}
+        if (meta.get("capabilities") or {}).get("builtin_tools", True) is False:
+            return ""
+        if not isinstance(metadata, dict) or not metadata.get("session_id"):
+            return ""
+        if (metadata.get("params") or {}).get("function_calling") == "legacy":
+            return ""
+        if (meta.get("builtinTools") or {}).get("knowledge", True) is False:
+            return ""
+        entries = []
+        for item in get_attached_knowledge(runtime_model, metadata) or []:
+            if not isinstance(item, dict):
+                continue
+            item_id = str(item.get("id") or "").strip()
+            item_type = str(item.get("type") or "").strip()
+            if not item_id or not item_type:
+                continue
+            attrs = [
+                f'type="{html.escape(item_type, quote=True)}"',
+                f'id="{html.escape(item_id, quote=True)}"',
+            ]
+            for key in ("name", "source"):
+                value = str(item.get(key) or "").strip()
+                if value:
+                    attrs.append(f'{key}="{html.escape(value, quote=True)}"')
+            entries.append("<knowledge " + " ".join(attrs) + "/>")
+        if not entries:
+            return ""
+        return "<attached_knowledge>\n" + "\n".join(entries) + "\n</attached_knowledge>"
+
+    async def resolve_general_builtin_tools(
+        self,
+        *,
+        request,
+        execution_user,
+        runtime_model,
+        metadata,
+        extra_params: dict,
+    ) -> dict:
+        if not self.lazy_skills(runtime_model):
+            return {}
+        if not isinstance(metadata, dict) or not metadata.get("session_id"):
+            return {}
+        if (metadata.get("params") or {}).get("function_calling") == "legacy":
+            return {}
+        features = metadata.get("features") if isinstance(metadata, dict) else None
+        builtin_tools = await get_builtin_tools(
+            request,
+            {**extra_params, "__user__": execution_user.model_dump(), "__skill_ids__": []},
+            features=features or {},
+            model=runtime_model,
+        )
+        return {
+            name: tool
+            for name, tool in builtin_tools.items()
+            if name not in BLOCKED_CHILD_BUILTIN_TOOLS and name != self.SKILL_TOOL_NAME
+        }
+
+    @staticmethod
     def orchestrator_prompt(skill_manifest: str) -> str:
         if not skill_manifest:
             return ""
@@ -746,15 +798,18 @@ class ModelCapabilityResolver:
         oauth_token,
         files,
         connector: Callable,
+        include_builtin_tools: bool = False,
     ) -> CapabilitySet:
         requested_ids = normalize_ids(tool_ids)
         requested_skill_ids = normalize_ids(skill_ids)
-        if not requested_ids and not requested_skill_ids:
+        if not requested_ids and not requested_skill_ids and not include_builtin_tools:
             return CapabilitySet([], [], {})
 
-        owner = await Users.get_user_by_id(capability_owner_id)
-        if owner is None:
-            raise ValueError("Model capability owner is unavailable")
+        owner = None
+        if requested_ids or requested_skill_ids:
+            owner = await Users.get_user_by_id(capability_owner_id)
+            if owner is None:
+                raise ValueError("Model capability owner is unavailable")
 
         mcp_ids = [item for item in requested_ids if item.startswith(self.MCP_PREFIX)]
         regular_ids = [item for item in requested_ids if not item.startswith(self.MCP_PREFIX)]
@@ -789,6 +844,18 @@ class ModelCapabilityResolver:
             raise ValueError(
                 "Attached model-bound Tools are unavailable: " + ", ".join(missing)
             )
+
+        if include_builtin_tools:
+            builtin_tools = await self.resolve_general_builtin_tools(
+                request=request,
+                execution_user=execution_user,
+                runtime_model=runtime_model,
+                metadata=metadata,
+                extra_params=extra_params,
+            )
+            for name, tool in builtin_tools.items():
+                if name not in tools:
+                    tools[name] = tool
 
         lazy_skills = self.lazy_skills(runtime_model)
         skill_manifest = await (
@@ -845,6 +912,7 @@ class ModelCapabilityResolver:
             "__message_id__": metadata.get("message_id"),
             "__messages__": messages,
             "__files__": files or metadata.get("files", []),
+            "__features__": metadata.get("features", {}),
         }
 
 
@@ -895,11 +963,6 @@ class ChildRequestBuilder:
                 f'Agent ID "{marker.agent_id}" is not available in the current registry'
             )
 
-        runtime_model = context.request.app.state.MODELS.get(agent.model_id)
-        if runtime_model is None:
-            raise ValueError(f'Agent "{agent.model_id}" is unavailable')
-        child_skill_ids, child_tool_ids = await self._attachments(agent, runtime_model)
-
         routed_body = runtime.routed_body(body)
         source_messages = remove_system_message(routed_body.get("messages") or [])
         raw_messages = runtime.metadata.get("lite_unfiltered_messages")
@@ -916,18 +979,15 @@ class ChildRequestBuilder:
         if not isinstance(capability_messages, list):
             capability_messages = []
             runtime.sync(lite_child_messages=capability_messages)
-        capabilities = await load_capabilities(
-            request=context.request,
-            user=context.user,
-            runtime_model=runtime_model,
-            metadata=runtime.metadata,
-            tool_ids=child_tool_ids,
-            skill_ids=child_skill_ids,
-            messages=capability_messages,
-            event_emitter=context.event_emitter,
-            event_call=context.event_call,
-            oauth_token=context.oauth_token,
-            files=context.files,
+        runtime_model, child_skill_ids, child_tool_ids, capabilities = (
+            await self.prepare_workspace_model(
+                routed_body=routed_body,
+                agent=agent,
+                runtime=runtime,
+                context=context,
+                capability_messages=capability_messages,
+                load_capabilities=load_capabilities,
+            )
         )
         # OWUI rebuilds and regroups the trace on each tool continuation.
         # Resolve the receipt again: cached message offsets are not stable.
@@ -956,14 +1016,20 @@ class ChildRequestBuilder:
             0,
             {
                 "role": "system",
-                "content": self._system_prompt(marker, capabilities.skill_manifest),
+                "content": self._system_prompt(
+                    marker,
+                    capabilities.skill_manifest,
+                    ModelCapabilityResolver.knowledge_context(
+                        runtime_model,
+                        runtime.metadata,
+                    ),
+                ),
             },
         )
         capability_messages[:] = copy.deepcopy(child_messages)
 
         routed_body["messages"] = child_messages
         routed_body["model"] = agent.model_id
-        self.clear_outer_inference_params(routed_body)
         runtime.bind_tools(capabilities.tools, child_tool_ids, replace=True)
         runtime.sync(skill_ids=child_skill_ids)
         runtime.activate(marker, marker.agent_id, agent.model_id)
@@ -973,6 +1039,44 @@ class ChildRequestBuilder:
         ]
         routed_body.pop("tool_choice", None)
         return routed_body, agent
+
+    async def prepare_workspace_model(
+        self,
+        *,
+        routed_body: dict,
+        agent: AgentSpec,
+        runtime: RequestRuntime,
+        context: InvocationContext,
+        capability_messages: list[dict],
+        load_capabilities: Callable,
+    ) -> tuple[dict, list[str], list[str], CapabilitySet]:
+        """Prepare only the Workspace Model state needed by a nested handoff.
+
+        Provider handlers still apply the child model's base_model_id, inference
+        params, custom params, and system prompt. This method removes the outer
+        model's already-expanded inference payload, then resolves the settings
+        that OWUI normally prepares before provider dispatch: attached Tools,
+        MCP servers, Skills, and builtin Tools.
+        """
+        runtime_model = context.request.app.state.MODELS.get(agent.model_id)
+        if runtime_model is None:
+            raise ValueError(f'Agent "{agent.model_id}" is unavailable')
+        child_skill_ids, child_tool_ids = await self._attachments(agent, runtime_model)
+        self.clear_outer_inference_params(routed_body)
+        capabilities = await load_capabilities(
+            request=context.request,
+            user=context.user,
+            runtime_model=runtime_model,
+            metadata=runtime.metadata,
+            tool_ids=child_tool_ids,
+            skill_ids=child_skill_ids,
+            messages=capability_messages,
+            event_emitter=context.event_emitter,
+            event_call=context.event_call,
+            oauth_token=context.oauth_token,
+            files=context.files,
+        )
+        return runtime_model, child_skill_ids, child_tool_ids, capabilities
 
     @staticmethod
     async def _attachments(agent: AgentSpec, runtime_model) -> tuple[list[str], list[str]]:
@@ -1001,7 +1105,11 @@ class ChildRequestBuilder:
         return normalize_ids(meta.get("skillIds")), normalize_ids(meta.get("toolIds"))
 
     @staticmethod
-    def _system_prompt(_marker: HandoffMarker, skill_manifest: str) -> str:
+    def _system_prompt(
+        _marker: HandoffMarker,
+        skill_manifest: str,
+        workspace_context: str = "",
+    ) -> str:
         prompt = (
             "You are the specialist selected by an orchestrator.\n"
             "Execute the delegated task directly and completely.\n"
@@ -1016,14 +1124,16 @@ class ChildRequestBuilder:
                 "When an available Skill may apply, call view_skill to load its full "
                 "instructions before completing the task."
             )
-        if skill_manifest:
-            prompt += "\n\n" + skill_manifest
+        for context in (workspace_context, skill_manifest):
+            if context:
+                prompt += "\n\n" + context
         return prompt
 
     @staticmethod
     def clear_outer_inference_params(body: dict) -> None:
-        for key in OUTER_INFERENCE_PARAMS:
-            body.pop(key, None)
+        for key in tuple(body):
+            if key not in CHILD_REQUEST_ENVELOPE_KEYS:
+                body.pop(key, None)
 
 
 class CompletionGateway:
@@ -1199,12 +1309,16 @@ class PipeAdapters:
         )
 
     async def _resolve_child_capabilities(self, **kwargs) -> CapabilitySet:
-        if not normalize_ids(kwargs["tool_ids"]) and not normalize_ids(kwargs["skill_ids"]):
-            return CapabilitySet([], [], {})
         runtime_model = kwargs["runtime_model"]
         target_model_id = str((runtime_model or {}).get("id") or "").strip()
         model_info = await Models.get_model_by_id(target_model_id)
-        if model_info is None or not model_info.is_active:
+        if model_info is None:
+            if not normalize_ids(kwargs["tool_ids"]) and not normalize_ids(
+                kwargs["skill_ids"]
+            ):
+                return CapabilitySet([], [], {})
+            raise ValueError("Child Model capability owner is unavailable")
+        if not model_info.is_active:
             raise ValueError("Child Model capability owner is unavailable")
         return await self._get_model_bound_capabilities(
             request=kwargs["request"],
@@ -1219,6 +1333,7 @@ class PipeAdapters:
             event_call=kwargs["event_call"],
             oauth_token=kwargs["oauth_token"],
             files=kwargs["files"],
+            include_builtin_tools=True,
         )
 
     async def _get_or_create_child_capabilities(self, **kwargs) -> CapabilitySet:

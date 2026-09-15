@@ -31,6 +31,9 @@ def load_router():
             ],
         },
         "open_webui.utils.tools": {
+            "get_attached_knowledge": lambda model, metadata: (
+                (model.get("info", {}).get("meta", {}) or {}).get("knowledge", [])
+            ),
             "get_builtin_tools": AsyncMock(), "get_tools": AsyncMock(),
         },
     }.items():
@@ -261,6 +264,170 @@ class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [m["tool_call_id"] for m in messages if m["role"] == "tool"], ["lookup"],
         )
+
+    async def test_workspace_preparation_removes_all_outer_inference_fields(self):
+        body = {
+            "model": "router",
+            "messages": grouped_history()[:4],
+            "metadata": self.metadata,
+            "stream": True,
+            "stream_options": {"include_usage": True},
+            "temperature": 0.9,
+            "top_k": 99,
+            "provider_specific_option": "outer-value",
+            "options": {"repeat_penalty": 1.5},
+        }
+        routed, _ = await self.builder.prepare(
+            body=body,
+            marker=router.HandoffMarker("agent-a"),
+            registry={"agent-a": self.agent},
+            runtime=self.runtime,
+            context=self.context,
+            load_capabilities=self.loader,
+        )
+        self.assertEqual(
+            set(routed),
+            {"model", "messages", "metadata", "stream", "stream_options", "tools"},
+        )
+        self.assertEqual(routed["model"], "agent-a")
+        self.assertTrue(routed["stream"])
+        self.assertEqual(routed["stream_options"], {"include_usage": True})
+
+
+class WorkspaceCapabilityTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.user = types.SimpleNamespace(model_dump=lambda: {"id": "user"})
+        self.owner = types.SimpleNamespace(model_dump=lambda: {"id": "owner"})
+        router.Users.get_user_by_id = AsyncMock(return_value=self.owner)
+        router.get_builtin_tools = AsyncMock(
+            return_value={
+                "search_web": {
+                    "spec": {"name": "search_web"},
+                    "callable": AsyncMock(),
+                },
+                "delegate_task": {
+                    "spec": {"name": "delegate_task"},
+                    "callable": AsyncMock(),
+                },
+                "timer": {
+                    "spec": {"name": "timer"},
+                    "callable": AsyncMock(),
+                },
+            }
+        )
+        self.resolver = router.ModelCapabilityResolver(router.McpRuntime())
+
+    async def test_child_gets_enabled_builtins_but_not_nested_subagents(self):
+        capabilities = await self.resolver.resolve(
+            request=types.SimpleNamespace(),
+            capability_owner_id="owner",
+            execution_user=self.user,
+            tool_ids=[],
+            skill_ids=[],
+            runtime_model={
+                "id": "child",
+                "info": {
+                    "meta": {
+                        "capabilities": {
+                            "builtin_tools": True,
+                            "web_search": True,
+                        }
+                    }
+                },
+            },
+            metadata={
+                "session_id": "session",
+                "params": {"function_calling": "native"},
+                "features": {"web_search": True},
+            },
+            messages=[],
+            event_emitter=None,
+            event_call=None,
+            oauth_token=None,
+            files=[],
+            connector=AsyncMock(),
+            include_builtin_tools=True,
+        )
+        self.assertEqual(set(capabilities.tools), {"search_web"})
+        self.assertEqual(
+            router.get_builtin_tools.call_args.kwargs["features"],
+            {"web_search": True},
+        )
+
+    async def test_builtin_tools_capability_can_disable_all_builtins(self):
+        capabilities = await self.resolver.resolve(
+            request=types.SimpleNamespace(),
+            capability_owner_id="owner",
+            execution_user=self.user,
+            tool_ids=[],
+            skill_ids=[],
+            runtime_model={
+                "id": "child",
+                "info": {"meta": {"capabilities": {"builtin_tools": False}}},
+            },
+            metadata={
+                "session_id": "session",
+                "params": {"function_calling": "native"},
+                "features": {"web_search": True},
+            },
+            messages=[],
+            event_emitter=None,
+            event_call=None,
+            oauth_token=None,
+            files=[],
+            connector=AsyncMock(),
+            include_builtin_tools=True,
+        )
+        self.assertEqual(capabilities.tools, {})
+        router.get_builtin_tools.assert_not_awaited()
+
+    async def test_legacy_function_calling_does_not_inject_native_builtins(self):
+        capabilities = await self.resolver.resolve(
+            request=types.SimpleNamespace(),
+            capability_owner_id="owner",
+            execution_user=self.user,
+            tool_ids=[],
+            skill_ids=[],
+            runtime_model={
+                "id": "child",
+                "info": {"meta": {"capabilities": {"builtin_tools": True}}},
+            },
+            metadata={
+                "session_id": "session",
+                "params": {"function_calling": "legacy"},
+                "features": {"web_search": True},
+            },
+            messages=[],
+            event_emitter=None,
+            event_call=None,
+            oauth_token=None,
+            files=[],
+            connector=AsyncMock(),
+            include_builtin_tools=True,
+        )
+        self.assertEqual(capabilities.tools, {})
+        router.get_builtin_tools.assert_not_awaited()
+
+    def test_attached_knowledge_is_rendered_for_child_prompt(self):
+        context = self.resolver.knowledge_context(
+            {
+                "info": {
+                    "meta": {
+                        "knowledge": [
+                            {
+                                "type": "file",
+                                "id": "file-1",
+                                "name": 'Guide "A"',
+                                "source": "model",
+                            }
+                        ]
+                    }
+                }
+            },
+            {"session_id": "session", "params": {"function_calling": "native"}},
+        )
+        self.assertIn('<knowledge type="file" id="file-1"', context)
+        self.assertIn('name="Guide &quot;A&quot;"', context)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 # Lite Handoff Router для Open WebUI v0.11.1
 
-Версия комплекта: **0.16.5**.
+Версия комплекта: **0.17.0**.
 
 Подготовка истории Router разделена на три inlet-фильтра. Pipe отвечает за
 runtime-маршрутизацию, capabilities выбранной модели, Skill-промпты и продолжения
@@ -15,7 +15,7 @@ runtime-маршрутизацию, capabilities выбранной модели
 | `previous_tool_context.py` | Filter | Добавляет любой модели строковую запись Tool Calls предыдущего запроса |
 | `history_cleanup.py` | Filter | Удаляет прошлые нативные Tool Calls из контекста любой модели |
 | `skill_context.py` | Filter | Необязательный самостоятельный Skill-контекст для других моделей |
-| `lite_handoff_router.py` | Pipe | Выбирает модель, подключает Skills, Tools и MCP, ведёт текущий handoff |
+| `lite_handoff_router.py` | Pipe | Выбирает модель, применяет её Workspace-контекст и ведёт текущий handoff |
 
 Все файлы самостоятельны: при установке в Open WebUI они не импортируют друг
 друга как Python-модули. Фильтры обмениваются только request-scoped значениями
@@ -23,8 +23,8 @@ runtime-маршрутизацию, capabilities выбранной модели
 
 ## Установка обновления
 
-1. Обновите существующие Functions из файлов:
-   `lite_subagent_registry.py` и `lite_handoff_router.py`. Если Skill-фильтр уже
+1. Обновите существующий Lite Handoff Router из файла
+   `lite_handoff_router.py`. Если Skill-фильтр уже
    установлен, замените его код содержимым `skill_context.py`, но отсоедините от
    Router Model.
 2. Создайте две Filter Functions из файлов:
@@ -100,6 +100,22 @@ Tool-цепочка не повреждается.
 вызовы и результаты сабагента остаются в нативном формате `tool_calls` / `tool`.
 Эта часть не вынесена в inlet-фильтр, поскольку Open WebUI продолжает Tool Call
 внутренним вызовом модели без повторного выполнения inlet chain.
+
+Перед первым вызовом сабагента `prepare_workspace_model()` оставляет в дочернем
+payload только сообщения, request metadata и параметры стрима. Благодаря этому
+`temperature`, `top_p`, `top_k`, `custom_params` и другие уже развёрнутые
+настройки Router Model не перекрывают настройки Workspace Model сабагента.
+`base_model_id`, inference params и системный промпт сабагента затем штатно
+применяются провайдерным обработчиком Open WebUI.
+
+Подготовщик отдельно подключает выбранные в карточке сабагента Tools, MCP,
+Skills и builtin Tools. Для Web Search, Image Generation, Code Interpreter и
+Memory дополнительно учитываются features текущего запроса, глобальные настройки
+сервера, native function calling и права пользователя. Прикреплённые Knowledge
+передаются builtin Tools и описываются в системном контексте. Встроенные
+`delegate_task` и `timer`
+исключаются, чтобы сабагент не запускал параллельную систему вложенной
+оркестрации поверх Lite Handoff Router.
 
 Handoff распознаёт только актуальный маркер
 `{"__lite_delegate__": "v2", "agent_id": "..."}`. Legacy-формат `v1` и поле
