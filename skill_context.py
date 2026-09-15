@@ -1,7 +1,7 @@
 """
-title: Lite Orchestrator Skills
-description: Builds the Router's dynamic Skill prompt from the registry metadata.
-version: 0.16.0
+title: Skill Context
+description: Injects a dynamic Skill prompt for any model.
+version: 0.16.5
 required_open_webui_version: 0.11.1
 """
 
@@ -15,8 +15,9 @@ from pydantic import BaseModel, Field
 
 log = logging.getLogger(__name__)
 
-PROMPT_PREFIX = "Lite orchestrator Skill context:\n"
-APPLIED_KEY = "lite_orchestrator_skills_applied"
+PROMPT_PREFIX = "Skill context:\n"
+LEGACY_PROMPT_PREFIX = "Lite orchestrator Skill context:\n"
+APPLIED_KEY = "skill_context_applied"
 
 
 def normalize_ids(values) -> list[str]:
@@ -68,7 +69,7 @@ async def skill_context(skill_ids: list[str], *, lazy: bool) -> str:
         return (
             "The following Skills are available on demand. Inspect their descriptions "
             "and call view_skill for any Skill that may apply before following its full "
-            "instructions. Load a relevant routing Skill before calling lite_delegate."
+            "instructions."
             "\n\n"
             + manifest
         )
@@ -79,7 +80,7 @@ class Filter:
     class Valves(BaseModel):
         priority: int = Field(
             default=-70,
-            description="Run after History Cleanup.",
+            description="Filter execution order; lower values run first.",
         )
         debug: bool = Field(default=False, description="Enable debug logs.")
 
@@ -88,35 +89,40 @@ class Filter:
 
     def _debug(self, message: str, *args) -> None:
         if self.valves.debug:
-            log.warning("[LITE_ORCHESTRATOR_SKILLS] " + message, *args)
+            log.warning("[SKILL_CONTEXT] " + message, *args)
 
     async def inlet(self, body: dict, __request__=None) -> dict:
         if __request__ is None:
-            raise ValueError("Lite Orchestrator Skills requires __request__")
-        metadata = body.get("metadata")
-        if not isinstance(metadata, dict) or not metadata.get(
-            "history_cleanup_applied"
-        ):
-            raise ValueError(
-                "Lite Orchestrator Skills requires History Cleanup earlier in the filter chain"
-            )
+            raise ValueError("Skill Context requires __request__")
+        metadata = body.setdefault("metadata", {})
+        if not isinstance(metadata, dict):
+            raise TypeError("Skill Context metadata must be an object")
         messages = body.get("messages")
         if not isinstance(messages, list):
-            raise TypeError("Lite Orchestrator Skills messages must be a list")
+            raise TypeError("Skill Context messages must be a list")
 
         messages = [
             message
             for message in messages
             if not (
                 isinstance(message.get("content"), str)
-                and message["content"].startswith(PROMPT_PREFIX)
+                and message["content"].startswith(
+                    (PROMPT_PREFIX, LEGACY_PROMPT_PREFIX)
+                )
             )
         ]
-        router_model_id = str(metadata.get("lite_router_model_id") or "").strip()
-        runtime_model = __request__.app.state.MODELS.get(router_model_id) or {
-            "id": router_model_id
+        model_id = str(body.get("model") or "").strip()
+        runtime_model = __request__.app.state.MODELS.get(model_id) or {
+            "id": model_id
         }
-        skill_ids = normalize_ids(metadata.get("lite_orchestrator_skill_ids"))
+        model_meta = (runtime_model.get("info") or {}).get("meta") or {}
+        skill_ids = normalize_ids(
+            [
+                *(body.get("skill_ids") or []),
+                *(model_meta.get("skillIds") or []),
+                *(metadata.get("lite_orchestrator_skill_ids") or []),
+            ]
+        )
         prompt = await skill_context(skill_ids, lazy=lazy_skills(runtime_model))
         if prompt:
             messages.insert(
@@ -125,5 +131,5 @@ class Filter:
             )
         body["messages"] = messages
         metadata[APPLIED_KEY] = True
-        self._debug("orchestrator Skill count=%s", len(skill_ids))
+        self._debug("model=%s Skill count=%s", model_id, len(skill_ids))
         return body

@@ -1,7 +1,7 @@
 """
 title: Lite Subagent Registry
 description: Dynamically exposes accessible subagents to Lite Handoff Router.
-version: 0.16.0
+version: 0.16.5
 required_open_webui_version: 0.11.1
 """
 
@@ -292,7 +292,6 @@ class Filter:
             "lite_unfiltered_messages",
             "previous_tool_context_applied",
             "history_cleanup_applied",
-            "lite_orchestrator_skills_applied",
         ):
             metadata.pop(key, None)
 

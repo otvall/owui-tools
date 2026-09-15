@@ -35,8 +35,8 @@ open_webui_models.__path__ = []
 open_webui_skills = types.ModuleType("open_webui.models.skills")
 open_webui_skills.Skills = skills_api
 skills_filter = load_module(
-    "lite_orchestrator_skills.py",
-    "lite_orchestrator_skills_tests",
+    "skill_context.py",
+    "skill_context_tests",
     {
         "open_webui": open_webui,
         "open_webui.models": open_webui_models,
@@ -253,7 +253,24 @@ class SkillPromptFilterTests(unittest.IsolatedAsyncioTestCase):
                 body, __request__=self.request
             )
             self.assertIn(expected, filtered["messages"][0]["content"])
-            self.assertTrue(metadata["lite_orchestrator_skills_applied"])
+            self.assertTrue(metadata["skill_context_applied"])
+
+    async def test_runs_for_regular_model_without_router_metadata(self):
+        self.request.app.state.MODELS["regular"] = {
+            "id": "regular",
+            "info": {
+                "meta": {
+                    "skillIds": ["general-skill"],
+                    "capabilities": {"builtin_tools": True},
+                }
+            },
+        }
+        body = {"model": "regular", "messages": [], "metadata": {}}
+
+        await skills_filter.Filter().inlet(body, __request__=self.request)
+
+        self.assertIn("general-skill", body["messages"][0]["content"])
+        self.assertTrue(body["metadata"]["skill_context_applied"])
 
     async def test_filter_is_idempotent(self):
         metadata = registry_metadata()
@@ -360,7 +377,6 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
         }
         await self.previous.inlet(body)
         await self.cleanup.inlet(body)
-        await self.skills.inlet(body, __request__=self.request)
         return body
 
     async def route(self, messages):
@@ -375,10 +391,38 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
             [
                 self.previous.valves.priority,
                 self.cleanup.valves.priority,
-                self.skills.valves.priority,
             ],
-            [-90, -80, -70],
+            [-90, -80],
         )
+
+    async def test_router_builds_skill_prompt_without_skill_filter(self):
+        self.metadata["lite_orchestrator_skill_ids"] = ["route-a"]
+        self.pipe._get_model_bound_capabilities = AsyncMock(
+            return_value=router.CapabilitySet(
+                [],
+                ["route-a"],
+                {},
+                "<available_skills>\n<skill><id>route-a</id></skill>\n</available_skills>",
+            )
+        )
+
+        body = await self.apply_filters(
+            [{"role": "user", "content": "Use an agent"}]
+        )
+        await self.pipe._orchestrator_branch(body, self.runtime, self.context)
+        routed = self.pipe._generate.call_args.kwargs["body"]
+
+        prompts = [
+            message["content"]
+            for message in routed["messages"]
+            if isinstance(message.get("content"), str)
+            and message["content"].startswith(
+                router.ORCHESTRATOR_SKILL_PROMPT_PREFIX
+            )
+        ]
+        self.assertEqual(len(prompts), 1)
+        self.assertIn("route-a", prompts[0])
+        self.assertNotIn("skill_context_applied", self.metadata)
 
     async def test_orchestrator_gets_text_history_record_and_current_native_calls(self):
         messages = [

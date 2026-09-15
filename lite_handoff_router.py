@@ -1,7 +1,7 @@
 """
 title: Lite Handoff Router
 description: Stateless same-response subagent handoff router.
-version: 0.16.4
+version: 0.16.5
 required_open_webui_version: 0.11.1
 """
 
@@ -32,6 +32,8 @@ ACTIVE_HANDOFF_KEY = "lite_active_handoff"
 CHILD_RUNTIME_KEY = "lite_active_tool_runtime"
 BASE_RUNTIME_KEY = "lite_base_tool_runtime"
 PREVIOUS_TOOL_CONTEXT_PREFIX = "Previous request execution record (reference data):\n"
+ORCHESTRATOR_SKILL_PROMPT_PREFIX = "Lite orchestrator Skill context:\n"
+GENERIC_SKILL_PROMPT_PREFIX = "Skill context:\n"
 TOOL_IMAGE_TEXT = "Here are the images from the tool results above. Please analyze them."
 OUTER_INFERENCE_PARAMS = (
     "temperature",
@@ -634,6 +636,20 @@ class ModelCapabilityResolver:
     def lazy_skills(runtime_model: dict) -> bool:
         meta = (runtime_model or {}).get("info", {}).get("meta", {}) or {}
         return (meta.get("capabilities") or {}).get("builtin_tools", True) is not False
+
+    @staticmethod
+    def orchestrator_prompt(skill_manifest: str) -> str:
+        if not skill_manifest:
+            return ""
+        if "<available_skills>" in skill_manifest:
+            return (
+                "The following Skills are available on demand. Inspect their descriptions "
+                "and call view_skill for any Skill that may apply before following its full "
+                "instructions. Load a relevant routing Skill before calling lite_delegate."
+                "\n\n"
+                + skill_manifest
+            )
+        return skill_manifest
 
     @staticmethod
     async def full_skill_context(skill_ids: list[str]) -> str:
@@ -1313,7 +1329,6 @@ class Pipe(PipeAdapters):
             for name, key in (
                 ("Previous Tool Context", "previous_tool_context_applied"),
                 ("History Cleanup", "history_cleanup_applied"),
-                ("Lite Orchestrator Skills", "lite_orchestrator_skills_applied"),
             )
             if not runtime.metadata.get(key)
         ]
@@ -1324,6 +1339,7 @@ class Pipe(PipeAdapters):
             )
         base_tool_ids = normalize_ids(runtime.metadata.get("lite_base_tool_ids"))
         skill_ids = normalize_ids(runtime.metadata.get("lite_orchestrator_skill_ids"))
+        skill_manifest = ""
         if base_tool_ids or skill_ids:
             router_model_id = str(runtime.metadata.get("lite_router_model_id") or "").strip()
             capabilities = runtime.cached_capabilities(
@@ -1357,11 +1373,33 @@ class Pipe(PipeAdapters):
                     router_model_id,
                     capabilities,
                 )
+            skill_manifest = capabilities.skill_manifest
             tool_ids = normalize_ids(
                 [*(runtime.metadata.get("tool_ids") or []), *base_tool_ids]
             )
             runtime.bind_tools(capabilities.tools, tool_ids, replace=False)
             self._merge_tool_schemas(routed, capabilities.tools)
+
+        messages = [
+            message
+            for message in routed.get("messages") or []
+            if not (
+                isinstance(message.get("content"), str)
+                and message["content"].startswith(
+                    (ORCHESTRATOR_SKILL_PROMPT_PREFIX, GENERIC_SKILL_PROMPT_PREFIX)
+                )
+            )
+        ]
+        skill_prompt = self._capabilities.orchestrator_prompt(skill_manifest)
+        if skill_prompt:
+            messages.insert(
+                0,
+                {
+                    "role": "system",
+                    "content": ORCHESTRATOR_SKILL_PROMPT_PREFIX + skill_prompt,
+                },
+            )
+        routed["messages"] = messages
 
         model_id = self.valves.orchestrator_model_id.strip()
         if not model_id:

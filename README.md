@@ -1,10 +1,10 @@
 # Lite Handoff Router для Open WebUI v0.11.1
 
-Версия комплекта: **0.16.4**.
+Версия комплекта: **0.16.5**.
 
-Логика начальной подготовки запроса разделена на четыре inlet-фильтра. Pipe
-отвечает только за runtime-маршрутизацию, capabilities выбранной модели и
-продолжения после Tool Calls.
+Подготовка истории Router разделена на три inlet-фильтра. Pipe отвечает за
+runtime-маршрутизацию, capabilities выбранной модели, Skill-промпты и продолжения
+после Tool Calls.
 
 ## Компоненты
 
@@ -14,7 +14,7 @@
 | `lite_subagent_registry.py` | Filter | Строит доступный пользователю реестр агентов |
 | `previous_tool_context.py` | Filter | Добавляет любой модели строковую запись Tool Calls предыдущего запроса |
 | `history_cleanup.py` | Filter | Удаляет прошлые нативные Tool Calls из контекста любой модели |
-| `lite_orchestrator_skills.py` | Filter | Строит динамический промпт Skills оркестратора |
+| `skill_context.py` | Filter | Необязательный самостоятельный Skill-контекст для других моделей |
 | `lite_handoff_router.py` | Pipe | Выбирает модель, подключает Skills, Tools и MCP, ведёт текущий handoff |
 
 Все файлы самостоятельны: при установке в Open WebUI они не импортируют друг
@@ -24,12 +24,13 @@
 ## Установка обновления
 
 1. Обновите существующие Functions из файлов:
-   `lite_subagent_registry.py` и `lite_handoff_router.py`.
-2. Создайте три новые Filter Functions из файлов:
-   `previous_tool_context.py`, `history_cleanup.py` и
-   `lite_orchestrator_skills.py`.
-3. Включите все четыре фильтра и прикрепите их к публичной Router Workspace
-   Model, через которую пользователь начинает чат.
+   `lite_subagent_registry.py` и `lite_handoff_router.py`. Если Skill-фильтр уже
+   установлен, замените его код содержимым `skill_context.py`, но отсоедините от
+   Router Model.
+2. Создайте две Filter Functions из файлов:
+   `previous_tool_context.py` и `history_cleanup.py`.
+3. Включите и прикрепите к публичной Router Workspace Model три фильтра: Registry,
+   Previous Tool Context и History Cleanup.
 4. Оставьте значения `priority`, указанные по умолчанию:
 
    | Filter | Priority |
@@ -37,11 +38,10 @@
    | Lite Subagent Registry | `-100` |
    | Previous Tool Context | `-90` |
    | History Cleanup | `-80` |
-   | Lite Orchestrator Skills | `-70` |
 
 5. В Valves Lite Handoff Router укажите `orchestrator_model_id`, как и раньше.
 
-Фильтры нужно прикрепить именно к Router Workspace Model. Внутренние вызовы
+Эти три фильтра нужно прикрепить именно к Router Workspace Model. Внутренние вызовы
 `orchestrator_model_id` и моделей сабагентов выполняются из pipe и не запускают
 для них новый inlet pipeline.
 
@@ -64,10 +64,15 @@
 3. History Cleanup оставляет штатную текстовую переписку, удаляет прошлые
    нативные `tool_calls` и сообщения `tool`, но сохраняет текущий запрос и его
    незавершённую цепочку без изменений.
-4. Orchestrator Skills добавляет системный контекст routing Skills. При доступном
-   builtin `view_skill` это manifest; иначе — полное содержимое Skills.
+4. Router на основе уже разрешённых capabilities строит системный контекст
+   routing Skills. При доступном builtin `view_skill` это manifest; иначе —
+   полное содержимое Skills.
 5. Router подключает реальные callables оркестратора и вызывает
    `orchestrator_model_id`.
+
+`skill_context.py` подключать к Router не нужно. Он сохранён как
+необязательный фильтр `Skill Context` для других моделей и самостоятельно читает
+их `skillIds`. Registry и History Cleanup для него не требуются.
 
 ## Самостоятельное использование контекстных фильтров
 
