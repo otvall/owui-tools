@@ -34,6 +34,10 @@ open_webui_models = types.ModuleType("open_webui.models")
 open_webui_models.__path__ = []
 open_webui_skills = types.ModuleType("open_webui.models.skills")
 open_webui_skills.Skills = skills_api
+open_webui_utils = types.ModuleType("open_webui.utils")
+open_webui_utils.__path__ = []
+open_webui_tools = types.ModuleType("open_webui.utils.tools")
+open_webui_tools.get_builtin_tools = AsyncMock(return_value={})
 skills_filter = load_module(
     "skill_context.py",
     "skill_context_tests",
@@ -41,8 +45,12 @@ skills_filter = load_module(
         "open_webui": open_webui,
         "open_webui.models": open_webui_models,
         "open_webui.models.skills": open_webui_skills,
+        "open_webui.utils": open_webui_utils,
+        "open_webui.utils.tools": open_webui_tools,
     },
 )
+tool_call_filter = load_module("tool_call_filter.py", "tool_call_filter_integration_tests")
+subagent_context_filter = load_module("subagent_context.py", "subagent_context_integration_tests")
 
 
 def previous_turn():
@@ -222,6 +230,14 @@ class SkillPromptFilterTests(unittest.IsolatedAsyncioTestCase):
                 is_active=True,
             )
         )
+        skills_filter.get_builtin_tools = AsyncMock(
+            return_value={
+                "view_skill": {
+                    "spec": {"name": "view_skill"},
+                    "callable": AsyncMock(),
+                }
+            }
+        )
         self.request = types.SimpleNamespace(
             app=types.SimpleNamespace(
                 state=types.SimpleNamespace(
@@ -243,6 +259,9 @@ class SkillPromptFilterTests(unittest.IsolatedAsyncioTestCase):
             (False, "Instructions route-a"),
         ):
             metadata = registry_metadata()
+            metadata.update(
+                {"session_id": "session", "params": {"function_calling": "native"}}
+            )
             metadata["history_cleanup_applied"] = True
             metadata["lite_orchestrator_skill_ids"] = ["route-a"]
             self.request.app.state.MODELS["router"]["info"]["meta"][
@@ -250,10 +269,21 @@ class SkillPromptFilterTests(unittest.IsolatedAsyncioTestCase):
             ]["builtin_tools"] = builtin_tools
             body = {"model": "router", "metadata": metadata, "messages": []}
             filtered = await skills_filter.Filter().inlet(
-                body, __request__=self.request
+                body, __request__=self.request, __user__={"id": "user"}
             )
             self.assertIn(expected, filtered["messages"][0]["content"])
             self.assertTrue(metadata["skill_context_applied"])
+            self.assertEqual(
+                "view_skill" in metadata.get("tools", {}),
+                builtin_tools,
+            )
+            self.assertEqual(
+                any(
+                    ((schema.get("function") or {}).get("name") == "view_skill")
+                    for schema in body.get("tools", [])
+                ),
+                builtin_tools,
+            )
 
     async def test_runs_for_regular_model_without_router_metadata(self):
         self.request.app.state.MODELS["regular"] = {
@@ -286,6 +316,169 @@ class SkillPromptFilterTests(unittest.IsolatedAsyncioTestCase):
             if message.get("content", "").startswith(skills_filter.PROMPT_PREFIX)
         ]
         self.assertEqual(len(prompts), 1)
+
+
+class ToolCallFilterTests(unittest.IsolatedAsyncioTestCase):
+    async def test_keeps_only_supported_complete_pairs_and_strips_router_trace(self):
+        body = {
+            "messages": grouped_history()
+            + [
+                assistant(call("blocked", "private_tool")),
+                result("blocked", "private result"),
+                result("orphan", "orphan result"),
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "lookup"}}
+            ],
+            "metadata": {
+                "tools": {"lookup": {}},
+                "lite_target_agent_id": "agent-a",
+                "lite_subagent_filter_run": True,
+                "lite_subagent_filter_pipeline": [],
+            },
+        }
+        original = copy.deepcopy(body["messages"])
+
+        await tool_call_filter.Filter().inlet(body)
+
+        calls = [
+            call_item["id"]
+            for message in body["messages"]
+            for call_item in message.get("tool_calls", [])
+        ]
+        results = [
+            message["tool_call_id"]
+            for message in body["messages"]
+            if message.get("role") == "tool"
+        ]
+        self.assertEqual(calls, ["lookup"])
+        self.assertEqual(results, ["lookup"])
+        self.assertNotIn("routing instructions", json.dumps(body["messages"]))
+        self.assertNotIn("private result", json.dumps(body["messages"]))
+        self.assertEqual(original, grouped_history() + [
+            assistant(call("blocked", "private_tool")),
+            result("blocked", "private result"),
+            result("orphan", "orphan result"),
+        ])
+
+    async def test_keeps_view_skill_result_after_skill_filter_enabled_it(self):
+        body = {
+            "messages": [
+                {"role": "user", "content": "question"},
+                assistant(call("delegate", "lite_delegate", agent_id="agent-a")),
+                result("delegate", marker("agent-a")),
+                assistant(call("skill", "view_skill", id="child-skill")),
+                result("skill", "skill instructions"),
+            ],
+            "metadata": {
+                "tools": {},
+                "lite_target_agent_id": "agent-a",
+                "lite_target_model_id": "agent-a",
+                "lite_view_skill_available": True,
+                "lite_view_skill_model_id": "agent-a",
+            },
+        }
+
+        await tool_call_filter.Filter().inlet(body)
+
+        self.assertEqual(
+            [
+                call_item["id"]
+                for message in body["messages"]
+                for call_item in message.get("tool_calls", [])
+            ],
+            ["skill"],
+        )
+        self.assertEqual(
+            [message.get("content") for message in body["messages"] if message.get("role") == "tool"],
+            ["skill instructions"],
+        )
+
+
+class SubagentContextFilterTests(unittest.IsolatedAsyncioTestCase):
+    @staticmethod
+    def conversation():
+        return [
+            {"role": "system", "content": "system"},
+            {"role": "user", "content": "question one"},
+            assistant(call("one-a", "lookup")),
+            result("one-a", "result one a"),
+            {"role": "assistant", "content": "answer one"},
+            {"role": "user", "content": "question two"},
+            assistant(call("two-a", "lookup"), call("two-b", "lookup")),
+            result("two-a", "result two a"),
+            result("two-b", "result two b"),
+            {"role": "assistant", "content": "answer two"},
+            {"role": "user", "content": "current question"},
+            assistant(call("current", "lookup")),
+            result("current", "current result"),
+        ]
+
+    async def apply(self, turns, tool_calls):
+        instance = subagent_context_filter.Filter()
+        instance.valves.history_turns = turns
+        instance.valves.history_tool_calls = tool_calls
+        body = {
+            "messages": self.conversation(),
+            "metadata": {
+                "tool_call_filter_applied": True,
+                "lite_subagent_filter_run": True,
+                "lite_subagent_filter_pipeline": ["tool_call_filter"],
+            },
+        }
+        await instance.inlet(body)
+        return body["messages"]
+
+    async def test_tool_limit_is_additional_to_turn_limit(self):
+        messages = await self.apply(turns=1, tool_calls=5)
+        serialized = json.dumps(messages)
+        self.assertNotIn("question one", serialized)
+        self.assertIn("question two", serialized)
+        self.assertIn("answer two", serialized)
+        self.assertIn("result two a", serialized)
+        self.assertIn("result two b", serialized)
+        self.assertIn("current result", serialized)
+
+    async def test_tool_limit_keeps_last_calls_but_all_selected_text_turns(self):
+        messages = await self.apply(turns=2, tool_calls=1)
+        serialized = json.dumps(messages)
+        self.assertIn("question one", serialized)
+        self.assertIn("answer one", serialized)
+        self.assertIn("question two", serialized)
+        self.assertIn("answer two", serialized)
+        self.assertNotIn("result one a", serialized)
+        self.assertNotIn("result two a", serialized)
+        self.assertIn("result two b", serialized)
+        self.assertIn("current result", serialized)
+
+    async def test_zero_turns_removes_all_historical_calls(self):
+        messages = await self.apply(turns=0, tool_calls=5)
+        serialized = json.dumps(messages)
+        self.assertNotIn("question one", serialized)
+        self.assertNotIn("question two", serialized)
+        self.assertNotIn("result two b", serialized)
+        self.assertIn("current question", serialized)
+        self.assertIn("current result", serialized)
+
+    async def test_incomplete_turn_does_not_consume_text_pair_limit(self):
+        instance = subagent_context_filter.Filter()
+        instance.valves.history_turns = 1
+        body = {
+            "messages": [
+                {"role": "user", "content": "completed question"},
+                {"role": "assistant", "content": "completed answer"},
+                {"role": "user", "content": "abandoned question"},
+                {"role": "user", "content": "current question"},
+            ],
+            "metadata": {"tool_call_filter_applied": True},
+        }
+
+        await instance.inlet(body)
+
+        serialized = json.dumps(body["messages"])
+        self.assertIn("completed question", serialized)
+        self.assertIn("completed answer", serialized)
+        self.assertNotIn("abandoned question", serialized)
 
 
 class PreviousToolContextMigrationTests(unittest.IsolatedAsyncioTestCase):
@@ -365,6 +558,25 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
         self.pipe = router.Pipe()
         self.pipe.valves.orchestrator_model_id = "base-model"
         self.pipe._generate = AsyncMock()
+        self.child_tool_filter = tool_call_filter.Filter()
+        self.child_context_filter = subagent_context_filter.Filter()
+        self.child_skill_filter = skills_filter.Filter()
+        self.pipe._child_filters.run = self.apply_child_filters
+
+    async def apply_child_filters(self, *, body, runtime_model, runtime, context):
+        metadata = runtime.metadata
+        metadata["lite_subagent_filter_run"] = True
+        metadata["lite_subagent_filter_pipeline"] = []
+        await self.child_tool_filter.inlet(body)
+        await self.child_context_filter.inlet(body)
+        await self.child_skill_filter.inlet(
+            body,
+            __request__=context.request,
+            __user__={},
+            __model__=runtime_model,
+        )
+        metadata.pop("lite_subagent_filter_run", None)
+        return body
 
     async def apply_filters(self, messages):
         body = {
@@ -393,6 +605,14 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
                 self.cleanup.valves.priority,
             ],
             [-90, -80],
+        )
+        self.assertEqual(
+            [
+                self.child_tool_filter.valves.priority,
+                self.child_context_filter.valves.priority,
+                self.child_skill_filter.valves.priority,
+            ],
+            [-30, -20, -10],
         )
 
     async def test_router_builds_skill_prompt_without_skill_filter(self):
@@ -538,8 +758,8 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
             ]
 
     async def test_same_child_receives_native_history_after_cleanup(self):
-        self.pipe.valves.history_turns = 1
-        self.pipe.valves.history_tool_calls = 1
+        self.child_context_filter.valves.history_turns = 1
+        self.child_context_filter.valves.history_tool_calls = 1
         self.pipe._child_builder._attachments = AsyncMock(
             return_value=([], ["catalog-tools"])
         )

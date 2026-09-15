@@ -25,6 +25,10 @@ def load_router():
         "open_webui.models.skills": {"Skills": types.SimpleNamespace()},
         "open_webui.models.users": {"Users": types.SimpleNamespace()},
         "open_webui.utils.chat": {"generate_chat_completion": AsyncMock()},
+        "open_webui.utils.filter": {
+            "get_filter_functions": AsyncMock(return_value=[]),
+            "process_filter_functions": AsyncMock(side_effect=lambda **kwargs: (kwargs["form_data"], {})),
+        },
         "open_webui.utils.misc": {
             "remove_system_message": lambda messages: [
                 m for m in messages if m["role"] != "system"
@@ -53,6 +57,17 @@ def load_router():
 router = load_router()
 
 
+def load_plain_module(filename, name):
+    spec = importlib.util.spec_from_file_location(name, ROOT / filename)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+tool_filter_module = load_plain_module("tool_call_filter.py", "tool_call_filter_tests")
+context_filter_module = load_plain_module("subagent_context.py", "subagent_context_tests")
+
+
 def call(call_id, name, **arguments):
     return {
         "id": call_id, "type": "function",
@@ -77,26 +92,7 @@ def grouped_history():
     return fixture["messages"]
 
 
-class HistoryTests(unittest.TestCase):
-    def setUp(self):
-        self.agent = router.AgentSpec("agent-a", "Agent A", "route-a")
-        self.registry = {"agent-a": self.agent}
-
-    def scope(self, messages, **options):
-        params = dict(
-            agent=self.agent, registry=self.registry,
-            allowed_tools={"lookup", "view_skill"}, skill_ids=["child-skill"],
-            user_index=0, marker_index=3, history_turns=0, history_tool_calls=0,
-        )
-        params.update(options)
-        return router.HandoffProtocol.scoped_history(messages, **params)
-
-    def assert_pairs(self, messages, expected_ids):
-        calls = [c["id"] for m in messages for c in m.get("tool_calls", [])]
-        results = [m["tool_call_id"] for m in messages if m["role"] == "tool"]
-        self.assertCountEqual(calls, expected_ids)
-        self.assertCountEqual(results, expected_ids)
-
+class ProtocolTests(unittest.TestCase):
     def test_only_v2_agent_id_marker_is_supported(self):
         self.assertEqual(router.HandoffMarker.parse(marker()).agent_id, "agent-a")
         self.assertIsNone(
@@ -110,25 +106,6 @@ class HistoryTests(unittest.TestCase):
             )
         )
 
-    def test_owui_grouped_delegate_and_child_call_preserves_result(self):
-        messages = grouped_history()
-        original = copy.deepcopy(messages)
-        scoped = self.scope(messages)
-        self.assert_pairs(scoped, ["lookup"])
-        self.assertEqual(scoped[-1]["content"], "TOOL_RESULT_42")
-        self.assertNotIn("routing instructions", json.dumps(scoped))
-        self.assertEqual(messages, original)
-
-    def test_separate_current_exchange_ignores_historical_limits(self):
-        messages = [
-            {"role": "user", "content": "question"},
-            assistant(call("delegate", "lite_delegate", agent_id="agent-a")),
-            result("delegate", marker()),
-            assistant(call("first", "lookup")), result("first", "first result"),
-            assistant(call("second", "lookup")), result("second", "second result"),
-        ]
-        self.assert_pairs(self.scope(messages, marker_index=2), ["first", "second"])
-
     def test_result_from_another_tool_cannot_start_handoff(self):
         messages = [
             {"role": "user", "content": "question"},
@@ -139,48 +116,6 @@ class HistoryTests(unittest.TestCase):
             router.HandoffProtocol.find_current(grouped_history()),
             router.HandoffMarker("agent-a"),
         )
-
-    def test_grouped_calls_keep_child_skill_and_drop_router_skill_and_orphans(self):
-        messages = grouped_history()
-        messages[1]["tool_calls"] += [
-            call("skill", "view_skill", id="child-skill"),
-            call("private", "view_skill", id="route-a"),
-            call("unknown", "other_tool"), call("unfinished", "lookup"),
-        ]
-        messages += [
-            result("skill", "child instructions"), result("private", "private instructions"),
-            result("unknown", "unknown output"), result("orphan", "orphan output"),
-        ]
-        scoped = self.scope(messages)
-        self.assert_pairs(scoped, ["lookup", "skill"])
-        self.assertNotIn("private instructions", json.dumps(scoped))
-        self.assertNotIn("orphan output", json.dumps(scoped))
-
-    def test_historical_grouped_calls_use_delegate_result_for_ownership(self):
-        messages = grouped_history() + [
-            {"role": "assistant", "content": "previous answer"},
-            {"role": "user", "content": "next question"},
-            assistant(call("delegate2", "lite_delegate", agent_id="agent-a")),
-            result("delegate2", marker()),
-        ]
-        scoped = self.scope(messages, user_index=6, marker_index=8, history_tool_calls=1)
-        self.assert_pairs(scoped, ["lookup"])
-        self.assertEqual(scoped[-1]["content"], "next question")
-
-    def test_historical_other_agent_and_unknown_owner_are_excluded(self):
-        messages = grouped_history()
-        messages[3]["content"] = marker("agent-b")
-        self.registry["agent-b"] = router.AgentSpec("agent-b", "Agent B")
-        messages += [
-            {"role": "user", "content": "unowned turn"},
-            assistant(call("unowned", "lookup")), result("unowned", "unowned result"),
-            {"role": "user", "content": "next question"},
-            assistant(call("delegate2", "lite_delegate", agent_id="agent-a")),
-            result("delegate2", marker()),
-        ]
-        scoped = self.scope(messages, user_index=8, marker_index=10, history_tool_calls=10)
-        self.assert_pairs(scoped, [])
-
 
 class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -198,12 +133,26 @@ class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
             ["toolkit"], [], {"lookup": {"spec": {"name": "lookup"}, "callable": AsyncMock()}},
         )
         self.loader = AsyncMock(return_value=self.capabilities)
+        self.tool_filter = tool_filter_module.Filter()
+        self.context_filter = context_filter_module.Filter()
+
+    async def apply_filters(self, *, body, runtime_model, runtime, context):
+        metadata = runtime.metadata
+        metadata["lite_subagent_filter_run"] = True
+        metadata["lite_subagent_filter_pipeline"] = []
+        await self.tool_filter.inlet(body)
+        await self.context_filter.inlet(body)
+        metadata["skill_context_applied"] = True
+        metadata["lite_subagent_filter_pipeline"].append("skill_context")
+        metadata.pop("lite_subagent_filter_run", None)
+        return body
 
     async def prepare(self, messages):
         return (await self.builder.prepare(
             body={"model": "router", "messages": messages},
             marker=router.HandoffMarker("agent-a"), registry={"agent-a": self.agent},
             runtime=self.runtime, context=self.context, load_capabilities=self.loader,
+            apply_filters=self.apply_filters,
         ))[0]["messages"]
 
     async def test_boundary_tracks_receipt_when_owui_regroups_messages(self):
@@ -224,7 +173,16 @@ class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
     async def test_tool_image_user_message_does_not_replace_original_request(self):
         initial = grouped_history()[:4]
         await self.prepare(initial)
-        image_message = {"role": "user", "content": [{"type": "image_url", "image_url": {"url": "https://example.test/image.png"}}]}
+        image_message = {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": tool_filter_module.TOOL_IMAGE_TEXT},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "https://example.test/image.png"},
+                },
+            ],
+        }
         messages = await self.prepare(grouped_history() + [image_message])
         users = [m for m in messages if m["role"] == "user"]
         self.assertEqual(users, [initial[0], image_message])
@@ -284,6 +242,7 @@ class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
             runtime=self.runtime,
             context=self.context,
             load_capabilities=self.loader,
+            apply_filters=self.apply_filters,
         )
         self.assertEqual(
             set(routed),
@@ -428,6 +387,79 @@ class WorkspaceCapabilityTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIn('<knowledge type="file" id="file-1"', context)
         self.assertIn('name="Guide &quot;A&quot;"', context)
+
+
+class ChildFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.metadata = {"filter_ids": ["enabled-toggle"]}
+        self.request = types.SimpleNamespace(
+            state=types.SimpleNamespace(metadata=self.metadata)
+        )
+        self.runtime = router.RequestRuntime(self.request, self.metadata)
+        self.context = router.InvocationContext(
+            request=self.request,
+            user=types.SimpleNamespace(model_dump=lambda: {"id": "user"}),
+        )
+        self.model = {
+            "id": "agent-a",
+            "info": {"meta": {"filterIds": ["tool", "context", "skills"]}},
+        }
+
+    async def test_runs_destination_model_inlet_pipeline(self):
+        filters = [types.SimpleNamespace(id=name) for name in ("tool", "context", "skills")]
+
+        async def process(**kwargs):
+            metadata = kwargs["form_data"]["metadata"]
+            metadata.update(
+                {
+                    "tool_call_filter_applied": True,
+                    "subagent_context_applied": True,
+                    "skill_context_applied": True,
+                    "lite_subagent_filter_pipeline": [
+                        "tool_call_filter",
+                        "subagent_context",
+                        "skill_context",
+                    ],
+                }
+            )
+            return kwargs["form_data"], {}
+
+        with (
+            patch.object(router, "get_filter_functions", AsyncMock(return_value=filters)) as get_filters,
+            patch.object(router, "process_filter_functions", AsyncMock(side_effect=process)) as run_filters,
+        ):
+            body = await router.ChildFilterPipeline().run(
+                body={"model": "agent-a", "messages": [], "metadata": self.metadata},
+                runtime_model=self.model,
+                runtime=self.runtime,
+                context=self.context,
+            )
+
+        self.assertIs(body["metadata"], self.metadata)
+        get_filters.assert_awaited_once_with(
+            self.request,
+            self.model,
+            ["enabled-toggle"],
+        )
+        self.assertEqual(run_filters.call_args.kwargs["filter_type"], "inlet")
+        self.assertNotIn("lite_subagent_filter_run", self.metadata)
+
+    async def test_reports_missing_required_destination_filters(self):
+        with (
+            patch.object(router, "get_filter_functions", AsyncMock(return_value=[])),
+            patch.object(
+                router,
+                "process_filter_functions",
+                AsyncMock(side_effect=lambda **kwargs: (kwargs["form_data"], {})),
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "Required subagent filters"):
+                await router.ChildFilterPipeline().run(
+                    body={"model": "agent-a", "messages": [], "metadata": self.metadata},
+                    runtime_model=self.model,
+                    runtime=self.runtime,
+                    context=self.context,
+                )
 
 
 if __name__ == "__main__":

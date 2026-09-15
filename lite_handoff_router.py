@@ -1,7 +1,7 @@
 """
 title: Lite Handoff Router
 description: Stateless same-response subagent handoff router.
-version: 0.17.0
+version: 0.18.0
 required_open_webui_version: 0.11.1
 """
 
@@ -20,6 +20,7 @@ from open_webui.models.models import Models
 from open_webui.models.skills import Skills
 from open_webui.models.users import Users
 from open_webui.utils.chat import generate_chat_completion
+from open_webui.utils.filter import get_filter_functions, process_filter_functions
 from open_webui.utils.misc import remove_system_message
 from open_webui.utils.tools import get_attached_knowledge, get_builtin_tools, get_tools
 from pydantic import BaseModel, Field
@@ -117,128 +118,6 @@ class InvocationContext:
 
 class HandoffProtocol:
     @staticmethod
-    def model_for_marker(marker: HandoffMarker | None, registry: dict[str, AgentSpec]) -> str | None:
-        if marker is None:
-            return None
-        spec = registry.get(marker.agent_id) or next(
-            (spec for spec in registry.values() if spec.routing_skill_id == marker.agent_id), None,
-        )
-        return spec.model_id if spec else None
-
-    @staticmethod
-    def scoped_history(
-        messages: list[dict], *, agent: AgentSpec, registry: dict[str, AgentSpec],
-        allowed_tools: set[str], skill_ids: list[str], user_index: int,
-        marker_index: int, history_turns: int, history_tool_calls: int,
-    ) -> list[dict]:
-        """Select independent text/tool memory; keep the current execution intact.
-
-        Persisted delegate receipts establish tool ownership. Names alone are
-        insufficient: different agents can expose identically named tools.
-        Unknown ownership is excluded from historical tool memory.
-        """
-        selected: dict[int, dict] = {}
-        past = messages[:user_index]
-        pairs = []
-        pending_user = None
-        final_answer = None
-        owner = None
-        calls = {}
-        exchanges = []
-        allowed_skills = {item.lower() for item in skill_ids}
-
-        def allowed(call):
-            function = call.get("function") or {}
-            name = function.get("name")
-            if name not in allowed_tools:
-                return False
-            if name == "view_skill":
-                try:
-                    args = function.get("arguments") or {}
-                    if isinstance(args, str):
-                        args = json.loads(args)
-                    return str(args.get("id") or "").lower() in allowed_skills
-                except (ValueError, TypeError, AttributeError):
-                    return False
-            return True
-
-        for index, message in enumerate(past):
-            role = message.get("role")
-            if role == "user":
-                owner = None
-                if pending_user is not None and final_answer is not None:
-                    pairs.append((pending_user, final_answer))
-                pending_user, final_answer = index, None
-            elif role == "assistant":
-                if message.get("tool_calls"):
-                    for position, call in enumerate(message["tool_calls"]):
-                        if call.get("id"):
-                            calls[call["id"]] = (index, position, call)
-                elif message.get("content") and not MessageHistory.is_previous_tool_context_message(message):
-                    final_answer = index
-            elif role == "tool":
-                entry = calls.get(message.get("tool_call_id"))
-                marker = HandoffMarker.parse(message.get("content"))
-                if marker is not None and entry is not None and (
-                    entry[2].get("function") or {}
-                ).get("name") == "lite_delegate":
-                    owner = HandoffProtocol.model_for_marker(marker, registry)
-                    continue
-                if entry is not None:
-                    call_index, position, call = entry
-                    # OWUI may batch calls from both sides of a handoff into
-                    # one assistant message. Receipt order establishes the
-                    # owner; the assistant message's position does not.
-                    if owner == agent.model_id and allowed(call):
-                        exchanges.append((call_index, position, call, index))
-        if pending_user is not None and final_answer is not None:
-            pairs.append((pending_user, final_answer))
-        for pair in pairs[-history_turns:] if history_turns else []:
-            for index in pair:
-                selected[index] = {"role": past[index]["role"], "content": past[index]["content"]}
-        exchanges.sort(key=lambda item: (item[0], item[1]))
-        for call_index, _position, call, result_index in exchanges[-history_tool_calls:] if history_tool_calls else []:
-            assistant = selected.setdefault(call_index, {"role": "assistant", "content": ""})
-            assistant.setdefault("tool_calls", []).append(call)
-            selected[result_index] = past[result_index]
-
-        current_start = max(marker_index, user_index) + 1
-        current = copy.deepcopy(messages[current_start:])
-        completed = {m.get("tool_call_id") for m in current if m.get("role") == "tool"}
-
-        # convert_output_to_messages in OWUI 0.11.1 can put lite_delegate
-        # and child calls in the SAME assistant.tool_calls array, before the
-        # delegate receipt. Recover only calls whose results follow that
-        # receipt; never copy the router's text, reasoning or Skill results.
-        recovered_calls = [
-            copy.deepcopy(call)
-            for message in messages[max(user_index + 1, 0):current_start]
-            if message.get("role") == "assistant"
-            for call in message.get("tool_calls") or []
-            if call.get("id") and call["id"] in completed and allowed(call)
-        ]
-        if recovered_calls:
-            current.insert(0, {"role": "assistant", "content": "", "tool_calls": recovered_calls})
-
-        # Keep complete, allowlisted pairs, including recovered calls.
-        accepted = set()
-        for message in current:
-            for call in message.get("tool_calls") or []:
-                if allowed(call) and call.get("id") and call["id"] in completed:
-                    accepted.add(call["id"])
-            if message.get("tool_calls"):
-                message["tool_calls"] = [c for c in message["tool_calls"] if c.get("id") in accepted]
-                if not message["tool_calls"]:
-                    message.pop("tool_calls")
-        current = [m for m in current
-                   if not (m.get("role") == "tool" and m.get("tool_call_id") not in accepted)
-                   and not (m.get("role") == "assistant" and not HandoffProtocol._has_visible_assistant_content(m))]
-        result = [selected[index] for index in sorted(selected)]
-        if 0 <= user_index < len(messages):
-            result.append(messages[user_index])
-        return result + current
-
-    @staticmethod
     def find_current(messages: list[dict]) -> HandoffMarker | None:
         exchange = HandoffProtocol._current_exchange(messages)
         return exchange[0] if exchange is not None else None
@@ -270,60 +149,6 @@ class HandoffProtocol:
             message = HandoffProtocol._clean_assistant_message(original)
             if message is not None:
                 cleaned.append(message)
-        return cleaned
-
-    @staticmethod
-    def child_history(messages: list[dict], allowed_tool_names: set[str]) -> list[dict]:
-        """Remove the Router turn and retain only the selected child's Tools.
-
-        A current handoff marker divides the Router's private execution trace
-        from child continuation messages. The marker itself and every message
-        after the latest user input but before that marker are omitted.
-        """
-
-        exchange = HandoffProtocol._current_exchange(messages)
-        if exchange is None:
-            candidate_messages = messages
-        else:
-            _marker, marker_index, last_user_index = exchange
-            candidate_messages = [
-                *messages[: last_user_index + 1],
-                *messages[marker_index + 1 :],
-            ]
-        return HandoffProtocol._filter_tool_history(
-            candidate_messages,
-            allowed_tool_names,
-        )
-
-    @staticmethod
-    def _filter_tool_history(messages: list[dict], allowed_tool_names: set[str]) -> list[dict]:
-        allowed_names = {str(name or "").strip() for name in allowed_tool_names}
-        removed_call_ids = set()
-        cleaned = []
-        for original in messages:
-            if original.get("role") == "assistant" and original.get("tool_calls"):
-                message = dict(original)
-                kept_calls = []
-                for call in original["tool_calls"]:
-                    name = str((call.get("function") or {}).get("name") or "").strip()
-                    if name in allowed_names:
-                        kept_calls.append(call)
-                    elif call.get("id"):
-                        removed_call_ids.add(call["id"])
-                if kept_calls:
-                    message["tool_calls"] = kept_calls
-                else:
-                    message.pop("tool_calls", None)
-                if HandoffProtocol._has_visible_assistant_content(message):
-                    cleaned.append(message)
-                continue
-
-            if (
-                original.get("role") == "tool"
-                and original.get("tool_call_id") in removed_call_ids
-            ):
-                continue
-            cleaned.append(original)
         return cleaned
 
     @staticmethod
@@ -799,6 +624,7 @@ class ModelCapabilityResolver:
         files,
         connector: Callable,
         include_builtin_tools: bool = False,
+        resolve_skills: bool = True,
     ) -> CapabilitySet:
         requested_ids = normalize_ids(tool_ids)
         requested_skill_ids = normalize_ids(skill_ids)
@@ -806,7 +632,7 @@ class ModelCapabilityResolver:
             return CapabilitySet([], [], {})
 
         owner = None
-        if requested_ids or requested_skill_ids:
+        if requested_ids or (requested_skill_ids and resolve_skills):
             owner = await Users.get_user_by_id(capability_owner_id)
             if owner is None:
                 raise ValueError("Model capability owner is unavailable")
@@ -858,11 +684,14 @@ class ModelCapabilityResolver:
                     tools[name] = tool
 
         lazy_skills = self.lazy_skills(runtime_model)
-        skill_manifest = await (
-            self.skill_manifest(requested_skill_ids)
-            if lazy_skills else self.full_skill_context(requested_skill_ids)
-        )
-        if requested_skill_ids and lazy_skills:
+        skill_manifest = ""
+        if requested_skill_ids and resolve_skills:
+            skill_manifest = await (
+                self.skill_manifest(requested_skill_ids)
+                if lazy_skills
+                else self.full_skill_context(requested_skill_ids)
+            )
+        if requested_skill_ids and resolve_skills and lazy_skills:
             if self.SKILL_TOOL_NAME in tools:
                 raise ValueError(
                     'Attached Tool name "view_skill" conflicts with the builtin Skill loader'
@@ -916,6 +745,79 @@ class ModelCapabilityResolver:
         }
 
 
+class ChildFilterPipeline:
+    REQUIRED = (
+        ("Tool Call Filter", "tool_call_filter_applied"),
+        ("Subagent Context", "subagent_context_applied"),
+        ("Skill Context", "skill_context_applied"),
+    )
+    EXPECTED_ORDER = ["tool_call_filter", "subagent_context", "skill_context"]
+
+    async def run(
+        self,
+        *,
+        body: dict,
+        runtime_model: dict,
+        runtime: RequestRuntime,
+        context: InvocationContext,
+    ) -> dict:
+        metadata = runtime.metadata
+        for _name, key in self.REQUIRED:
+            metadata.pop(key, None)
+        metadata["lite_subagent_filter_pipeline"] = []
+        metadata["lite_subagent_filter_run"] = True
+
+        user_data = (
+            context.user.model_dump()
+            if hasattr(context.user, "model_dump")
+            else {}
+        )
+        extra_params = {
+            "__event_emitter__": context.event_emitter,
+            "__event_call__": context.event_call,
+            "__user__": user_data,
+            "__metadata__": metadata,
+            "__oauth_token__": context.oauth_token,
+            "__request__": context.request,
+            "__model__": runtime_model,
+            "__chat_id__": metadata.get("chat_id"),
+            "__message_id__": metadata.get("message_id"),
+        }
+        try:
+            filter_functions = await get_filter_functions(
+                context.request,
+                runtime_model,
+                metadata.get("filter_ids", []),
+            )
+            body, _flags = await process_filter_functions(
+                request=context.request,
+                filter_context=None,
+                filter_functions=filter_functions,
+                filter_type="inlet",
+                form_data=body,
+                extra_params=extra_params,
+            )
+        finally:
+            metadata.pop("lite_subagent_filter_run", None)
+
+        missing = [name for name, key in self.REQUIRED if not metadata.get(key)]
+        if missing:
+            raise ValueError(
+                "Required subagent filters are not attached to the destination model: "
+                + ", ".join(missing)
+            )
+        actual_order = metadata.get("lite_subagent_filter_pipeline")
+        if actual_order != self.EXPECTED_ORDER:
+            raise ValueError(
+                "Subagent filters ran in the wrong order: "
+                + " -> ".join(str(item) for item in actual_order or [])
+            )
+        if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
+            raise TypeError("Subagent filter pipeline returned an invalid request body")
+        body["metadata"] = metadata
+        return body
+
+
 class ChildRequestBuilder:
     @staticmethod
     def agent_registry(metadata: dict) -> dict[str, AgentSpec]:
@@ -945,8 +847,7 @@ class ChildRequestBuilder:
         runtime: RequestRuntime,
         context: InvocationContext,
         load_capabilities: Callable,
-        history_turns: int = 0,
-        history_tool_calls: int = 0,
+        apply_filters: Callable,
     ) -> tuple[dict, AgentSpec]:
         agent = registry.get(marker.agent_id)
         if agent is None:
@@ -989,36 +890,12 @@ class ChildRequestBuilder:
                 load_capabilities=load_capabilities,
             )
         )
-        # OWUI rebuilds and regroups the trace on each tool continuation.
-        # Resolve the receipt again: cached message offsets are not stable.
-        delegate_call_ids = HandoffProtocol._delegate_call_ids(source_messages)
-        marker_index = next(
-            (index for index in range(len(source_messages) - 1, -1, -1)
-             if source_messages[index].get("role") == "tool"
-             and source_messages[index].get("tool_call_id") in delegate_call_ids
-             and HandoffProtocol.model_for_marker(
-                 HandoffMarker.parse(source_messages[index].get("content")), registry,
-             ) == agent.model_id),
-            -1,
-        )
-        before = marker_index if marker_index >= 0 else len(source_messages)
-        user_index = MessageHistory.last_user_index(source_messages[:before])
-        runtime.sync(lite_history_boundary={
-            "model_id": agent.model_id, "user_index": user_index, "marker_index": marker_index,
-        })
-        child_messages = HandoffProtocol.scoped_history(
-            source_messages, agent=agent, registry=registry,
-            allowed_tools=set(capabilities.tools), skill_ids=child_skill_ids,
-            user_index=user_index, marker_index=marker_index,
-            history_turns=history_turns, history_tool_calls=history_tool_calls,
-        )
+        child_messages = copy.deepcopy(source_messages)
         child_messages.insert(
             0,
             {
                 "role": "system",
                 "content": self._system_prompt(
-                    marker,
-                    capabilities.skill_manifest,
                     ModelCapabilityResolver.knowledge_context(
                         runtime_model,
                         runtime.metadata,
@@ -1026,18 +903,28 @@ class ChildRequestBuilder:
                 ),
             },
         )
-        capability_messages[:] = copy.deepcopy(child_messages)
-
         routed_body["messages"] = child_messages
         routed_body["model"] = agent.model_id
         runtime.bind_tools(capabilities.tools, child_tool_ids, replace=True)
-        runtime.sync(skill_ids=child_skill_ids)
+        runtime.sync(
+            skill_ids=child_skill_ids,
+            lite_target_agent_id=marker.agent_id,
+            lite_target_model_id=agent.model_id,
+            lite_target_skill_ids=child_skill_ids,
+        )
         runtime.activate(marker, marker.agent_id, agent.model_id)
         routed_body["tools"] = [
             {"type": "function", "function": tool["spec"]}
             for tool in capabilities.tools.values()
         ]
         routed_body.pop("tool_choice", None)
+        routed_body = await apply_filters(
+            body=routed_body,
+            runtime_model=runtime_model,
+            runtime=runtime,
+            context=context,
+        )
+        capability_messages[:] = copy.deepcopy(routed_body["messages"])
         return routed_body, agent
 
     async def prepare_workspace_model(
@@ -1056,7 +943,8 @@ class ChildRequestBuilder:
         params, custom params, and system prompt. This method removes the outer
         model's already-expanded inference payload, then resolves the settings
         that OWUI normally prepares before provider dispatch: attached Tools,
-        MCP servers, Skills, and builtin Tools.
+        MCP servers and builtin Tools. The destination model's inlet filters
+        prepare history and Skills after this step.
         """
         runtime_model = context.request.app.state.MODELS.get(agent.model_id)
         if runtime_model is None:
@@ -1105,11 +993,7 @@ class ChildRequestBuilder:
         return normalize_ids(meta.get("skillIds")), normalize_ids(meta.get("toolIds"))
 
     @staticmethod
-    def _system_prompt(
-        _marker: HandoffMarker,
-        skill_manifest: str,
-        workspace_context: str = "",
-    ) -> str:
+    def _system_prompt(workspace_context: str = "") -> str:
         prompt = (
             "You are the specialist selected by an orchestrator.\n"
             "Execute the delegated task directly and completely.\n"
@@ -1119,14 +1003,8 @@ class ChildRequestBuilder:
             "Use your available tools whenever necessary.\n"
             "Follow the supplied Skill instructions. "
         )
-        if "<available_skills>" in skill_manifest:
-            prompt += (
-                "When an available Skill may apply, call view_skill to load its full "
-                "instructions before completing the task."
-            )
-        for context in (workspace_context, skill_manifest):
-            if context:
-                prompt += "\n\n" + context
+        if workspace_context:
+            prompt += "\n\n" + workspace_context
         return prompt
 
     @staticmethod
@@ -1195,14 +1073,6 @@ class CompletionGateway:
 
 class PipeAdapters:
     class Valves(BaseModel):
-        history_turns: int = Field(
-            default=0, ge=0,
-            description="Previous user/assistant pairs supplied at handoff; 0 means none.",
-        )
-        history_tool_calls: int = Field(
-            default=0, ge=0,
-            description="Previous calls and results from the selected agent; 0 means none. Current execution is always retained.",
-        )
         orchestrator_model_id: str = Field(
             default="",
             description="Real model used for normal orchestrator inference.",
@@ -1218,6 +1088,7 @@ class PipeAdapters:
         self._protocol = HandoffProtocol()
         self._mcp = McpRuntime()
         self._capabilities = ModelCapabilityResolver(self._mcp)
+        self._child_filters = ChildFilterPipeline()
         self._child_builder = ChildRequestBuilder()
         self._gateway = CompletionGateway()
 
@@ -1249,9 +1120,6 @@ class PipeAdapters:
 
     def _strip_delegate_exchange(self, messages: list[dict]) -> list[dict]:
         return self._protocol.strip_exchange(messages)
-
-    async def _load_child_skill_manifest(self, *, user=None, skill_ids: list[str]) -> str:
-        return await self._capabilities.skill_manifest(skill_ids)
 
     @staticmethod
     def _clear_outer_inference_params(body: dict) -> None:
@@ -1334,6 +1202,7 @@ class PipeAdapters:
             oauth_token=kwargs["oauth_token"],
             files=kwargs["files"],
             include_builtin_tools=True,
+            resolve_skills=False,
         )
 
     async def _get_or_create_child_capabilities(self, **kwargs) -> CapabilitySet:
@@ -1397,8 +1266,7 @@ class PipeAdapters:
             runtime=RequestRuntime(kwargs["request"], kwargs["metadata"]),
             context=context,
             load_capabilities=self._get_or_create_child_capabilities,
-            history_turns=self.valves.history_turns,
-            history_tool_calls=self.valves.history_tool_calls,
+            apply_filters=self._child_filters.run,
         )
         return body, agent.name, agent.model_id
 

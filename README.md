@@ -1,10 +1,10 @@
 # Lite Handoff Router для Open WebUI v0.11.1
 
-Версия комплекта: **0.17.0**.
+Версия комплекта: **0.18.0**.
 
-Подготовка истории Router разделена на три inlet-фильтра. Pipe отвечает за
-runtime-маршрутизацию, capabilities выбранной модели, Skill-промпты и продолжения
-после Tool Calls.
+Pipe отвечает за runtime-маршрутизацию и capabilities выбранной модели. Перед
+каждым вызовом сабагента он вручную запускает три inlet-фильтра, прикреплённые к
+Workspace Model адресата.
 
 ## Компоненты
 
@@ -14,8 +14,10 @@ runtime-маршрутизацию, capabilities выбранной модели
 | `lite_subagent_registry.py` | Filter | Строит доступный пользователю реестр агентов |
 | `previous_tool_context.py` | Filter | Добавляет любой модели строковую запись Tool Calls предыдущего запроса |
 | `history_cleanup.py` | Filter | Удаляет прошлые нативные Tool Calls из контекста любой модели |
-| `skill_context.py` | Filter | Необязательный самостоятельный Skill-контекст для других моделей |
-| `lite_handoff_router.py` | Pipe | Выбирает модель, применяет её Workspace-контекст и ведёт текущий handoff |
+| `tool_call_filter.py` | Filter | Оставляет только Tool Calls, доступные модели адресата |
+| `subagent_context.py` | Filter | Ограничивает прошлые пары сообщений и Tool Calls |
+| `skill_context.py` | Filter | Строит Skill-контекст и подключает `view_skill` |
+| `lite_handoff_router.py` | Pipe | Выбирает модель, запускает её фильтры и ведёт текущий handoff |
 
 Все файлы самостоятельны: при установке в Open WebUI они не импортируют друг
 друга как Python-модули. Фильтры обмениваются только request-scoped значениями
@@ -23,27 +25,35 @@ runtime-маршрутизацию, capabilities выбранной модели
 
 ## Установка обновления
 
-1. Обновите существующий Lite Handoff Router из файла
-   `lite_handoff_router.py`. Если Skill-фильтр уже
-   установлен, замените его код содержимым `skill_context.py`, но отсоедините от
-   Router Model.
-2. Создайте две Filter Functions из файлов:
+1. Обновите Lite Handoff Router, Lite Subagent Registry и Skill Context из файлов
+   `lite_handoff_router.py`, `lite_subagent_registry.py` и `skill_context.py`.
+2. Создайте Router Filter Functions из файлов:
    `previous_tool_context.py` и `history_cleanup.py`.
-3. Включите и прикрепите к публичной Router Workspace Model три фильтра: Registry,
+3. Создайте новые Filter Functions из файлов `tool_call_filter.py` и
+   `subagent_context.py`.
+4. Включите и прикрепите к публичной Router Workspace Model три фильтра: Registry,
    Previous Tool Context и History Cleanup.
-4. Оставьте значения `priority`, указанные по умолчанию:
+5. К каждой Workspace Model сабагента прикрепите Tool Call Filter, Subagent
+   Context и Skill Context.
+6. Оставьте значения `priority`, указанные по умолчанию:
 
    | Filter | Priority |
    |---|---:|
    | Lite Subagent Registry | `-100` |
    | Previous Tool Context | `-90` |
    | History Cleanup | `-80` |
+   | Tool Call Filter | `-30` |
+   | Subagent Context | `-20` |
+   | Skill Context | `-10` |
 
-5. В Valves Lite Handoff Router укажите `orchestrator_model_id`, как и раньше.
+7. В Valves Lite Handoff Router укажите `orchestrator_model_id`, как и раньше.
 
-Эти три фильтра нужно прикрепить именно к Router Workspace Model. Внутренние вызовы
-`orchestrator_model_id` и моделей сабагентов выполняются из pipe и не запускают
-для них новый inlet pipeline.
+Первые три фильтра нужно прикрепить именно к Router Workspace Model. Три фильтра
+сабагента должны быть прикреплены к каждой модели адресата: внутренний вызов из
+Pipe не запускает обычный inlet pipeline, поэтому Router получает их через
+`get_filter_functions()` и последовательно вызывает `process_filter_functions()`.
+Не отмечайте эти шесть фильтров как global: иначе Router- и subagent-цепочки
+смешаются до того, как Pipe выберет модель адресата.
 
 Если один из обязательных Router-фильтров отсутствует, Pipe завершит запрос
 понятной ошибкой с именем отсутствующего компонента. Зависимые фильтры также
@@ -70,9 +80,8 @@ runtime-маршрутизацию, capabilities выбранной модели
 5. Router подключает реальные callables оркестратора и вызывает
    `orchestrator_model_id`.
 
-`skill_context.py` подключать к Router не нужно. Он сохранён как
-необязательный фильтр `Skill Context` для других моделей и самостоятельно читает
-их `skillIds`. Registry и History Cleanup для него не требуются.
+`skill_context.py` подключать к Router Model не нужно. Он остаётся самостоятельным
+и может применяться к обычным моделям без Lite Handoff Router.
 
 ## Самостоятельное использование контекстных фильтров
 
@@ -98,8 +107,8 @@ Tool-цепочка не повреждается.
 
 После `lite_delegate` pipe сам переключает модель и набор capabilities. Текущие
 вызовы и результаты сабагента остаются в нативном формате `tool_calls` / `tool`.
-Эта часть не вынесена в inlet-фильтр, поскольку Open WebUI продолжает Tool Call
-внутренним вызовом модели без повторного выполнения inlet chain.
+На каждом продолжении Pipe снова запускает фильтры модели адресата, поэтому
+текущая Tool-цепочка проверяется тем же способом.
 
 Перед первым вызовом сабагента `prepare_workspace_model()` оставляет в дочернем
 payload только сообщения, request metadata и параметры стрима. Благодаря этому
@@ -108,11 +117,12 @@ payload только сообщения, request metadata и параметры 
 `base_model_id`, inference params и системный промпт сабагента затем штатно
 применяются провайдерным обработчиком Open WebUI.
 
-Подготовщик отдельно подключает выбранные в карточке сабагента Tools, MCP,
-Skills и builtin Tools. Для Web Search, Image Generation, Code Interpreter и
+Подготовщик отдельно подключает выбранные в карточке сабагента Tools, MCP и
+builtin Tools. Для Web Search, Image Generation, Code Interpreter и
 Memory дополнительно учитываются features текущего запроса, глобальные настройки
 сервера, native function calling и права пользователя. Прикреплённые Knowledge
-передаются builtin Tools и описываются в системном контексте. Встроенные
+передаются builtin Tools и описываются в системном контексте. Skills обрабатывает
+третий фильтр. Встроенные
 `delegate_task` и `timer`
 исключаются, чтобы сабагент не запускал параллельную систему вложенной
 оркестрации поверх Lite Handoff Router.
@@ -142,19 +152,39 @@ Handoff распознаёт только актуальный маркер
 Если непосредственно предыдущий запрос не вызывал инструменты, дополнительный
 блок не создаётся. Результаты более старого запроса вместо него не подставляются.
 
-## История сабагента
+## Фильтры сабагента
 
-Сабагент не получает строковый блок оркестратора. Для него действуют Valves pipe:
+Сабагент не получает строковый блок оркестратора. Перед его вызовом Router
+последовательно применяет следующие фильтры:
+
+1. Tool Call Filter удаляет вызовы и ответы инструментов, которых нет среди
+   реальных Tools, MCP и builtin Tools модели адресата. Handoff-вызов и приватная
+   трасса оркестратора также удаляются. Незавершённые и осиротевшие пары не
+   передаются модели.
+2. Subagent Context выбирает последние N завершённых пар «вопрос пользователя —
+   итоговый ответ модели». `history_tool_calls` служит дополнительным пределом:
+   Tool Calls выбираются только внутри сохранённых пар и не могут расширить
+   число текстовых пар.
+3. Skill Context читает `skillIds` модели. При доступных builtin Tools он строит
+   manifest и добавляет разрешённый только для этих Skills `view_skill`. Если
+   builtin Tools выключены или используется legacy function calling, полное
+   содержимое Skills добавляется в системный промпт.
+
+Настройки находятся в Valves **Subagent Context**:
 
 | Параметр | По умолчанию | Назначение |
 |---|---:|---|
 | `history_turns` | `0` | Последние N прошлых пар «вопрос — ответ» |
 | `history_tool_calls` | `0` | Последние N завершённых вызовов этого агента с результатами |
 
-Pipe выбирает нативную историю из сохранённого фильтром исходного набора
-сообщений. Поэтому очистка контекста оркестратора не влияет на
-`history_tool_calls`. Вызовы других агентов и неизвестных владельцев исключаются.
-Текущая цепочка выбранного агента сохраняется целиком независимо от лимитов.
+Например, `history_turns=1` и `history_tool_calls=5` сохраняют один прошлый вопрос,
+итоговый ответ и не более пяти завершённых Tool Calls, выполненных внутри этого
+ответа. Текущий запрос и уже начатая Tool-цепочка сохраняются целиком независимо
+от лимитов.
+
+Valves Function хранятся на уровне экземпляра фильтра. Чтобы две модели имели
+разные лимиты, создайте второй экземпляр Subagent Context с другим Function ID,
+задайте ему другие Valves и прикрепите к нужной модели.
 
 ## Локальная проверка
 
