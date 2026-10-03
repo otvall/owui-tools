@@ -32,7 +32,6 @@ DELEGATE_VERSION = "v2"
 ACTIVE_HANDOFF_KEY = "lite_active_handoff"
 CHILD_RUNTIME_KEY = "lite_active_tool_runtime"
 BASE_RUNTIME_KEY = "lite_base_tool_runtime"
-PREVIOUS_TOOL_CONTEXT_PREFIX = "Previous request execution record (reference data):\n"
 ORCHESTRATOR_SKILL_PROMPT_PREFIX = "Lite orchestrator Skill context:\n"
 GENERIC_SKILL_PROMPT_PREFIX = "Skill context:\n"
 TOOL_IMAGE_TEXT = "Here are the images from the tool results above. Please analyze them."
@@ -140,29 +139,6 @@ class HandoffProtocol:
         return HandoffMarker.parse(metadata.get(ACTIVE_HANDOFF_KEY))
 
     @staticmethod
-    def strip_exchange(messages: list[dict]) -> list[dict]:
-        delegate_call_ids = HandoffProtocol._delegate_call_ids(messages)
-        cleaned = []
-        for original in messages:
-            if HandoffProtocol._is_delegate_result(original, delegate_call_ids):
-                continue
-            message = HandoffProtocol._clean_assistant_message(original)
-            if message is not None:
-                cleaned.append(message)
-        return cleaned
-
-    @staticmethod
-    def _has_visible_assistant_content(message: dict) -> bool:
-        content = message.get("content")
-        has_content = bool(content.strip()) if isinstance(content, str) else bool(content)
-        return bool(
-            has_content
-            or message.get("tool_calls")
-            or message.get("reasoning_content")
-            or message.get("thinking")
-        )
-
-    @staticmethod
     def _delegate_call_ids(messages: list[dict]) -> set[str]:
         return {
             call.get("id")
@@ -173,38 +149,8 @@ class HandoffProtocol:
             and call.get("id")
         }
 
-    @staticmethod
-    def _is_delegate_result(message: dict, delegate_call_ids: set[str]) -> bool:
-        return message.get("role") == "tool" and (
-            HandoffMarker.parse(message.get("content")) is not None
-            or message.get("tool_call_id") in delegate_call_ids
-        )
-
-    @staticmethod
-    def _clean_assistant_message(message: dict) -> dict | None:
-        cleaned = dict(message)
-        if cleaned.get("role") != "assistant" or not cleaned.get("tool_calls"):
-            return cleaned
-        kept = [
-            call
-            for call in cleaned["tool_calls"]
-            if (call.get("function") or {}).get("name") != "lite_delegate"
-        ]
-        if kept:
-            cleaned["tool_calls"] = kept
-        else:
-            cleaned.pop("tool_calls", None)
-        if HandoffProtocol._has_visible_assistant_content(cleaned):
-            return cleaned
-        return None
-
 
 class MessageHistory:
-    @staticmethod
-    def is_previous_tool_context_message(message: dict) -> bool:
-        content = message.get("content")
-        return isinstance(content, str) and content.startswith(PREVIOUS_TOOL_CONTEXT_PREFIX)
-
     @staticmethod
     def is_tool_image_message(message: dict) -> bool:
         # OWUI 0.11.1 flattens tool images into this synthetic user message.
@@ -316,42 +262,6 @@ class RequestRuntime:
                     "skill_manifest": capabilities.skill_manifest,
                 }
             }
-        )
-
-    # Compatibility adapters used by installed-runtime characterization.
-    def cached_tools(
-        self,
-        cache_key: str,
-        model_id: str,
-        tool_ids: list[str],
-        skill_ids: list[str] | None = None,
-    ) -> dict | None:
-        capabilities = self.cached_capabilities(
-            cache_key,
-            model_id,
-            tool_ids,
-            normalize_ids(skill_ids),
-        )
-        return capabilities.tools if capabilities else None
-
-    def cache_tools(
-        self,
-        cache_key: str,
-        model_id: str,
-        tool_ids: list[str],
-        tools: dict,
-        skill_ids: list[str] | None = None,
-        skill_manifest: str = "",
-    ) -> None:
-        self.cache_capabilities(
-            cache_key,
-            model_id,
-            CapabilitySet(
-                tool_ids=list(tool_ids),
-                skill_ids=normalize_ids(skill_ids),
-                tools=tools,
-                skill_manifest=skill_manifest,
-            ),
         )
 
     def activate(self, marker: HandoffMarker, agent_id: str, model_id: str) -> None:
@@ -712,9 +622,6 @@ class ModelCapabilityResolver:
             skill_manifest,
         )
 
-    async def resolve_tools(self, **kwargs) -> CapabilitySet:
-        return await self.resolve(**kwargs, skill_ids=[])
-
     @staticmethod
     def _extra_params(
         *,
@@ -819,6 +726,12 @@ class ChildFilterPipeline:
 
 
 class ChildRequestBuilder:
+    """Prepare a destination request, including capabilities, reuse and filters."""
+
+    def __init__(self):
+        self._capabilities = ModelCapabilityResolver(McpRuntime())
+        self._filters = ChildFilterPipeline()
+
     @staticmethod
     def agent_registry(metadata: dict) -> dict[str, AgentSpec]:
         raw_registry = metadata.get("lite_agents") or {}
@@ -846,8 +759,6 @@ class ChildRequestBuilder:
         registry: dict[str, AgentSpec],
         runtime: RequestRuntime,
         context: InvocationContext,
-        load_capabilities: Callable,
-        apply_filters: Callable,
     ) -> tuple[dict, AgentSpec]:
         agent = registry.get(marker.agent_id)
         if agent is None:
@@ -881,13 +792,12 @@ class ChildRequestBuilder:
             capability_messages = []
             runtime.sync(lite_child_messages=capability_messages)
         runtime_model, child_skill_ids, child_tool_ids, capabilities = (
-            await self.prepare_workspace_model(
+            await self._prepare_workspace_model(
                 routed_body=routed_body,
                 agent=agent,
                 runtime=runtime,
                 context=context,
                 capability_messages=capability_messages,
-                load_capabilities=load_capabilities,
             )
         )
         child_messages = copy.deepcopy(source_messages)
@@ -918,7 +828,7 @@ class ChildRequestBuilder:
             for tool in capabilities.tools.values()
         ]
         routed_body.pop("tool_choice", None)
-        routed_body = await apply_filters(
+        routed_body = await self._filters.run(
             body=routed_body,
             runtime_model=runtime_model,
             runtime=runtime,
@@ -927,7 +837,7 @@ class ChildRequestBuilder:
         capability_messages[:] = copy.deepcopy(routed_body["messages"])
         return routed_body, agent
 
-    async def prepare_workspace_model(
+    async def _prepare_workspace_model(
         self,
         *,
         routed_body: dict,
@@ -935,7 +845,6 @@ class ChildRequestBuilder:
         runtime: RequestRuntime,
         context: InvocationContext,
         capability_messages: list[dict],
-        load_capabilities: Callable,
     ) -> tuple[dict, list[str], list[str], CapabilitySet]:
         """Prepare only the Workspace Model state needed by a nested handoff.
 
@@ -950,21 +859,61 @@ class ChildRequestBuilder:
         if runtime_model is None:
             raise ValueError(f'Agent "{agent.model_id}" is unavailable')
         child_skill_ids, child_tool_ids = await self._attachments(agent, runtime_model)
-        self.clear_outer_inference_params(routed_body)
-        capabilities = await load_capabilities(
-            request=context.request,
-            user=context.user,
+        self._clear_outer_inference_params(routed_body)
+        capabilities = await self._model_capabilities(
             runtime_model=runtime_model,
-            metadata=runtime.metadata,
             tool_ids=child_tool_ids,
             skill_ids=child_skill_ids,
             messages=capability_messages,
-            event_emitter=context.event_emitter,
-            event_call=context.event_call,
-            oauth_token=context.oauth_token,
-            files=context.files,
+            runtime=runtime,
+            context=context,
         )
         return runtime_model, child_skill_ids, child_tool_ids, capabilities
+
+    async def _model_capabilities(
+        self,
+        *,
+        runtime_model: dict,
+        tool_ids: list[str],
+        skill_ids: list[str],
+        messages: list[dict],
+        runtime: RequestRuntime,
+        context: InvocationContext,
+    ) -> CapabilitySet:
+        model_id = str(runtime_model.get("id") or "").strip()
+        cached = runtime.cached_capabilities(
+            CHILD_RUNTIME_KEY, model_id, tool_ids, skill_ids,
+        )
+        if cached is not None:
+            return cached
+
+        model_info = await Models.get_model_by_id(model_id)
+        if model_info is None:
+            if tool_ids or skill_ids:
+                raise ValueError("Child Model capability owner is unavailable")
+            capabilities = CapabilitySet([], [], {})
+        else:
+            if not model_info.is_active:
+                raise ValueError("Child Model capability owner is unavailable")
+            capabilities = await self._capabilities.resolve(
+                request=context.request,
+                capability_owner_id=str(model_info.user_id or ""),
+                execution_user=context.user,
+                tool_ids=tool_ids,
+                skill_ids=skill_ids,
+                runtime_model=runtime_model,
+                metadata=runtime.metadata,
+                messages=messages,
+                event_emitter=context.event_emitter,
+                event_call=context.event_call,
+                oauth_token=context.oauth_token,
+                files=context.files,
+                connector=McpRuntime.connect,
+                include_builtin_tools=True,
+                resolve_skills=False,
+            )
+        runtime.cache_capabilities(CHILD_RUNTIME_KEY, model_id, capabilities)
+        return capabilities
 
     @staticmethod
     async def _attachments(agent: AgentSpec, runtime_model) -> tuple[list[str], list[str]]:
@@ -1008,7 +957,7 @@ class ChildRequestBuilder:
         return prompt
 
     @staticmethod
-    def clear_outer_inference_params(body: dict) -> None:
+    def _clear_outer_inference_params(body: dict) -> None:
         for key in tuple(body):
             if key not in CHILD_REQUEST_ENVELOPE_KEYS:
                 body.pop(key, None)
@@ -1071,7 +1020,7 @@ class CompletionGateway:
         return response
 
 
-class PipeAdapters:
+class Pipe:
     class Valves(BaseModel):
         orchestrator_model_id: str = Field(
             default="",
@@ -1086,200 +1035,13 @@ class PipeAdapters:
     def __init__(self):
         self.valves = self.Valves()
         self._protocol = HandoffProtocol()
-        self._mcp = McpRuntime()
-        self._capabilities = ModelCapabilityResolver(self._mcp)
-        self._child_filters = ChildFilterPipeline()
+        self._capabilities = ModelCapabilityResolver(McpRuntime())
         self._child_builder = ChildRequestBuilder()
         self._gateway = CompletionGateway()
 
     def _debug(self, message: str, *args) -> None:
         if self.valves.debug:
             log.warning("[LITE_ROUTER] " + message, *args)
-
-    # Compatibility adapters for installed-runtime characterization.
-    @staticmethod
-    def _json_object(value: Any) -> dict | None:
-        marker = HandoffMarker.parse(value)
-        return marker.to_dict() if marker else None
-
-    @staticmethod
-    def _agent_registry(metadata: dict) -> dict[str, dict]:
-        return {
-            skill_id: {"model_id": spec.model_id, "name": spec.name}
-            for skill_id, spec in ChildRequestBuilder.agent_registry(metadata).items()
-        }
-
-    def _find_current_handoff(self, messages: list[dict]) -> dict | None:
-        marker = self._protocol.find_current(messages)
-        return marker.to_dict() if marker else None
-
-    @staticmethod
-    def _active_handoff(metadata: dict) -> dict | None:
-        marker = HandoffProtocol.active(metadata)
-        return marker.to_dict() if marker else None
-
-    def _strip_delegate_exchange(self, messages: list[dict]) -> list[dict]:
-        return self._protocol.strip_exchange(messages)
-
-    @staticmethod
-    def _clear_outer_inference_params(body: dict) -> None:
-        ChildRequestBuilder.clear_outer_inference_params(body)
-
-    @staticmethod
-    def _copy_request_body(body: dict) -> dict:
-        return RequestRuntime.copy_body(body)
-
-    @staticmethod
-    async def _connect_mcp_server(request, server_id, user, metadata, extra_params):
-        return await McpRuntime.connect(request, server_id, user, metadata, extra_params)
-
-    @staticmethod
-    def _register_mcp_client(metadata: dict, server_id: str, client) -> None:
-        McpRuntime.register_client(metadata, server_id, client)
-
-    @staticmethod
-    def _mcp_tool_callable(client, function_name: str):
-        return McpRuntime.tool_callable(client, function_name)
-
-    async def _get_model_bound_tools(self, **kwargs) -> dict:
-        capabilities = await self._capabilities.resolve_tools(
-            **kwargs,
-            connector=self._connect_mcp_server,
-        )
-        return capabilities.tools
-
-    async def _get_model_bound_capabilities(self, **kwargs) -> CapabilitySet:
-        return await self._capabilities.resolve(
-            **kwargs,
-            connector=self._connect_mcp_server,
-        )
-
-    async def _resolve_child_tools(self, **kwargs) -> dict:
-        if not normalize_ids(kwargs["tool_ids"]):
-            return {}
-        runtime_model = kwargs["runtime_model"]
-        target_model_id = str((runtime_model or {}).get("id") or "").strip()
-        model_info = await Models.get_model_by_id(target_model_id)
-        if model_info is None or not model_info.is_active:
-            raise ValueError("Child Model capability owner is unavailable")
-        return await self._get_model_bound_tools(
-            request=kwargs["request"],
-            capability_owner_id=str(model_info.user_id or ""),
-            execution_user=kwargs["user"],
-            tool_ids=kwargs["tool_ids"],
-            runtime_model=runtime_model,
-            metadata=kwargs["metadata"],
-            messages=kwargs["messages"],
-            event_emitter=kwargs["event_emitter"],
-            event_call=kwargs["event_call"],
-            oauth_token=kwargs["oauth_token"],
-            files=kwargs["files"],
-        )
-
-    async def _resolve_child_capabilities(self, **kwargs) -> CapabilitySet:
-        runtime_model = kwargs["runtime_model"]
-        target_model_id = str((runtime_model or {}).get("id") or "").strip()
-        model_info = await Models.get_model_by_id(target_model_id)
-        if model_info is None:
-            if not normalize_ids(kwargs["tool_ids"]) and not normalize_ids(
-                kwargs["skill_ids"]
-            ):
-                return CapabilitySet([], [], {})
-            raise ValueError("Child Model capability owner is unavailable")
-        if not model_info.is_active:
-            raise ValueError("Child Model capability owner is unavailable")
-        return await self._get_model_bound_capabilities(
-            request=kwargs["request"],
-            capability_owner_id=str(model_info.user_id or ""),
-            execution_user=kwargs["user"],
-            tool_ids=kwargs["tool_ids"],
-            skill_ids=kwargs["skill_ids"],
-            runtime_model=runtime_model,
-            metadata=kwargs["metadata"],
-            messages=kwargs["messages"],
-            event_emitter=kwargs["event_emitter"],
-            event_call=kwargs["event_call"],
-            oauth_token=kwargs["oauth_token"],
-            files=kwargs["files"],
-            include_builtin_tools=True,
-            resolve_skills=False,
-        )
-
-    async def _get_or_create_child_capabilities(self, **kwargs) -> CapabilitySet:
-        tool_ids = normalize_ids(kwargs["tool_ids"])
-        skill_ids = normalize_ids(kwargs["skill_ids"])
-        model_id = str((kwargs["runtime_model"] or {}).get("id") or "").strip()
-        runtime = RequestRuntime(kwargs["request"], kwargs["metadata"])
-        cached = runtime.cached_capabilities(
-            CHILD_RUNTIME_KEY,
-            model_id,
-            tool_ids,
-            skill_ids,
-        )
-        if cached is not None:
-            return cached
-        capabilities = await self._resolve_child_capabilities(
-            **{
-                **kwargs,
-                "tool_ids": tool_ids,
-                "skill_ids": skill_ids,
-            }
-        )
-        runtime.cache_capabilities(CHILD_RUNTIME_KEY, model_id, capabilities)
-        return capabilities
-
-    async def _get_or_create_child_tools(self, **kwargs) -> dict:
-        tool_ids = normalize_ids(kwargs["tool_ids"])
-        model_id = str((kwargs["runtime_model"] or {}).get("id") or "").strip()
-        runtime = RequestRuntime(kwargs["request"], kwargs["metadata"])
-        cached = runtime.cached_tools(CHILD_RUNTIME_KEY, model_id, tool_ids)
-        if cached is not None:
-            return cached
-        tools = await self._resolve_child_tools(**{**kwargs, "tool_ids": tool_ids})
-        runtime.cache_tools(CHILD_RUNTIME_KEY, model_id, tool_ids, tools)
-        return tools
-
-    async def _prepare_child(self, **kwargs):
-        marker = HandoffMarker.parse(kwargs["handoff"])
-        if marker is None:
-            raise ValueError("Invalid handoff marker")
-        registry = {
-            agent_id: AgentSpec(
-                config["model_id"],
-                config["name"],
-                str(config.get("routing_skill_id") or "").strip(),
-            )
-            for agent_id, config in kwargs["registry"].items()
-        }
-        context = InvocationContext(
-            request=kwargs["request"],
-            user=kwargs["user"],
-            event_emitter=kwargs["event_emitter"],
-            event_call=kwargs["event_call"],
-            oauth_token=kwargs["oauth_token"],
-            files=kwargs["files"],
-        )
-        body, agent = await self._child_builder.prepare(
-            body=kwargs["body"],
-            marker=marker,
-            registry=registry,
-            runtime=RequestRuntime(kwargs["request"], kwargs["metadata"]),
-            context=context,
-            load_capabilities=self._get_or_create_child_capabilities,
-            apply_filters=self._child_filters.run,
-        )
-        return body, agent.name, agent.model_id
-
-    @staticmethod
-    def _response_error_text(response: Response) -> str:
-        return CompletionGateway.response_error_text(response)
-
-    async def _generate(self, **kwargs):
-        return await self._gateway.generate(**kwargs)
-
-    @staticmethod
-    def _append_unique(current, additions) -> list[str]:
-        return normalize_ids([*(current or []), *(additions or [])])
 
     @staticmethod
     def _merge_tool_schemas(body: dict, tools: dict) -> None:
@@ -1298,8 +1060,6 @@ class PipeAdapters:
             by_name[name] = {"type": "function", "function": tool["spec"]}
         body["tools"] = [by_name[name] for name in order]
 
-
-class Pipe(PipeAdapters):
     async def _orchestrator_branch(
         self,
         body: dict,
@@ -1335,7 +1095,7 @@ class Pipe(PipeAdapters):
                 runtime_model = context.request.app.state.MODELS.get(router_model_id) or {
                     "id": router_model_id
                 }
-                capabilities = await self._get_model_bound_capabilities(
+                capabilities = await self._capabilities.resolve(
                     request=context.request,
                     capability_owner_id=str(
                         runtime.metadata.get("lite_router_owner_id") or ""
@@ -1350,6 +1110,7 @@ class Pipe(PipeAdapters):
                     event_call=context.event_call,
                     oauth_token=context.oauth_token,
                     files=context.files,
+                    connector=McpRuntime.connect,
                 )
                 runtime.cache_capabilities(
                     BASE_RUNTIME_KEY,
@@ -1389,7 +1150,7 @@ class Pipe(PipeAdapters):
             raise ValueError("orchestrator_model_id is not configured")
         routed["model"] = model_id
         self._debug("-> orchestrator %s", model_id)
-        return await self._generate(request=context.request, body=routed, user=context.user)
+        return await self._gateway.generate(request=context.request, body=routed, user=context.user)
 
     async def _child_branch(
         self,
@@ -1399,24 +1160,12 @@ class Pipe(PipeAdapters):
         runtime: RequestRuntime,
         context: InvocationContext,
     ):
-        routed, agent_name, model_id = await self._prepare_child(
+        routed, agent = await self._child_builder.prepare(
             body=body,
-            handoff=marker.to_dict(),
-            registry={
-                agent_id: {
-                    "model_id": spec.model_id,
-                    "name": spec.name,
-                    "routing_skill_id": spec.routing_skill_id,
-                }
-                for agent_id, spec in registry.items()
-            },
-            request=context.request,
-            user=context.user,
-            metadata=runtime.metadata,
-            event_emitter=context.event_emitter,
-            event_call=context.event_call,
-            oauth_token=context.oauth_token,
-            files=context.files,
+            marker=marker,
+            registry=registry,
+            runtime=runtime,
+            context=context,
         )
         if self.valves.emit_handoff_status and context.event_emitter:
             try:
@@ -1425,20 +1174,20 @@ class Pipe(PipeAdapters):
                         "type": "status",
                         "data": {
                             "action": "lite_delegate",
-                            "description": f"delegate to {agent_name}",
+                            "description": f"delegate to {agent.name}",
                             "done": True,
                         },
                     }
                 )
             except Exception as exc:  # noqa: BLE001 - status events are best effort
                 self._debug("status emit failed: %s", exc)
-        self._debug("-> child %s", model_id)
+        self._debug("-> child %s", agent.model_id)
         self._debug(
             "child tool results: incoming=%s outgoing=%s",
             [m.get("tool_call_id") for m in body.get("messages", []) if m.get("role") == "tool"],
             [m.get("tool_call_id") for m in routed["messages"] if m.get("role") == "tool"],
         )
-        return await self._generate(request=context.request, body=routed, user=context.user)
+        return await self._gateway.generate(request=context.request, body=routed, user=context.user)
 
     async def pipe(
         self,

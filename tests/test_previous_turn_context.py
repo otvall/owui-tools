@@ -9,7 +9,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
-from test_handoff_history import assistant, call, grouped_history, marker, result, router
+from test_handoff_history import PipeTestCase, assistant, call, grouped_history, marker, result, router
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -535,48 +535,16 @@ class StandaloneHistoryCleanupTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("TOOL_RESULT_42", json.dumps(body["messages"]))
 
 
-class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
+class SplitFilterPipelineTests(PipeTestCase):
     async def asyncSetUp(self):
+        await super().asyncSetUp()
         self.metadata = registry_metadata()
-        self.request = types.SimpleNamespace(
-            state=types.SimpleNamespace(metadata=self.metadata),
-            app=types.SimpleNamespace(
-                state=types.SimpleNamespace(
-                    MODELS={
-                        "router": {"id": "router"},
-                        "agent-a": {"id": "agent-a"},
-                        "agent-b": {"id": "agent-b"},
-                    }
-                )
-            ),
-        )
-        self.runtime = router.RequestRuntime(self.request, self.metadata)
-        self.context = router.InvocationContext(request=self.request, user=object())
+        self.request.state.metadata = self.metadata
         self.previous = previous_filter.Filter()
         self.cleanup = cleanup_filter.Filter()
-        self.skills = skills_filter.Filter()
-        self.pipe = router.Pipe()
-        self.pipe.valves.orchestrator_model_id = "base-model"
-        self.pipe._generate = AsyncMock()
-        self.child_tool_filter = tool_call_filter.Filter()
-        self.child_context_filter = subagent_context_filter.Filter()
-        self.child_skill_filter = skills_filter.Filter()
-        self.pipe._child_filters.run = self.apply_child_filters
-
-    async def apply_child_filters(self, *, body, runtime_model, runtime, context):
-        metadata = runtime.metadata
-        metadata["lite_subagent_filter_run"] = True
-        metadata["lite_subagent_filter_pipeline"] = []
-        await self.child_tool_filter.inlet(body)
-        await self.child_context_filter.inlet(body)
-        await self.child_skill_filter.inlet(
-            body,
-            __request__=context.request,
-            __user__={},
-            __model__=runtime_model,
-        )
-        metadata.pop("lite_subagent_filter_run", None)
-        return body
+        self.child_tool_filter = self.tool_filter
+        self.child_context_filter = self.context_filter
+        self.child_skill_filter = self.skill_filter
 
     async def apply_filters(self, messages):
         body = {
@@ -594,9 +562,9 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def route(self, messages):
         body = await self.apply_filters(messages)
         filtered = copy.deepcopy(body)
-        await self.pipe._orchestrator_branch(body, self.runtime, self.context)
+        await self.invoke_body(body)
         self.assertEqual(body, filtered)
-        return self.pipe._generate.call_args.kwargs["body"]
+        return self.routed
 
     async def test_priorities_define_required_order(self):
         self.assertEqual(
@@ -617,20 +585,15 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_router_builds_skill_prompt_without_skill_filter(self):
         self.metadata["lite_orchestrator_skill_ids"] = ["route-a"]
-        self.pipe._get_model_bound_capabilities = AsyncMock(
-            return_value=router.CapabilitySet(
-                [],
-                ["route-a"],
-                {},
-                "<available_skills>\n<skill><id>route-a</id></skill>\n</available_skills>",
-            )
-        )
+        self.builtins.return_value = {
+            "view_skill": {"spec": {"name": "view_skill"}, "callable": AsyncMock()},
+        }
 
         body = await self.apply_filters(
             [{"role": "user", "content": "Use an agent"}]
         )
-        await self.pipe._orchestrator_branch(body, self.runtime, self.context)
-        routed = self.pipe._generate.call_args.kwargs["body"]
+        await self.invoke_body(body)
+        routed = self.routed
 
         prompts = [
             message["content"]
@@ -682,7 +645,6 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
 
         self.metadata = registry_metadata()
         self.request.state.metadata = self.metadata
-        self.runtime = router.RequestRuntime(self.request, self.metadata)
         second = await self.route(
             previous_turn()
             + [
@@ -704,31 +666,12 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_router_reports_missing_filters(self):
         with self.assertRaisesRegex(ValueError, "Required Router filters"):
-            await router.Pipe()._orchestrator_branch(
-                {"messages": []},
-                router.RequestRuntime(
-                    self.request,
-                    {"tools": {}, "lite_registry_applied": True},
-                ),
-                self.context,
-            )
+            self.metadata = {"tools": {}, "lite_registry_applied": True}
+            await self.invoke([])
 
     async def test_other_child_excludes_orchestrator_reference_context(self):
-        self.pipe._child_builder._attachments = AsyncMock(
-            return_value=([], ["reader-tools"])
-        )
-        self.pipe._get_or_create_child_capabilities = AsyncMock(
-            return_value=router.CapabilitySet(
-                ["reader-tools"],
-                [],
-                {
-                    "open_document": {
-                        "spec": {"name": "open_document"},
-                        "callable": AsyncMock(),
-                    }
-                },
-            )
-        )
+        self.models["agent-b"].meta["toolIds"] = ["reader-tools"]
+        self.tool_names = ["open_document"]
         raw = previous_turn() + [
             {"role": "user", "content": "Open the second document"},
             assistant(call("next-delegate", "lite_delegate", agent_id="agent-b")),
@@ -736,16 +679,9 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
         ]
         filtered = await self.apply_filters(raw)
         source = filtered["messages"]
-        registry = router.ChildRequestBuilder.agent_registry(self.metadata)
         for step in range(2):
-            await self.pipe._child_branch(
-                {"model": "router", "messages": source},
-                router.HandoffMarker("agent-b"),
-                registry,
-                self.runtime,
-                self.context,
-            )
-            routed = self.pipe._generate.call_args.kwargs["body"]
+            await self.invoke(source)
+            routed = self.routed
             self.assertIsNone(unpack_record(routed["messages"]))
             self.assertNotIn("TOOL_RESULT_42", json.dumps(routed["messages"]))
             self.assertEqual(
@@ -760,16 +696,7 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
     async def test_same_child_receives_native_history_after_cleanup(self):
         self.child_context_filter.valves.history_turns = 1
         self.child_context_filter.valves.history_tool_calls = 1
-        self.pipe._child_builder._attachments = AsyncMock(
-            return_value=([], ["catalog-tools"])
-        )
-        self.pipe._get_or_create_child_capabilities = AsyncMock(
-            return_value=router.CapabilitySet(
-                ["catalog-tools"],
-                [],
-                {"lookup": {"spec": {"name": "lookup"}, "callable": AsyncMock()}},
-            )
-        )
+        self.models["agent-b"].meta["toolIds"] = ["catalog-tools"]
         raw = previous_turn()
         raw[3]["content"] = marker("agent-b")
         raw += [
@@ -778,14 +705,8 @@ class SplitFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
             result("next-delegate", marker("agent-b")),
         ]
         filtered = await self.apply_filters(raw)
-        await self.pipe._child_branch(
-            {"model": "router", "messages": filtered["messages"]},
-            router.HandoffMarker("agent-b"),
-            router.ChildRequestBuilder.agent_registry(self.metadata),
-            self.runtime,
-            self.context,
-        )
-        messages = self.pipe._generate.call_args.kwargs["body"]["messages"]
+        await self.invoke(filtered["messages"])
+        messages = self.routed["messages"]
         self.assertIsNone(unpack_record(messages))
         self.assertIn(
             "Found documents: first, second.",

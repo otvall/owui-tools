@@ -1,17 +1,19 @@
 """Regression tests for OWUI's reconstructed tool history, without an OWUI server.
 
 Run: python3 -m unittest discover -s tests -v
-OWUI imports are stubbed; the router and ChildRequestBuilder run unmodified.
+OWUI boundary adapters are stubbed; Pipe.pipe and the context filters run unmodified.
 The fixture was generated with v0.11.1's convert_output_to_messages(raw=True).
 """
 
 import copy
 import importlib.util
+import inspect
 import json
 import sys
 import types
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 
@@ -57,15 +59,120 @@ def load_router():
 router = load_router()
 
 
-def load_plain_module(filename, name):
+def load_plain_module(filename, name, modules=None):
     spec = importlib.util.spec_from_file_location(name, ROOT / filename)
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    with patch.dict(sys.modules, modules or {}):
+        spec.loader.exec_module(module)
     return module
 
 
 tool_filter_module = load_plain_module("tool_call_filter.py", "tool_call_filter_tests")
 context_filter_module = load_plain_module("subagent_context.py", "subagent_context_tests")
+skill_filter_module = load_plain_module(
+    "skill_context.py", "skill_context_pipe_tests",
+    {
+        "open_webui.models.skills": types.SimpleNamespace(Skills=router.Skills),
+        "open_webui.utils.tools": types.SimpleNamespace(get_builtin_tools=router.get_builtin_tools),
+    },
+)
+
+
+class PipeTestCase(unittest.IsolatedAsyncioTestCase):
+    """Run the real Pipe and filters with controlled OWUI boundary adapters."""
+
+    async def asyncSetUp(self):
+        self.user = types.SimpleNamespace(model_dump=lambda: {"id": "user"})
+        self.owner: Any = types.SimpleNamespace(model_dump=lambda: {"id": "owner"})
+        self.metadata: dict[str, Any] = {
+            "tools": {},
+            "previous_tool_context_applied": True,
+            "history_cleanup_applied": True,
+            "lite_agents": {
+                "agent-a": {"model_id": "agent-a", "name": "Agent A", "routing_skill_id": "route-a"},
+                "agent-b": {"model_id": "agent-b", "name": "Agent B", "routing_skill_id": "route-b"},
+            },
+        }
+        self.models = {
+            name: types.SimpleNamespace(is_active=True, user_id="owner", meta={"toolIds": ["toolkit"]})
+            for name in ("agent-a", "agent-b")
+        }
+        self.request = types.SimpleNamespace(
+            state=types.SimpleNamespace(metadata=self.metadata),
+            app=types.SimpleNamespace(state=types.SimpleNamespace(MODELS={
+                name: {"id": name} for name in ("router", "agent-a", "agent-b")
+            })),
+        )
+        self.tool_names = ["lookup"]
+        self.tool_filter = tool_filter_module.Filter()
+        self.context_filter = context_filter_module.Filter()
+        self.skill_filter = skill_filter_module.Filter()
+        self.filters = [self.tool_filter, self.context_filter, self.skill_filter]
+        self.users = self.enterContext(patch.object(
+            router.Users, "get_user_by_id", AsyncMock(side_effect=lambda id: self.user if id == "user" else self.owner), create=True,
+        ))
+        self.model_lookup = self.enterContext(patch.object(
+            router.Models, "get_model_by_id", AsyncMock(side_effect=lambda id: self.models.get(id)), create=True,
+        ))
+        self.loader = self.enterContext(patch.object(router, "get_tools", AsyncMock(side_effect=self.load_tools)))
+        self.builtins = self.enterContext(patch.object(router, "get_builtin_tools", AsyncMock(return_value={})))
+        self.enterContext(patch.object(skill_filter_module, "get_builtin_tools", self.builtins))
+        self.skills = self.enterContext(patch.object(
+            router.Skills, "get_skill_by_id", AsyncMock(side_effect=lambda id: types.SimpleNamespace(
+                is_active=True, name=id, description="Skill description", content="Skill instructions for " + id,
+            )), create=True,
+        ))
+        self.connector = AsyncMock(return_value=None)
+        self.enterContext(patch.dict(sys.modules, {
+            "open_webui.utils.middleware": types.SimpleNamespace(connect_mcp_server=self.connector),
+        }))
+        self.get_filters = self.enterContext(patch.object(
+            router, "get_filter_functions", AsyncMock(side_effect=lambda *args: self.filters),
+        ))
+        self.dispatch_filters = self.enterContext(patch.object(
+            router, "process_filter_functions", AsyncMock(side_effect=self.process_filters),
+        ))
+        self.completion_result = {"choices": [{"message": {"content": "answer"}}]}
+        self.completion = self.enterContext(patch.object(
+            router, "generate_chat_completion", AsyncMock(return_value=self.completion_result),
+        ))
+        self.events = AsyncMock()
+        self.pipe = router.Pipe()
+        self.pipe.valves.orchestrator_model_id = "base-model"
+
+    async def load_tools(self, request, ids, owner, extra_params):
+        history = extra_params["__messages__"]
+
+        async def read_history():
+            return copy.deepcopy(history)
+
+        return {
+            name: {"tool_id": ids[0], "spec": {"name": name}, "callable": read_history}
+            for name in self.tool_names
+        }
+
+    async def process_filters(self, **kwargs):
+        body = kwargs["form_data"]
+        for filter in kwargs["filter_functions"]:
+            supported = inspect.signature(filter.inlet).parameters
+            body = await filter.inlet(body, **{
+                key: value for key, value in kwargs["extra_params"].items() if key in supported
+            })
+        return body, {}
+
+    async def invoke(self, messages, **fields):
+        return await self.invoke_body({"model": "router", "messages": messages, **fields})
+
+    async def invoke_body(self, body):
+        return await self.pipe.pipe(
+            body,
+            __request__=self.request, __user__={"id": "user"}, __metadata__=self.metadata,
+            __event_emitter__=self.events,
+        )
+
+    @property
+    def routed(self):
+        return self.completion.call_args.args[1]
 
 
 def call(call_id, name, **arguments):
@@ -92,68 +199,10 @@ def grouped_history():
     return fixture["messages"]
 
 
-class ProtocolTests(unittest.TestCase):
-    def test_only_v2_agent_id_marker_is_supported(self):
-        self.assertEqual(router.HandoffMarker.parse(marker()).agent_id, "agent-a")
-        self.assertIsNone(
-            router.HandoffMarker.parse(
-                {"__lite_delegate__": "v1", "skill_id": "agent-a"}
-            )
-        )
-        self.assertIsNone(
-            router.HandoffMarker.parse(
-                {"__lite_delegate__": "v2", "skill_id": "agent-a"}
-            )
-        )
-
-    def test_result_from_another_tool_cannot_start_handoff(self):
-        messages = [
-            {"role": "user", "content": "question"},
-            assistant(call("lookup", "lookup")), result("lookup", marker()),
-        ]
-        self.assertIsNone(router.HandoffProtocol.find_current(messages))
-        self.assertEqual(
-            router.HandoffProtocol.find_current(grouped_history()),
-            router.HandoffMarker("agent-a"),
-        )
-
-class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.metadata = {"tools": {}}
-        self.request = types.SimpleNamespace(
-            state=types.SimpleNamespace(metadata=self.metadata),
-            app=types.SimpleNamespace(state=types.SimpleNamespace(MODELS={"agent-a": {"id": "agent-a"}})),
-        )
-        self.runtime = router.RequestRuntime(self.request, self.metadata)
-        self.context = router.InvocationContext(request=self.request, user=object())
-        self.agent = router.AgentSpec("agent-a", "Agent A", "route-a")
-        self.builder = router.ChildRequestBuilder()
-        self.builder._attachments = AsyncMock(return_value=([], ["toolkit"]))
-        self.capabilities = router.CapabilitySet(
-            ["toolkit"], [], {"lookup": {"spec": {"name": "lookup"}, "callable": AsyncMock()}},
-        )
-        self.loader = AsyncMock(return_value=self.capabilities)
-        self.tool_filter = tool_filter_module.Filter()
-        self.context_filter = context_filter_module.Filter()
-
-    async def apply_filters(self, *, body, runtime_model, runtime, context):
-        metadata = runtime.metadata
-        metadata["lite_subagent_filter_run"] = True
-        metadata["lite_subagent_filter_pipeline"] = []
-        await self.tool_filter.inlet(body)
-        await self.context_filter.inlet(body)
-        metadata["skill_context_applied"] = True
-        metadata["lite_subagent_filter_pipeline"].append("skill_context")
-        metadata.pop("lite_subagent_filter_run", None)
-        return body
-
+class ChildContinuationTests(PipeTestCase):
     async def prepare(self, messages):
-        return (await self.builder.prepare(
-            body={"model": "router", "messages": messages},
-            marker=router.HandoffMarker("agent-a"), registry={"agent-a": self.agent},
-            runtime=self.runtime, context=self.context, load_capabilities=self.loader,
-            apply_filters=self.apply_filters,
-        ))[0]["messages"]
+        await self.invoke(messages)
+        return self.routed["messages"]
 
     async def test_boundary_tracks_receipt_when_owui_regroups_messages(self):
         initial = [
@@ -167,8 +216,9 @@ class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
         messages = await self.prepare(grouped_history())
         self.assertEqual([m["content"] for m in messages if m["role"] == "tool"], ["TOOL_RESULT_42"])
         # Cached tool callables must see the same updated history list.
-        shared_messages = self.loader.call_args.kwargs["messages"]
+        shared_messages = await self.metadata["tools"]["lookup"]["callable"]()
         self.assertEqual(shared_messages, messages)
+        self.loader.assert_awaited_once()
 
     async def test_tool_image_user_message_does_not_replace_original_request(self):
         initial = grouped_history()[:4]
@@ -190,11 +240,16 @@ class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_three_continuations_with_two_mcp_servers_and_regular_tool(self):
         names = ["first_server_search", "second_server_fetch", "extra_tool"]
-        self.capabilities.tools.clear()
-        self.capabilities.tools.update({
-            name: {"spec": {"name": name}, "callable": AsyncMock()}
-            for name in names
-        })
+        self.models["agent-a"].meta["toolIds"] = ["toolkit", "server:mcp:first_server", "server:mcp:second_server"]
+        self.tool_names = ["extra_tool"]
+        clients = {}
+
+        async def connect(request, server_id, owner, metadata, extra_params):
+            client = types.SimpleNamespace(call_tool=AsyncMock(return_value="mcp result"))
+            clients[server_id] = client
+            return client, [{"name": "search" if server_id == "first_server" else "fetch"}]
+
+        self.connector.side_effect = connect
         # The first invocation contains only the router's completed handoff.
         source = grouped_history()[:4]
         source[1]["tool_calls"] = source[1]["tool_calls"][:2]
@@ -213,6 +268,12 @@ class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
                 [f"child-{n}" for n in range(index + 1)],
             )
             self.assertEqual(set(self.metadata["tools"]), set(names))
+        self.loader.assert_awaited_once()
+        self.assertEqual(self.connector.await_count, 2)
+        self.assertEqual(set(self.metadata["mcp_clients"]), {"first_server", "second_server"})
+        returned = await self.metadata["tools"]["second_server_fetch"]["callable"](id="document")
+        self.assertEqual(returned, "mcp result")
+        clients["second_server"].call_tool.assert_awaited_once_with("fetch", function_args={"id": "document"})
 
     async def test_child_tool_returning_marker_does_not_move_history_boundary(self):
         await self.prepare(grouped_history()[:4])
@@ -224,6 +285,12 @@ class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_workspace_preparation_removes_all_outer_inference_fields(self):
+        child_model = self.request.app.state.MODELS["agent-a"]
+        child_model.update(
+            base_model_id="child-provider",
+            info={"params": {"temperature": 0.2, "system": "Child system prompt"}},
+        )
+        child_settings = copy.deepcopy(child_model)
         body = {
             "model": "router",
             "messages": grouped_history()[:4],
@@ -235,15 +302,8 @@ class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
             "provider_specific_option": "outer-value",
             "options": {"repeat_penalty": 1.5},
         }
-        routed, _ = await self.builder.prepare(
-            body=body,
-            marker=router.HandoffMarker("agent-a"),
-            registry={"agent-a": self.agent},
-            runtime=self.runtime,
-            context=self.context,
-            load_capabilities=self.loader,
-            apply_filters=self.apply_filters,
-        )
+        await self.invoke_body(body)
+        routed = self.routed
         self.assertEqual(
             set(routed),
             {"model", "messages", "metadata", "stream", "stream_options", "tools"},
@@ -251,215 +311,275 @@ class ChildContinuationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(routed["model"], "agent-a")
         self.assertTrue(routed["stream"])
         self.assertEqual(routed["stream_options"], {"include_usage": True})
+        self.assertEqual(child_model, child_settings)
+        self.assertIs(self.get_filters.call_args.args[1], child_model)
 
 
-class WorkspaceCapabilityTests(unittest.IsolatedAsyncioTestCase):
+class CapabilityReuseTests(PipeTestCase):
+    async def test_matching_continuation_reuses_live_tools_with_updated_history(self):
+        shared_tools = self.metadata["tools"]
+        # OWUI can also keep a distinct metadata dictionary on request.state.
+        self.request.state.metadata = {}
+        await self.invoke(grouped_history()[:4])
+        lookup = shared_tools["lookup"]["callable"]
+        await self.invoke(grouped_history())
+        self.loader.assert_awaited_once()
+        self.assertIs(shared_tools["lookup"]["callable"], lookup)
+        self.assertEqual(await lookup(), self.routed["messages"])
+        self.assertIs(self.routed["metadata"], self.metadata)
+        self.assertIs(self.request.state.metadata["tools"], shared_tools)
+        self.assertEqual(self.loader.call_args.args[2], self.owner)
+        params = self.loader.call_args.args[3]
+        self.assertEqual(params["__user__"], {"id": "user"})
+        self.assertIs(params["__metadata__"], self.metadata)
+        self.assertIs(params["__request__"], self.request)
+
+    async def test_changed_destination_reloads_capabilities(self):
+        await self.invoke(grouped_history()[:4])
+        lookup = self.metadata["tools"]["lookup"]["callable"]
+        self.metadata["lite_agents"]["agent-a"]["model_id"] = "agent-b"
+        await self.invoke(grouped_history())
+        self.assertEqual(self.loader.await_count, 2)
+        self.assertEqual(self.routed["model"], "agent-b")
+        self.assertIsNot(self.metadata["tools"]["lookup"]["callable"], lookup)
+
+    async def test_changed_tool_selection_replaces_capabilities(self):
+        await self.invoke(grouped_history()[:4])
+        self.models["agent-a"].meta["toolIds"] = ["reader-tools"]
+        self.tool_names = ["open_document"]
+        await self.invoke(grouped_history())
+        self.assertEqual(self.loader.await_count, 2)
+        self.assertEqual(set(self.metadata["tools"]), {"open_document"})
+        self.assertEqual(self.loader.call_args.args[1], ["reader-tools"])
+        self.assertNotIn("TOOL_RESULT_42", json.dumps(self.routed["messages"]))
+
+    async def test_changed_skill_selection_reloads_capabilities(self):
+        await self.invoke(grouped_history()[:4])
+        self.models["agent-a"].meta["skillIds"] = ["specialist-skill"]
+        await self.invoke(grouped_history())
+        self.assertEqual(self.loader.await_count, 2)
+        self.assertIn("Skill instructions for specialist-skill", self.routed["messages"][0]["content"])
+
+    async def test_equivalent_normalized_selections_reuse_capabilities(self):
+        self.models["agent-a"].meta.update(toolIds=[" toolkit ", "toolkit", ""], skillIds=[" skill ", "skill"])
+        await self.invoke(grouped_history()[:4])
+        self.models["agent-a"].meta.update(toolIds=["toolkit"], skillIds=["skill"])
+        await self.invoke(grouped_history())
+        self.loader.assert_awaited_once()
+        self.assertEqual(self.loader.call_args.args[1], ["toolkit"])
+
+
+class PublicRoutingTests(PipeTestCase):
+    async def test_only_v2_agent_id_marker_starts_handoff(self):
+        for receipt in (
+            {"__lite_delegate__": "v1", "skill_id": "agent-a"},
+            {"__lite_delegate__": "v2", "skill_id": "agent-a"},
+        ):
+            with self.subTest(receipt=receipt):
+                await self.invoke([
+                    {"role": "user", "content": "question"},
+                    assistant(call("delegate", "lite_delegate")), result("delegate", json.dumps(receipt)),
+                ])
+                self.assertEqual(self.routed["model"], "base-model")
+        await self.invoke(grouped_history())
+        self.assertEqual(self.routed["model"], "agent-a")
+
+    async def test_unrelated_tool_marker_keeps_configured_orchestrator(self):
+        returned = await self.invoke([
+            {"role": "user", "content": "question"},
+            assistant(call("lookup", "lookup")), result("lookup", marker()),
+        ])
+        self.assertEqual(self.routed["model"], "base-model")
+        self.assertIs(returned, self.completion_result)
+        self.events.assert_not_awaited()
+
+    async def test_routing_skill_alias_selects_agent_and_emits_status(self):
+        await self.invoke([
+            {"role": "user", "content": "question"},
+            assistant(call("delegate", "lite_delegate")), result("delegate", marker("route-a")),
+        ])
+        self.assertEqual(self.routed["model"], "agent-a")
+        self.assertEqual(self.events.call_args.args[0], {
+            "type": "status", "data": {"action": "lite_delegate", "description": "delegate to Agent A", "done": True},
+        })
+
+    async def test_active_agent_continues_without_delegate_exchange(self):
+        await self.invoke(grouped_history()[:4])
+        current = copy.deepcopy(self.routed["messages"])
+        current += [assistant(call("next", "lookup")), result("next", "second result")]
+        await self.invoke(current)
+        self.assertEqual(self.routed["model"], "agent-a")
+        self.assertEqual([m["tool_call_id"] for m in self.routed["messages"] if m["role"] == "tool"], ["next"])
+        self.loader.assert_awaited_once()
+
+    async def test_unregistered_agent_fails_before_completion(self):
+        with self.assertRaisesRegex(ValueError, 'Agent ID "unknown" is not available'):
+            await self.invoke([
+                {"role": "user", "content": "question"},
+                assistant(call("delegate", "lite_delegate")), result("delegate", marker("unknown")),
+            ])
+        self.completion.assert_not_awaited()
+
+    async def test_unavailable_destination_fails_before_completion(self):
+        del self.request.app.state.MODELS["agent-a"]
+        with self.assertRaisesRegex(ValueError, 'Agent "agent-a" is unavailable'):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_not_awaited()
+
+    async def test_inactive_destination_fails_before_completion(self):
+        self.models["agent-a"].is_active = False
+        with self.assertRaisesRegex(ValueError, 'Agent "agent-a" is inactive'):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_not_awaited()
+
+    async def test_unavailable_tool_fails_before_completion(self):
+        self.loader.return_value = {}
+        self.loader.side_effect = None
+        with self.assertRaisesRegex(ValueError, "Attached model-bound Tools are unavailable: toolkit"):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_not_awaited()
+
+    async def test_unavailable_skill_fails_before_completion(self):
+        self.models["agent-a"].meta["skillIds"] = ["missing"]
+        self.skills.side_effect = None
+        self.skills.return_value = None
+        with self.assertRaisesRegex(ValueError, "Attached model Skills are unavailable: missing"):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_not_awaited()
+
+    async def test_unavailable_owner_fails_before_completion(self):
+        self.owner = None
+        with self.assertRaisesRegex(ValueError, "Model capability owner is unavailable"):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_not_awaited()
+
+
+class WorkspaceCapabilityTests(PipeTestCase):
     async def asyncSetUp(self):
-        self.user = types.SimpleNamespace(model_dump=lambda: {"id": "user"})
-        self.owner = types.SimpleNamespace(model_dump=lambda: {"id": "owner"})
-        router.Users.get_user_by_id = AsyncMock(return_value=self.owner)
-        router.get_builtin_tools = AsyncMock(
-            return_value={
-                "search_web": {
-                    "spec": {"name": "search_web"},
-                    "callable": AsyncMock(),
-                },
-                "delegate_task": {
-                    "spec": {"name": "delegate_task"},
-                    "callable": AsyncMock(),
-                },
-                "timer": {
-                    "spec": {"name": "timer"},
-                    "callable": AsyncMock(),
-                },
-            }
+        await super().asyncSetUp()
+        self.metadata.update(
+            session_id="session", params={"function_calling": "native"}, features={"web_search": True},
         )
-        self.resolver = router.ModelCapabilityResolver(router.McpRuntime())
-
-    async def test_child_gets_enabled_builtins_but_not_nested_subagents(self):
-        capabilities = await self.resolver.resolve(
-            request=types.SimpleNamespace(),
-            capability_owner_id="owner",
-            execution_user=self.user,
-            tool_ids=[],
-            skill_ids=[],
-            runtime_model={
-                "id": "child",
-                "info": {
-                    "meta": {
-                        "capabilities": {
-                            "builtin_tools": True,
-                            "web_search": True,
-                        }
-                    }
-                },
-            },
-            metadata={
-                "session_id": "session",
-                "params": {"function_calling": "native"},
-                "features": {"web_search": True},
-            },
-            messages=[],
-            event_emitter=None,
-            event_call=None,
-            oauth_token=None,
-            files=[],
-            connector=AsyncMock(),
-            include_builtin_tools=True,
-        )
-        self.assertEqual(set(capabilities.tools), {"search_web"})
-        self.assertEqual(
-            router.get_builtin_tools.call_args.kwargs["features"],
-            {"web_search": True},
-        )
-
-    async def test_builtin_tools_capability_can_disable_all_builtins(self):
-        capabilities = await self.resolver.resolve(
-            request=types.SimpleNamespace(),
-            capability_owner_id="owner",
-            execution_user=self.user,
-            tool_ids=[],
-            skill_ids=[],
-            runtime_model={
-                "id": "child",
-                "info": {"meta": {"capabilities": {"builtin_tools": False}}},
-            },
-            metadata={
-                "session_id": "session",
-                "params": {"function_calling": "native"},
-                "features": {"web_search": True},
-            },
-            messages=[],
-            event_emitter=None,
-            event_call=None,
-            oauth_token=None,
-            files=[],
-            connector=AsyncMock(),
-            include_builtin_tools=True,
-        )
-        self.assertEqual(capabilities.tools, {})
-        router.get_builtin_tools.assert_not_awaited()
-
-    async def test_legacy_function_calling_does_not_inject_native_builtins(self):
-        capabilities = await self.resolver.resolve(
-            request=types.SimpleNamespace(),
-            capability_owner_id="owner",
-            execution_user=self.user,
-            tool_ids=[],
-            skill_ids=[],
-            runtime_model={
-                "id": "child",
-                "info": {"meta": {"capabilities": {"builtin_tools": True}}},
-            },
-            metadata={
-                "session_id": "session",
-                "params": {"function_calling": "legacy"},
-                "features": {"web_search": True},
-            },
-            messages=[],
-            event_emitter=None,
-            event_call=None,
-            oauth_token=None,
-            files=[],
-            connector=AsyncMock(),
-            include_builtin_tools=True,
-        )
-        self.assertEqual(capabilities.tools, {})
-        router.get_builtin_tools.assert_not_awaited()
-
-    def test_attached_knowledge_is_rendered_for_child_prompt(self):
-        context = self.resolver.knowledge_context(
-            {
-                "info": {
-                    "meta": {
-                        "knowledge": [
-                            {
-                                "type": "file",
-                                "id": "file-1",
-                                "name": 'Guide "A"',
-                                "source": "model",
-                            }
-                        ]
-                    }
-                }
-            },
-            {"session_id": "session", "params": {"function_calling": "native"}},
-        )
-        self.assertIn('<knowledge type="file" id="file-1"', context)
-        self.assertIn('name="Guide &quot;A&quot;"', context)
-
-
-class ChildFilterPipelineTests(unittest.IsolatedAsyncioTestCase):
-    async def asyncSetUp(self):
-        self.metadata = {"filter_ids": ["enabled-toggle"]}
-        self.request = types.SimpleNamespace(
-            state=types.SimpleNamespace(metadata=self.metadata)
-        )
-        self.runtime = router.RequestRuntime(self.request, self.metadata)
-        self.context = router.InvocationContext(
-            request=self.request,
-            user=types.SimpleNamespace(model_dump=lambda: {"id": "user"}),
-        )
-        self.model = {
-            "id": "agent-a",
-            "info": {"meta": {"filterIds": ["tool", "context", "skills"]}},
+        self.models["agent-a"].meta["toolIds"] = []
+        self.builtins.return_value = {
+            name: {"spec": {"name": name}, "callable": AsyncMock()}
+            for name in ("search_web", "delegate_task", "timer")
         }
 
-    async def test_runs_destination_model_inlet_pipeline(self):
-        filters = [types.SimpleNamespace(id=name) for name in ("tool", "context", "skills")]
+    async def test_child_gets_enabled_builtins_but_not_nested_subagents(self):
+        await self.invoke(grouped_history()[:4])
+        self.assertEqual(set(self.metadata["tools"]), {"search_web"})
+        self.assertEqual(self.builtins.call_args.kwargs["features"], {"web_search": True})
+        self.assertEqual(self.builtins.call_args.args[1]["__user__"], {"id": "user"})
 
-        async def process(**kwargs):
-            metadata = kwargs["form_data"]["metadata"]
-            metadata.update(
-                {
-                    "tool_call_filter_applied": True,
-                    "subagent_context_applied": True,
-                    "skill_context_applied": True,
-                    "lite_subagent_filter_pipeline": [
-                        "tool_call_filter",
-                        "subagent_context",
-                        "skill_context",
-                    ],
-                }
-            )
-            return kwargs["form_data"], {}
+    async def test_builtin_tools_capability_can_disable_all_builtins(self):
+        self.request.app.state.MODELS["agent-a"]["info"] = {
+            "meta": {"capabilities": {"builtin_tools": False}},
+        }
+        await self.invoke(grouped_history()[:4])
+        self.assertEqual(self.metadata["tools"], {})
+        self.builtins.assert_not_awaited()
 
-        with (
-            patch.object(router, "get_filter_functions", AsyncMock(return_value=filters)) as get_filters,
-            patch.object(router, "process_filter_functions", AsyncMock(side_effect=process)) as run_filters,
-        ):
-            body = await router.ChildFilterPipeline().run(
-                body={"model": "agent-a", "messages": [], "metadata": self.metadata},
-                runtime_model=self.model,
-                runtime=self.runtime,
-                context=self.context,
-            )
+    async def test_legacy_function_calling_does_not_inject_native_builtins(self):
+        self.metadata["params"]["function_calling"] = "legacy"
+        await self.invoke(grouped_history()[:4])
+        self.assertEqual(self.metadata["tools"], {})
+        self.builtins.assert_not_awaited()
 
-        self.assertIs(body["metadata"], self.metadata)
-        get_filters.assert_awaited_once_with(
-            self.request,
-            self.model,
-            ["enabled-toggle"],
+    async def test_attached_knowledge_is_rendered_for_child_prompt(self):
+        self.request.app.state.MODELS["agent-a"]["info"] = {"meta": {"knowledge": [{
+            "type": "file", "id": "file-1", "name": 'Guide "A"', "source": "model",
+        }]}}
+        await self.invoke(grouped_history()[:4])
+        prompt = self.routed["messages"][0]["content"]
+        self.assertIn('<knowledge type="file" id="file-1"', prompt)
+        self.assertIn('name="Guide &quot;A&quot;"', prompt)
+
+    async def test_child_skill_manifest_and_loader_use_only_attached_skills(self):
+        self.models["agent-a"].meta["skillIds"] = ["specialist-skill"]
+        view_skill = AsyncMock(return_value="Loaded specialist Skill")
+        self.builtins.return_value["view_skill"] = {
+            "spec": {"name": "view_skill"}, "callable": view_skill,
+        }
+        await self.invoke(grouped_history()[:4])
+        prompt = self.routed["messages"][0]["content"]
+        self.assertIn("<available_skills>", prompt)
+        self.assertIn("specialist-skill", prompt)
+        self.assertNotIn("Skill instructions for specialist-skill", prompt)
+        tool = self.metadata["tools"]["view_skill"]["callable"]
+        self.assertEqual(await tool(id="specialist-skill"), "Loaded specialist Skill")
+        self.assertIn("error", json.loads(await tool(id="routing-skill")))
+        view_skill.assert_awaited_once_with(id="specialist-skill")
+        self.assertEqual(self.builtins.call_args.args[1]["__user__"], {"id": "user"})
+
+    async def test_disabled_builtins_deliver_full_attached_skills(self):
+        self.models["agent-a"].meta["skillIds"] = ["specialist-skill"]
+        self.request.app.state.MODELS["agent-a"]["info"] = {
+            "meta": {"capabilities": {"builtin_tools": False}},
+        }
+        await self.invoke(grouped_history()[:4])
+        self.assertIn("Skill instructions for specialist-skill", self.routed["messages"][0]["content"])
+        self.assertNotIn("view_skill", self.metadata["tools"])
+        self.builtins.assert_not_awaited()
+
+    async def test_pipe_destination_without_workspace_attachments_remains_supported(self):
+        del self.models["agent-a"]
+        self.request.app.state.MODELS["agent-a"]["pipe"] = {"type": "pipe"}
+        await self.invoke(grouped_history()[:4])
+        self.assertEqual(self.routed["model"], "agent-a")
+        self.assertEqual(self.metadata["tools"], {})
+        self.loader.assert_not_awaited()
+        self.builtins.assert_not_awaited()
+
+
+class CompletionTests(PipeTestCase):
+    async def test_provider_http_error_retains_message_on_both_routes(self):
+        self.completion.return_value = router.Response(
+            content='{"error":{"message":"provider refused request"}}', status_code=403,
         )
-        self.assertEqual(run_filters.call_args.kwargs["filter_type"], "inlet")
+        for messages in ([{"role": "user", "content": "question"}], grouped_history()[:4]):
+            with self.subTest(messages=messages):
+                with self.assertRaisesRegex(RuntimeError, "provider refused request"):
+                    await self.invoke(messages)
+
+    async def test_streaming_child_response_keeps_identity(self):
+        response = router.StreamingResponse(iter(["chunk"]))
+        self.completion.return_value = response
+        self.assertIs(await self.invoke(grouped_history()[:4]), response)
+
+    async def test_status_failure_does_not_interrupt_child_completion(self):
+        self.events.side_effect = RuntimeError("status channel closed")
+        self.assertIs(await self.invoke(grouped_history()[:4]), self.completion_result)
+
+    async def test_handoff_status_can_be_disabled(self):
+        self.pipe.valves.emit_handoff_status = False
+        await self.invoke(grouped_history()[:4])
+        self.events.assert_not_awaited()
+
+
+class ChildFilterPipelineTests(PipeTestCase):
+    async def test_runs_destination_model_inlet_pipeline(self):
+        self.metadata["filter_ids"] = ["enabled-toggle"]
+        await self.invoke(grouped_history()[:4])
+        self.assertIs(self.routed["metadata"], self.metadata)
+        self.get_filters.assert_awaited_once_with(
+            self.request, self.request.app.state.MODELS["agent-a"], ["enabled-toggle"],
+        )
+        self.assertEqual(self.dispatch_filters.call_args.kwargs["filter_type"], "inlet")
         self.assertNotIn("lite_subagent_filter_run", self.metadata)
 
     async def test_reports_missing_required_destination_filters(self):
-        with (
-            patch.object(router, "get_filter_functions", AsyncMock(return_value=[])),
-            patch.object(
-                router,
-                "process_filter_functions",
-                AsyncMock(side_effect=lambda **kwargs: (kwargs["form_data"], {})),
-            ),
-        ):
-            with self.assertRaisesRegex(ValueError, "Required subagent filters"):
-                await router.ChildFilterPipeline().run(
-                    body={"model": "agent-a", "messages": [], "metadata": self.metadata},
-                    runtime_model=self.model,
-                    runtime=self.runtime,
-                    context=self.context,
-                )
+        self.filters = []
+        with self.assertRaisesRegex(ValueError, "Required subagent filters"):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_not_awaited()
+
+    async def test_reports_misordered_destination_filters_before_completion(self):
+        self.filters = [self.skill_filter, self.tool_filter, self.context_filter]
+        with self.assertRaisesRegex(ValueError, "must run before Skill Context"):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_not_awaited()
+        self.assertNotIn("lite_subagent_filter_run", self.metadata)
 
 
 if __name__ == "__main__":
