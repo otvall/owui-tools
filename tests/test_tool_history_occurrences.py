@@ -7,7 +7,6 @@ from test_handoff_history import (
     PipeTestCase, assistant, call, context_filter_module, marker, result,
     tool_filter_module,
 )
-from test_previous_turn_context import cleanup_filter, previous_filter, registry_metadata
 
 
 class ToolOccurrenceFilterTests(unittest.IsolatedAsyncioTestCase):
@@ -134,15 +133,13 @@ class HistoricalOccurrenceLimitTests(unittest.IsolatedAsyncioTestCase):
 class PipeOccurrenceHistoryTests(PipeTestCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        self.metadata.clear()
-        self.metadata.update(registry_metadata())
         self.context_filter.valves.history_turns = 2
         self.context_filter.valves.history_tool_calls = 5
 
     async def route_history(self, messages):
         body = {"model": "router", "metadata": self.metadata, "messages": copy.deepcopy(messages)}
-        await previous_filter.Filter().inlet(body)
-        await cleanup_filter.Filter().inlet(body)
+        self.begin_request()
+        await self.router_inlets(body)
         await self.invoke_body(body)
         return self.routed["messages"]
 

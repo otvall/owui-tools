@@ -20,6 +20,9 @@ class SkillBehavior:
                 is_active=True, name="Beta", description="Beta description", content="Full beta instructions",
             ),
         }
+        if self.path == "standalone":
+            self.metadata.clear()
+            self.metadata["tools"] = {}
         self.skills.side_effect = self.records.get
         self.metadata.update(session_id="session", params={"function_calling": "native"})
         self.view_skill = AsyncMock(return_value="builtin checked permissions")
@@ -326,6 +329,7 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
         ], "tools": schemas}
         registry = self.registry_filter()
         registry.valves.base_skill_ids = ["alpha"]
+        self.begin_request(metadata=self.request.state.metadata)
         await registry.inlet(body, __request__=self.request, __user__={"id": "user"})
         for key in (*legacy_keys, "lite_active_handoff", "lite_active_model_id", "lite_active_tool_runtime",
                     "lite_base_tool_runtime", "lite_unfiltered_messages", "lite_child_messages", "lite_skill_loader",
@@ -371,10 +375,15 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
                 if not include_schemas:
                     self.body.pop("tools")
                 self.body["model"] = "router"
+                self.body["messages"] += [
+                    {"role": "assistant", "content": "Done"},
+                    {"role": "user", "content": "question"},
+                ]
                 registry = self.registry_filter()
+                self.begin_request(metadata=self.request.state.metadata)
                 await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
                 self.assertNotIn("lite_skill_loader", self.metadata)
-                self.metadata.update(previous_tool_context_applied=True, history_cleanup_applied=True)
+                await self.context_inlets(self.body)
                 if replacement == "foreign":
                     self.assertIs(self.metadata["tools"]["view_skill"], foreign)
                     self.assertIn(old_schema, self.body["tools"])
@@ -385,7 +394,6 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
                 else:
                     self.assertNotIn("view_skill", self.metadata["tools"])
                     self.assertNotIn(old_schema, self.body.get("tools", []))
-                self.metadata.update(previous_tool_context_applied=True, history_cleanup_applied=True)
 
     async def test_registry_validation_failure_does_not_reset_previous_request(self):
         await self.prepare()
@@ -395,6 +403,7 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
         registry = self.registry_filter()
         self.records.pop("alpha")
         with self.assertRaisesRegex(ValueError, "Configured model-bound Skills are unavailable"):
+            self.begin_request(metadata=self.request.state.metadata)
             await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
         self.assertEqual(self.metadata, snapshot)
         self.assertIs(self.metadata["tools"]["view_skill"], old_loader)
@@ -404,10 +413,11 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
         schema = {"type": "function", "function": {"name": "view_skill", "description": "foreign"}}
         self.body["tools"] = [schema]
         registry = self.registry_filter()
+        self.begin_request(metadata=self.request.state.metadata)
         await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
         self.assertEqual(self.metadata["tools"], {})
         self.assertEqual(self.body["tools"], [schema])
-        self.metadata.update(previous_tool_context_applied=True, history_cleanup_applied=True)
+        await self.context_inlets(self.body)
         with self.assertRaisesRegex(ValueError, "conflicts with the builtin Skill loader"):
             await self.prepare()
         self.completion.assert_not_awaited()
@@ -464,6 +474,7 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
         filter = registry.Filter()
         filter.valves.base_skill_ids = [" ALPHA ", "alpha", ""]
         filter.valves.base_tool_ids = ["Toolkit"]
+        self.begin_request(metadata=self.request.state.metadata)
         await filter.inlet(self.body, __request__=self.request, __user__={"id": "user"})
         previous = load_plain_module("previous_tool_context.py", "skill_registry_previous_tests").Filter()
         cleanup = load_plain_module("history_cleanup.py", "skill_registry_cleanup_tests").Filter()
