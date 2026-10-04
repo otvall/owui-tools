@@ -1,6 +1,6 @@
 """
 title: Subagent Context
-description: Limits previous user/assistant turns and Tool calls for a model.
+description: Limits completed previous text turns and concrete Tool call occurrences for a model.
 version: 0.18.0
 required_open_webui_version: 0.11.1
 """
@@ -264,6 +264,65 @@ class RequestRuntime:
         )
 # END GENERATED REQUEST RUNTIME
 
+# BEGIN GENERATED TOOL HISTORY
+# Edit shared/tool_history.py; run python3 tools/generate_skill_preparation.py
+"""Pair concrete Tool exchanges without treating correlation IDs as global keys."""
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ToolExchange:
+    message_index: int
+    call_index: int
+    result_index: int
+
+
+def completed_tool_exchanges(
+    messages: list[dict], *, is_tool_image_message: Callable[[dict], bool],
+) -> list[ToolExchange]:
+    """Match only within one assistant execution batch in one user request.
+
+    OWUI may group several sequential executions into one assistant message.
+    Unique IDs can still correlate those calls with their ordered results. Reused
+    IDs within that batch are ambiguous; a later batch cannot complete an earlier
+    one. Identical repeated results represent one exchange, conflicting ones none.
+    """
+    exchanges: list[ToolExchange] = []
+    calls: dict[str, list[tuple[int, int]]] = {}
+    results: dict[str, list[int]] = {}
+
+    def finish_batch() -> None:
+        for call_id, occurrences in calls.items():
+            matching_results = results.get(call_id, [])
+            if len(occurrences) != 1 or not matching_results:
+                continue
+            first_result = matching_results[0]
+            if any(messages[index] != messages[first_result] for index in matching_results[1:]):
+                continue
+            message_index, call_index = occurrences[0]
+            exchanges.append(ToolExchange(message_index, call_index, first_result))
+        calls.clear()
+        results.clear()
+
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role == "assistant" or (role == "user" and not is_tool_image_message(message)):
+            finish_batch()
+        if role == "assistant":
+            for call_index, call in enumerate(message.get("tool_calls") or []):
+                call_id = call.get("id")
+                if isinstance(call_id, str) and call_id:
+                    calls.setdefault(call_id, []).append((index, call_index))
+        elif role == "tool":
+            call_id = message.get("tool_call_id")
+            if isinstance(call_id, str) and call_id in calls:
+                results.setdefault(call_id, []).append(index)
+    finish_batch()
+    return exchanges
+# END GENERATED TOOL HISTORY
+
 log = logging.getLogger(__name__)
 
 TOOL_IMAGE_TEXT = "Here are the images from the tool results above. Please analyze them."
@@ -309,7 +368,7 @@ class Filter:
         history_tool_calls: int = Field(
             default=0,
             ge=0,
-            description="Maximum completed Tool calls inside retained previous turns.",
+            description="Maximum completed Tool call occurrences inside retained previous turns; repeated IDs count separately.",
         )
         debug: bool = Field(default=False, description="Enable debug logs.")
 
@@ -321,10 +380,6 @@ class Filter:
             log.warning("[SUBAGENT_CONTEXT] " + message, *args)
 
     @staticmethod
-    def _historical_segment(messages: list[dict], start: int, end: int) -> list[dict]:
-        return messages[start:end]
-
-    @staticmethod
     def _is_completed_segment(messages: list[dict], start: int, end: int) -> bool:
         return any(
             message.get("role") == "assistant"
@@ -334,33 +389,38 @@ class Filter:
         )
 
     @staticmethod
-    def _select_segment(segment: list[dict], tool_limit_ids: set[str]) -> list[dict]:
+    def _select_segment(
+        messages: list[dict], start: int, end: int, exchanges: list[ToolExchange],
+    ) -> list[dict]:
+        selected_calls = {(exchange.message_index, exchange.call_index) for exchange in exchanges}
+        selected_results = {exchange.result_index for exchange in exchanges}
         selected: dict[int, dict] = {}
-        if segment and segment[0].get("role") == "user":
-            selected[0] = copy.deepcopy(segment[0])
+        if messages[start].get("role") == "user":
+            selected[start] = copy.deepcopy(messages[start])
 
         final_answer = next(
             (
                 index
-                for index in range(len(segment) - 1, -1, -1)
-                if segment[index].get("role") == "assistant"
-                and segment[index].get("content")
-                and not segment[index].get("tool_calls")
+                for index in range(end - 1, start - 1, -1)
+                if messages[index].get("role") == "assistant"
+                and messages[index].get("content")
+                and not messages[index].get("tool_calls")
             ),
             -1,
         )
         if final_answer >= 0:
             selected[final_answer] = {
                 "role": "assistant",
-                "content": copy.deepcopy(segment[final_answer].get("content")),
+                "content": copy.deepcopy(messages[final_answer].get("content")),
             }
 
-        for index, message in enumerate(segment):
+        for index in range(start, end):
+            message = messages[index]
             if message.get("role") == "assistant" and message.get("tool_calls"):
                 kept = [
                     copy.deepcopy(call)
-                    for call in message.get("tool_calls") or []
-                    if call.get("id") in tool_limit_ids
+                    for call_index, call in enumerate(message.get("tool_calls") or [])
+                    if (index, call_index) in selected_calls
                 ]
                 if kept:
                     selected[index] = {
@@ -370,7 +430,7 @@ class Filter:
                     }
             elif (
                 message.get("role") == "tool"
-                and message.get("tool_call_id") in tool_limit_ids
+                and index in selected_results
             ):
                 selected[index] = copy.deepcopy(message)
         return [selected[index] for index in sorted(selected)]
@@ -399,16 +459,15 @@ class Filter:
                 if self.valves.history_turns
                 else []
             )
-            historical_calls = [
-                call.get("id")
+            exchanges = completed_tool_exchanges(messages, is_tool_image_message=is_tool_image_message)
+            historical_exchanges = [
+                exchange
                 for start, end in retained_ranges
-                for message in messages[start:end]
-                if message.get("role") == "assistant"
-                for call in message.get("tool_calls") or []
-                if call.get("id")
+                for exchange in exchanges
+                if start <= exchange.message_index < exchange.result_index < end
             ]
-            retained_call_ids = set(
-                historical_calls[-self.valves.history_tool_calls :]
+            retained_exchanges = (
+                historical_exchanges[-self.valves.history_tool_calls :]
                 if self.valves.history_tool_calls
                 else []
             )
@@ -421,8 +480,7 @@ class Filter:
                 item
                 for start, end in retained_ranges
                 for item in self._select_segment(
-                    self._historical_segment(messages, start, end),
-                    retained_call_ids,
+                    messages, start, end, retained_exchanges,
                 )
             ]
             current = copy.deepcopy(messages[current_user:])
