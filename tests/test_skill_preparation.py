@@ -230,6 +230,7 @@ class SkillBehavior:
             self.metadata["lite_base_tool_ids"] = ["Toolkit", "server:mcp:documents"]
         elif self.path == "child":
             self.models["agent-a"].meta["toolIds"] = ["Toolkit", "server:mcp:documents"]
+            self.runtime_model["info"]["meta"]["skillIds"] = ["alpha", "beta"]
         else:
             self.metadata["tools"]["lookup"] = {
                 "spec": {"name": "lookup"}, "callable": AsyncMock(),
@@ -259,6 +260,7 @@ class SkillBehavior:
             self.assertEqual(await mcp["callable"](id="item"), "MCP result")
         if self.path == "child":
             self.assertEqual(await lookup(), self.body["messages"])
+            self.assertNotIn("beta", self.prompt())
 
     async def test_newly_missing_skill_is_detected_on_next_preparation(self):
         await self.prepare()
@@ -489,6 +491,167 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
 class ChildSkillTests(SkillBehavior, PipeTestCase):
     path = "child"
 
+    async def test_database_removal_clears_skills_despite_stale_runtime_and_outer_selection(self):
+        self.runtime_model["info"]["meta"]["skillIds"] = ["alpha"]
+        request_state = {"platform": "keep request"}
+        self.request.state.metadata = request_state
+        for mode in ("native", "legacy"):
+            with self.subTest(mode=mode):
+                self.metadata["params"] = {"function_calling": mode}
+                self.select(["alpha"])
+                await self.prepare()
+                self.assertIn("alpha", self.prompt())
+                shared = self.metadata["tools"]
+                history = self.metadata["lite_child_messages"]
+                self.select([])
+                self.body["skill_ids"] = ["alpha", "beta"]
+                self.metadata["lite_orchestrator_skill_ids"] = ["beta"]
+                outer_metadata = {"skill_ids": ["alpha"], "platform": "keep outer"}
+                self.body["metadata"] = outer_metadata
+                self.skills.reset_mock()
+                self.builtins.reset_mock()
+
+                await self.prepare()
+
+                self.assertEqual(self.runtime_model["info"]["meta"]["skillIds"], ["alpha"])
+                self.assertNotIn("alpha", self.prompt())
+                self.assertNotIn("beta", self.prompt())
+                self.assertNotIn("<available_skills>", self.prompt())
+                self.assertNotIn("view_skill", shared)
+                self.assertNotIn("lite_skill_loader", self.metadata)
+                self.assertFalse(self.metadata["lite_view_skill_available"])
+                self.assertFalse(any(s["function"]["name"] == "view_skill" for s in self.body["tools"]))
+                self.assertEqual(self.metadata["skill_ids"], [])
+                self.assertEqual(self.metadata["lite_target_skill_ids"], [])
+                self.assertIs(self.body["metadata"]["tools"], shared)
+                self.assertIs(self.metadata["lite_child_messages"], history)
+                self.assertIs(request_state["tools"], shared)
+                self.assertIs(request_state["lite_child_messages"], history)
+                self.assertNotIn("lite_skill_loader", request_state)
+                self.assertEqual(request_state["skill_ids"], [])
+                self.assertEqual(request_state["platform"], "keep request")
+                self.assertEqual(outer_metadata, {"skill_ids": ["alpha"], "platform": "keep outer"})
+                self.skills.assert_not_awaited()
+                self.assertTrue(all(args.args[1]["__skill_ids__"] == [] for args in self.builtins.call_args_list))
+
+    async def test_database_replacement_updates_context_schema_and_loader_allowlist(self):
+        self.runtime_model["info"]["meta"]["skillIds"] = ["alpha"]
+
+        async def dispatch_with_stale_body_selection(**kwargs):
+            kwargs["form_data"]["skill_ids"] = ["alpha"]
+            return await self.process_filters(**kwargs)
+
+        self.dispatch_filters.side_effect = dispatch_with_stale_body_selection
+        self.metadata["lite_orchestrator_skill_ids"] = ["alpha"]
+        for mode in ("native", "legacy"):
+            with self.subTest(mode=mode):
+                self.metadata["params"] = {"function_calling": mode}
+                self.select(["alpha"])
+                await self.prepare()
+                previous_loader = self.metadata["tools"].get("view_skill")
+                self.select([" BETA ", "beta", ""])
+                self.skills.reset_mock()
+                self.view_skill.reset_mock()
+                self.builtins.return_value["view_skill"]["spec"] = {
+                    "name": "view_skill", "description": "Current Skill loader",
+                }
+
+                await self.prepare()
+
+                self.assertEqual(self.runtime_model["info"]["meta"]["skillIds"], ["alpha"])
+                self.assertNotIn("alpha", self.prompt())
+                self.assertIn("beta", self.prompt())
+                self.skills.assert_awaited_once_with("beta")
+                self.assertEqual(self.metadata["skill_ids"], ["beta"])
+                schemas = [s["function"] for s in self.body["tools"] if s["function"]["name"] == "view_skill"]
+                if mode == "native":
+                    loader = self.metadata["tools"]["view_skill"]
+                    self.assertIsNot(loader, previous_loader)
+                    self.assertEqual(schemas, [{"name": "view_skill", "description": "Current Skill loader"}])
+                    self.assertEqual(json.loads(await loader["callable"](id=" ALPHA ")), {
+                        "error": "Skill is not available in the current model context",
+                    })
+                    self.view_skill.assert_not_awaited()
+                    self.assertEqual(await loader["callable"](id=" BETA "), "builtin checked permissions")
+                    self.view_skill.assert_awaited_once_with(id="beta")
+                    params = self.builtins.call_args.args[1]
+                    self.assertEqual(params["__skill_ids__"], ["beta"])
+                    self.assertEqual(params["__user__"], {"id": "user"})
+                else:
+                    self.assertIn("Full beta instructions", self.prompt())
+                    self.assertEqual(schemas, [])
+                    self.assertNotIn("view_skill", self.metadata["tools"])
+                    self.assertNotIn("lite_skill_loader", self.metadata)
+
+    async def test_fresh_attachment_errors_do_not_lookup_detached_runtime_skills(self):
+        self.runtime_model["info"]["meta"]["skillIds"] = ["alpha"]
+        await self.prepare()
+        self.records.pop("alpha")
+        self.select([" BETA ", "beta"])
+        for mode, inactive in itertools.product(("native", "legacy"), (False, True)):
+            with self.subTest(mode=mode, inactive=inactive):
+                self.metadata["params"] = {"function_calling": mode}
+                if inactive:
+                    self.records["beta"] = types.SimpleNamespace(is_active=False)
+                else:
+                    self.records.pop("beta", None)
+                self.skills.reset_mock()
+                self.completion.reset_mock()
+                with self.assertRaisesRegex(ValueError, "Attached model Skills are unavailable: beta$"):
+                    await self.prepare()
+                self.skills.assert_awaited_once_with("beta")
+                self.completion.assert_not_awaited()
+                self.assertEqual(self.metadata["skill_ids"], ["alpha"])
+
+    async def test_failure_after_fresh_skill_install_restores_local_state_and_keeps_mcp_resources(self):
+        self.runtime_model["info"]["meta"]["skillIds"] = ["alpha"]
+        request_state = {"platform": "keep request"}
+        self.request.state.metadata = request_state
+        await self.prepare()
+        shared = self.metadata["tools"]
+        old_tools = dict(shared)
+        history = self.metadata["lite_child_messages"]
+        old_history = list(history)
+        state = dict(self.metadata)
+        request_snapshot = dict(request_state)
+        body = self.body
+        outer_metadata = {"skill_ids": ["alpha"], "platform": "keep outer"}
+        body["metadata"] = outer_metadata
+        self.models["agent-a"].meta.update(skillIds=["beta"], toolIds=["Toolkit", "server:mcp:documents"])
+        client = types.SimpleNamespace(call_tool=AsyncMock(return_value="MCP result"))
+        self.connector.return_value = (client, [{"name": "fetch"}])
+
+        async def fail_after_filters(**kwargs):
+            filtered, _ = await self.process_filters(**kwargs)
+            filtered["metadata"]["lite_child_messages"].append({"role": "user", "content": "partial"})
+            raise RuntimeError("dispatch failed after Skill refresh")
+
+        self.dispatch_filters.side_effect = fail_after_filters
+        self.completion.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, "dispatch failed after Skill refresh"):
+            await self.prepare()
+        self.completion.assert_not_awaited()
+        self.assertIs(self.metadata["tools"], shared)
+        self.assertEqual(shared, old_tools)
+        for name, tool in old_tools.items():
+            self.assertIs(shared[name], tool)
+        self.assertIs(self.metadata["lite_child_messages"], history)
+        self.assertEqual(history, old_history)
+        self.assertEqual(await old_tools["lookup"]["callable"](), old_history)
+        for key, value in state.items():
+            self.assertEqual(self.metadata[key], value)
+        self.assertEqual(request_state, request_snapshot)
+        self.assertIs(request_state["tools"], shared)
+        self.assertIs(request_state["lite_child_messages"], history)
+        self.assertNotIn("lite_subagent_filter_run", request_state)
+        self.assertEqual(request_state["platform"], "keep request")
+        self.assertIs(self.body, body)
+        self.assertEqual(outer_metadata, {"skill_ids": ["alpha"], "platform": "keep outer"})
+        self.connector.assert_awaited_once()
+        self.assertIs(self.metadata["mcp_clients"]["documents"], client)
+        self.assertNotIn("beta", "\n".join(m["content"] for m in history if m["role"] == "system"))
+        self.assertIn("error", json.loads(await old_tools["view_skill"]["callable"](id="beta")))
+
     async def test_child_skill_failure_restores_owned_loader_and_attachment_identifiers(self):
         await self.prepare()
         shared = self.metadata["tools"]
@@ -518,6 +681,28 @@ class ChildSkillTests(SkillBehavior, PipeTestCase):
 
 class StandaloneSkillTests(SkillBehavior, PipeTestCase):
     path = "standalone"
+
+    async def test_standalone_selection_keeps_body_runtime_and_orchestrator_sources(self):
+        self.records["gamma"] = types.SimpleNamespace(
+            is_active=True, name="Gamma", description="Gamma description", content="Full gamma instructions",
+        )
+        self.body["skill_ids"] = [" BETA "]
+        self.metadata.update(lite_orchestrator_skill_ids=["gamma"], lite_target_skill_ids=["missing-child-skill"])
+        for mode in ("native", "legacy"):
+            with self.subTest(mode=mode):
+                self.metadata["params"] = {"function_calling": mode}
+                self.skills.reset_mock()
+                await self.prepare()
+                self.assertEqual([args.args[0] for args in self.skills.call_args_list], ["beta", "alpha", "gamma"])
+                self.assertNotIn("missing-child-skill", self.prompt())
+                if mode == "native":
+                    self.assertLess(self.prompt().index("<id>beta</id>"), self.prompt().index("<id>alpha</id>"))
+                    self.assertLess(self.prompt().index("<id>alpha</id>"), self.prompt().index("<id>gamma</id>"))
+                    loader = self.metadata["tools"]["view_skill"]["callable"]
+                    self.assertEqual(await loader(id="gamma"), "builtin checked permissions")
+                else:
+                    for skill_id in ("alpha", "beta", "gamma"):
+                        self.assertIn("Full " + skill_id + " instructions", self.prompt())
 
     async def test_standalone_filter_uses_body_metadata_and_mirrors_managed_fields_only(self):
         body_metadata = self.metadata

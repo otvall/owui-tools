@@ -1,6 +1,6 @@
 """
 title: Tool Call Filter
-description: Removes Tool calls that the destination model cannot execute.
+description: Keeps unambiguous completed Tool call occurrences permitted for the destination model.
 version: 0.18.0
 required_open_webui_version: 0.11.1
 """
@@ -341,6 +341,65 @@ class RequestRuntime:
         )
 # END GENERATED REQUEST RUNTIME
 
+# BEGIN GENERATED TOOL HISTORY
+# Edit shared/tool_history.py; run python3 tools/generate_skill_preparation.py
+"""Pair concrete Tool exchanges without treating correlation IDs as global keys."""
+
+from collections.abc import Callable
+from dataclasses import dataclass
+
+
+@dataclass(frozen=True)
+class ToolExchange:
+    message_index: int
+    call_index: int
+    result_index: int
+
+
+def completed_tool_exchanges(
+    messages: list[dict], *, is_tool_image_message: Callable[[dict], bool],
+) -> list[ToolExchange]:
+    """Match only within one assistant execution batch in one user request.
+
+    OWUI may group several sequential executions into one assistant message.
+    Unique IDs can still correlate those calls with their ordered results. Reused
+    IDs within that batch are ambiguous; a later batch cannot complete an earlier
+    one. Identical repeated results represent one exchange, conflicting ones none.
+    """
+    exchanges: list[ToolExchange] = []
+    calls: dict[str, list[tuple[int, int]]] = {}
+    results: dict[str, list[int]] = {}
+
+    def finish_batch() -> None:
+        for call_id, occurrences in calls.items():
+            matching_results = results.get(call_id, [])
+            if len(occurrences) != 1 or not matching_results:
+                continue
+            first_result = matching_results[0]
+            if any(messages[index] != messages[first_result] for index in matching_results[1:]):
+                continue
+            message_index, call_index = occurrences[0]
+            exchanges.append(ToolExchange(message_index, call_index, first_result))
+        calls.clear()
+        results.clear()
+
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role == "assistant" or (role == "user" and not is_tool_image_message(message)):
+            finish_batch()
+        if role == "assistant":
+            for call_index, call in enumerate(message.get("tool_calls") or []):
+                call_id = call.get("id")
+                if isinstance(call_id, str) and call_id:
+                    calls.setdefault(call_id, []).append((index, call_index))
+        elif role == "tool":
+            call_id = message.get("tool_call_id")
+            if isinstance(call_id, str) and call_id in calls:
+                results.setdefault(call_id, []).append(index)
+    finish_batch()
+    return exchanges
+# END GENERATED TOOL HISTORY
+
 log = logging.getLogger(__name__)
 
 DELEGATE_VERSION = "v2"
@@ -437,82 +496,57 @@ class Filter:
         return {name for name in names if name}
 
     @staticmethod
-    def _strip_router_exchange(messages: list[dict], target_agent_id: str) -> list[dict]:
+    def _keep_supported_pairs(
+        messages: list[dict], allowed_names: set[str], target_agent_id: str,
+    ) -> list[dict]:
+        exchanges = completed_tool_exchanges(messages, is_tool_image_message=is_tool_image_message)
         current_user = last_user_index(messages)
-        if current_user < 0 or not target_agent_id:
-            return list(messages)
-        delegate_ids = {
-            call.get("id")
-            for message in messages[current_user + 1 :]
-            if message.get("role") == "assistant"
-            for call in message.get("tool_calls") or []
-            if (call.get("function") or {}).get("name") == "lite_delegate"
-            and call.get("id")
-        }
-        marker_index = next(
+        marker_index = max(
             (
-                index
-                for index in range(len(messages) - 1, current_user, -1)
-                if messages[index].get("role") == "tool"
-                and messages[index].get("tool_call_id") in delegate_ids
-                and parse_delegate_marker(messages[index].get("content"))
+                exchange.result_index
+                for exchange in exchanges
+                if current_user >= 0 and target_agent_id
+                and exchange.message_index > current_user
+                and (messages[exchange.message_index]["tool_calls"][exchange.call_index].get("function") or {}).get("name") == "lite_delegate"
+                and parse_delegate_marker(messages[exchange.result_index].get("content"))
                 == target_agent_id
             ),
-            -1,
+            default=-1,
         )
-        if marker_index < 0:
-            return list(messages)
-        after_marker = messages[marker_index + 1 :]
-        completed_after_marker = {
-            message.get("tool_call_id")
-            for message in after_marker
-            if message.get("role") == "tool" and message.get("tool_call_id")
-        }
-        recovered_calls = [
-            call
-            for message in messages[current_user + 1 : marker_index]
-            if message.get("role") == "assistant"
-            for call in message.get("tool_calls") or []
-            if call.get("id") in completed_after_marker
-        ]
-        recovered = (
-            [{"role": "assistant", "content": "", "tool_calls": recovered_calls}]
-            if recovered_calls
-            else []
-        )
-        return [*messages[: current_user + 1], *recovered, *after_marker]
-
-    @staticmethod
-    def _keep_supported_pairs(messages: list[dict], allowed_names: set[str]) -> list[dict]:
-        results = {
-            message.get("tool_call_id")
-            for message in messages
-            if message.get("role") == "tool" and message.get("tool_call_id")
-        }
-        accepted = {
-            call.get("id")
-            for message in messages
-            if message.get("role") == "assistant"
-            for call in message.get("tool_calls") or []
-            if call.get("id") in results
-            and str((call.get("function") or {}).get("name") or "").strip()
+        accepted = [
+            exchange for exchange in exchanges
+            if (exchange.message_index < current_user or exchange.result_index > marker_index)
+            and str((messages[exchange.message_index]["tool_calls"][exchange.call_index].get("function") or {}).get("name") or "").strip()
             in allowed_names
-        }
+        ]
+        # Grouped child calls occur before the delegate result in OWUI's payload.
+        # Recover only their concrete pairs, after matching the original batches.
+        recovered_calls = [
+            messages[exchange.message_index]["tool_calls"][exchange.call_index]
+            for exchange in accepted
+            if current_user < exchange.message_index < marker_index
+        ]
+        accepted_calls = {(exchange.message_index, exchange.call_index) for exchange in accepted}
+        accepted_results = {exchange.result_index for exchange in accepted}
         cleaned = []
-        for original in messages:
+        for index, original in enumerate(messages):
+            if current_user < index <= marker_index:
+                if index == marker_index and recovered_calls:
+                    cleaned.append({"role": "assistant", "content": "", "tool_calls": recovered_calls})
+                continue
             if original.get("role") == "assistant" and original.get("tool_calls"):
                 message = dict(original)
                 message["tool_calls"] = [
                     call
-                    for call in original.get("tool_calls") or []
-                    if call.get("id") in accepted
+                    for call_index, call in enumerate(original.get("tool_calls") or [])
+                    if (index, call_index) in accepted_calls
                 ]
                 if not message["tool_calls"]:
                     message.pop("tool_calls", None)
                     message.pop("reasoning_items", None)
                 if visible_assistant(message):
                     cleaned.append(message)
-            elif original.get("role") != "tool" or original.get("tool_call_id") in accepted:
+            elif original.get("role") != "tool" or index in accepted_results:
                 cleaned.append(original)
         return cleaned
 
@@ -524,11 +558,10 @@ class Filter:
         if not isinstance(messages, list):
             raise TypeError("Tool Call Filter messages must be a list")
         allowed_names = self._allowed_tool_names(body, metadata)
-        messages = self._strip_router_exchange(
-            messages,
+        body["messages"] = self._keep_supported_pairs(
+            messages, allowed_names,
             str(metadata.get("lite_target_agent_id") or "").strip(),
         )
-        body["messages"] = self._keep_supported_pairs(messages, allowed_names)
         RequestRuntime(__request__, metadata).finish_filter("tool_call_filter")
         self._debug(
             "allowed=%s messages before=%s after=%s",
