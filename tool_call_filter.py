@@ -610,6 +610,9 @@ class Filter:
                     if (index, call_index) in accepted_calls
                 ]
                 if not message["tool_calls"]:
+                    if index < current_user:
+                        # Tool narration must not become a historical final answer.
+                        continue
                     message.pop("tool_calls", None)
                     message.pop("reasoning_items", None)
                 if visible_assistant(message):

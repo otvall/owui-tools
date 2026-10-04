@@ -6,7 +6,8 @@ import unittest
 from types import SimpleNamespace
 
 from test_handoff_history import (
-    PipeTestCase, assistant, call, grouped_history, marker, result, tool_filter_module,
+    PipeTestCase, assistant, call, context_filter_module, grouped_history, marker,
+    result, tool_filter_module,
 )
 
 
@@ -236,6 +237,52 @@ class ExecutorHistoryTests(PipeTestCase):
                 self.assertEqual([m["content"] for m in messages if m["role"] == "user"],
                                  ["A question", "B question", "current question"] if turns == 2 else
                                  ["B question", "current question"] if turns == 1 else ["current question"])
+
+    async def test_filtered_tool_narration_does_not_replace_a_completed_text_turn(self):
+        self.context_filter.valves.history_turns = 1
+        narration = assistant(call("unfinished-lookup", "lookup"))
+        narration["content"] = "I will look this up"
+        messages = await self.route_history([
+            {"role": "user", "content": "completed question"},
+            assistant(call("old-delegate", "lite_delegate")), result("old-delegate", marker()),
+            assistant(call("old-lookup", "lookup")), result("old-lookup", "COMPLETED_CHILD_RESULT"),
+            {"role": "assistant", "content": "completed answer"},
+            {"role": "user", "content": "unfinished question"},
+            narration, result("unfinished-lookup", "PENDING_ORCHESTRATOR_RESULT"),
+            {"role": "user", "content": "current question"},
+            assistant(call("delegate", "lite_delegate")), result("delegate", marker()),
+        ])
+
+        self.assertEqual([m["content"] for m in messages if m["role"] in ("user", "assistant") and not m.get("tool_calls")],
+                         ["completed question", "completed answer", "current question"])
+        self.assertEqual([m for m in messages if m["role"] == "tool"], [result("old-lookup", "COMPLETED_CHILD_RESULT")])
+
+    async def test_standalone_filters_preserve_final_answers_and_current_tool_narration(self):
+        old_narration = assistant(call("private", "private_tool"))
+        old_narration["content"] = "I will look this up"
+        current_narration = assistant(call("current", "lookup"))
+        current_narration["content"] = "Checking the current question"
+        current = [
+            {"role": "user", "content": "current question"},
+            current_narration, result("current", "CURRENT_RESULT"),
+        ]
+        body = {"metadata": {"tools": {"lookup": {}}}, "messages": [
+            {"role": "user", "content": "completed question"},
+            {"role": "assistant", "content": "completed answer"},
+            {"role": "user", "content": "unfinished question"},
+            old_narration, result("private", "PRIVATE_RESULT"), *current,
+        ]}
+        # Standalone capability filtering must preserve the same text boundary.
+        await tool_filter_module.Filter().inlet(body)
+        context = context_filter_module.Filter()
+        context.valves.history_turns = 1
+        await context.inlet(body)
+
+        self.assertEqual(body["messages"][:2], [
+            {"role": "user", "content": "completed question"},
+            {"role": "assistant", "content": "completed answer"},
+        ])
+        self.assertEqual(body["messages"][2:], current)
 
     async def test_failed_preparation_restores_history_and_tools_before_a_successful_retry(self):
         source = [*grouped_history(), {"role": "assistant", "content": "old answer"},
