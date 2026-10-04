@@ -9,14 +9,18 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FUNCTIONS = (
+    "lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py",
+    "previous_tool_context.py", "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
+)
 
 
 class SkillGenerationTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for name in (
-            "shared/skill_preparation.py", "tools/generate_skill_preparation.py",
-            "lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py",
+            "shared/skill_preparation.py", "shared/request_runtime.py", "tools/generate_skill_preparation.py",
+            *FUNCTIONS,
         ):
             target = self.root / name
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -29,9 +33,7 @@ class SkillGenerationTests(unittest.TestCase):
         )
 
     def outputs(self):
-        return {name: (self.root / name).read_bytes() for name in (
-            "lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py",
-        )}
+        return {name: (self.root / name).read_bytes() for name in FUNCTIONS}
 
     def test_generation_is_reproducible_and_check_is_read_only(self):
         before = self.outputs()
@@ -53,11 +55,14 @@ class SkillGenerationTests(unittest.TestCase):
         before = self.outputs()
         checked = self.run_generator("--check")
         self.assertEqual(checked.returncode, 1)
-        for name in before:
+        for name in FUNCTIONS[:3]:
             self.assertIn(name, checked.stderr)
         self.assertEqual(self.outputs(), before)
         self.assertEqual(self.run_generator().returncode, 0)
         for name, output in self.outputs().items():
+            if name not in FUNCTIONS[:3]:
+                self.assertEqual(output, before[name])
+                continue
             self.assertNotEqual(output, before[name])
         self.assertEqual(self.run_generator("--check").returncode, 0)
 
@@ -84,6 +89,20 @@ class SkillGenerationTests(unittest.TestCase):
         before = self.outputs()
         self.assertEqual(self.run_generator().returncode, 0)
         self.assertEqual(self.outputs(), before)
+
+    def test_lifecycle_source_change_refreshes_every_function(self):
+        source = self.root / "shared/request_runtime.py"
+        source.write_text(source.read_text() + "\n# Updated lifecycle source\n")
+        before = self.outputs()
+        checked = self.run_generator("--check")
+        self.assertEqual(checked.returncode, 1, checked.stderr)
+        for name in FUNCTIONS:
+            self.assertIn(name, checked.stderr)
+        self.assertEqual(self.outputs(), before)
+        self.assertEqual(self.run_generator().returncode, 0)
+        for name, output in self.outputs().items():
+            self.assertNotEqual(output, before[name])
+        self.assertEqual(self.run_generator("--check").returncode, 0)
 
     def test_check_detects_a_stale_deployment_copy_and_generation_repairs_it(self):
         before = self.outputs()
@@ -132,6 +151,8 @@ getattr(module, sys.argv[2])()
 '''
         for filename, entrypoint in (
             ("lite_handoff_router.py", "Pipe"), ("skill_context.py", "Filter"), ("lite_subagent_registry.py", "Filter"),
+            ("previous_tool_context.py", "Filter"), ("history_cleanup.py", "Filter"),
+            ("tool_call_filter.py", "Filter"), ("subagent_context.py", "Filter"),
         ):
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
                 target = Path(directory) / filename

@@ -288,6 +288,160 @@ class SkillBehavior:
 class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
     path = "orchestrator"
 
+    def registry_filter(self):
+        registry = load_plain_module("lite_subagent_registry.py", "registry_lifecycle_tests", {
+            "open_webui.config": types.SimpleNamespace(BYPASS_ADMIN_ACCESS_CONTROL=False),
+            "open_webui.env": types.SimpleNamespace(BYPASS_MODEL_ACCESS_CONTROL=False),
+            "open_webui.models.models": types.SimpleNamespace(Models=router.Models),
+            "open_webui.models.skills": types.SimpleNamespace(Skills=router.Skills),
+            "open_webui.models.users": types.SimpleNamespace(Users=router.Users),
+            "open_webui.utils.models": types.SimpleNamespace(check_model_access=AsyncMock()),
+        })
+        self.enterContext(patch.dict(registry.SUBAGENTS, {"agent-b": "beta"}, clear=True))
+        self.user.id, self.user.role = "user", "user"
+        self.models["router"] = types.SimpleNamespace(is_active=True, user_id="owner")
+        filter = registry.Filter()
+        filter.valves.base_skill_ids = ["alpha"]
+        filter.valves.base_tool_ids = []
+        return filter
+
+    async def test_new_request_resets_successful_handoff_and_prepares_current_registry(self):
+        self.metadata["params"]["function_calling"] = "native"
+        self.models["agent-a"].meta["skillIds"] = ["alpha"]
+        await self.invoke(grouped_history()[:4])
+        shared = self.metadata["tools"]
+        ordinary = shared["lookup"]
+        schemas = self.routed["tools"]
+        legacy_keys = ("lite_history_boundary", "lite_router_user_index", "lite_active_skill_id", "lite_orchestrator_skill_context")
+        self.metadata.update({key: "old" for key in legacy_keys})
+        self.metadata["platform"] = "keep authoritative"
+        client = object()
+        self.metadata["mcp_clients"] = {"existing": client}
+        request_state = {**self.metadata, "platform": "keep request", "session_setting": "keep"}
+        self.request.state.metadata = request_state
+        body = {"model": "router", "metadata": self.metadata, "messages": self.routed["messages"] + [
+            {"role": "user", "content": "new task"},
+        ], "tools": schemas}
+        registry = self.registry_filter()
+        registry.valves.base_skill_ids = ["alpha"]
+        await registry.inlet(body, __request__=self.request, __user__={"id": "user"})
+        for key in (*legacy_keys, "lite_active_handoff", "lite_active_model_id", "lite_active_tool_runtime",
+                    "lite_base_tool_runtime", "lite_unfiltered_messages", "lite_child_messages", "lite_skill_loader",
+                    "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
+                    "lite_subagent_filter_run", "lite_subagent_filter_pipeline", "lite_target_model_id"):
+            self.assertNotIn(key, self.metadata)
+            self.assertNotIn(key, request_state)
+        self.assertIs(self.metadata["tools"], shared)
+        self.assertIs(request_state["tools"], shared)
+        self.assertIs(shared["lookup"], ordinary)
+        self.assertNotIn("view_skill", shared)
+        self.assertFalse(any(s["function"]["name"] == "view_skill" for s in body["tools"]))
+        self.assertIs(self.metadata["mcp_clients"]["existing"], client)
+        self.assertEqual(list(self.metadata["lite_agents"]), ["agent-b"])
+        self.assertEqual(self.metadata["lite_orchestrator_skill_ids"], ["alpha", "beta"])
+        previous = load_plain_module("previous_tool_context.py", "lifecycle_previous_tests").Filter()
+        cleanup = load_plain_module("history_cleanup.py", "lifecycle_cleanup_tests").Filter()
+        await previous.inlet(body, __request__=self.request)
+        await cleanup.inlet(body, __request__=self.request)
+        self.records["alpha"].description = "new request current Skill"
+        await self.invoke_body(body)
+        self.assertEqual(self.routed["model"], "base-model")
+        self.assertIs(self.routed["metadata"], self.metadata)
+        self.assertIn("new request current Skill", self.routed["messages"][0]["content"])
+        self.assertIn("<id>beta</id>", self.routed["messages"][0]["content"])
+        self.assertNotIn("lite_active_handoff", self.metadata)
+        self.assertEqual(request_state["platform"], "keep request")
+        self.assertEqual(request_state["session_setting"], "keep")
+        self.assertEqual(self.metadata["platform"], "keep authoritative")
+        for key in ("previous_tool_context_applied", "history_cleanup_applied", "lite_skill_loader", "lite_view_skill_available"):
+            self.assertEqual(request_state[key], self.metadata[key])
+
+    async def test_new_request_loader_cleanup_respects_callable_and_schema_ownership(self):
+        for replacement, include_schemas in (("owned", True), ("absent", True), ("foreign", True), ("owned", False)):
+            with self.subTest(replacement=replacement, include_schemas=include_schemas):
+                await self.prepare()
+                foreign = {"spec": {"name": "view_skill", "description": "foreign"}, "callable": AsyncMock()}
+                if replacement == "absent":
+                    self.metadata["tools"].pop("view_skill")
+                elif replacement == "foreign":
+                    self.metadata["tools"]["view_skill"] = foreign
+                old_schema = next(s for s in self.body["tools"] if s["function"]["name"] == "view_skill")
+                if not include_schemas:
+                    self.body.pop("tools")
+                self.body["model"] = "router"
+                registry = self.registry_filter()
+                await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
+                self.assertNotIn("lite_skill_loader", self.metadata)
+                self.metadata.update(previous_tool_context_applied=True, history_cleanup_applied=True)
+                if replacement == "foreign":
+                    self.assertIs(self.metadata["tools"]["view_skill"], foreign)
+                    self.assertIn(old_schema, self.body["tools"])
+                    with self.assertRaisesRegex(ValueError, "conflicts with the builtin Skill loader"):
+                        await self.prepare()
+                    self.metadata["tools"].pop("view_skill")
+                    self.body["tools"] = []
+                else:
+                    self.assertNotIn("view_skill", self.metadata["tools"])
+                    self.assertNotIn(old_schema, self.body.get("tools", []))
+                self.metadata.update(previous_tool_context_applied=True, history_cleanup_applied=True)
+
+    async def test_registry_validation_failure_does_not_reset_previous_request(self):
+        await self.prepare()
+        snapshot = dict(self.metadata)
+        old_loader = self.metadata["tools"]["view_skill"]
+        self.body["model"] = "router"
+        registry = self.registry_filter()
+        self.records.pop("alpha")
+        with self.assertRaisesRegex(ValueError, "Configured model-bound Skills are unavailable"):
+            await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
+        self.assertEqual(self.metadata, snapshot)
+        self.assertIs(self.metadata["tools"]["view_skill"], old_loader)
+
+    async def test_registry_initializes_invalid_tool_registry_and_keeps_foreign_schema_conflict(self):
+        self.metadata["tools"] = ["invalid registry"]
+        schema = {"type": "function", "function": {"name": "view_skill", "description": "foreign"}}
+        self.body["tools"] = [schema]
+        registry = self.registry_filter()
+        await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
+        self.assertEqual(self.metadata["tools"], {})
+        self.assertEqual(self.body["tools"], [schema])
+        self.metadata.update(previous_tool_context_applied=True, history_cleanup_applied=True)
+        with self.assertRaisesRegex(ValueError, "conflicts with the builtin Skill loader"):
+            await self.prepare()
+        self.completion.assert_not_awaited()
+
+    async def test_orchestrator_provider_failure_retains_prepared_cache_and_loader(self):
+        self.metadata["lite_base_tool_ids"] = ["toolkit"]
+        self.completion.side_effect = RuntimeError("provider failed")
+        with self.assertRaisesRegex(RuntimeError, "provider failed"):
+            await self.prepare()
+        self.completion.assert_awaited_once()
+        self.assertIn("lite_base_tool_runtime", self.metadata)
+        self.assertIn("lookup", self.metadata["tools"])
+        self.assertIn("view_skill", self.metadata["tools"])
+        self.assertIs(self.metadata["lite_skill_loader"]["callable"], self.metadata["tools"]["view_skill"]["callable"])
+
+    async def test_failed_orchestrator_skill_preparation_restores_tools_cache_and_attachments(self):
+        await self.prepare()
+        shared = self.metadata["tools"]
+        old_loader = shared["view_skill"]
+        ownership = self.metadata["lite_skill_loader"]
+        self.metadata.update(lite_base_tool_ids=["toolkit"], tool_ids=["existing"], skill_ids=["old"])
+        state = dict(self.metadata)
+        self.records.pop("alpha")
+        self.completion.reset_mock()
+        with self.assertRaisesRegex(ValueError, "Skills are unavailable"):
+            await self.prepare()
+        self.completion.assert_not_awaited()
+        self.assertEqual(self.metadata, state)
+        self.assertIs(self.metadata["tools"], shared)
+        self.assertIs(shared["view_skill"], old_loader)
+        self.assertIs(self.metadata["lite_skill_loader"], ownership)
+        self.assertNotIn("lookup", shared)
+        self.assertIs(self.metadata["lite_base_tool_runtime"], state["lite_base_tool_runtime"])
+        self.assertEqual(self.metadata["tool_ids"], ["existing"])
+        self.loader.assert_awaited_once()
+
     async def test_registry_canonicalizes_configured_skills_before_pipe(self):
         registry = load_plain_module("lite_subagent_registry.py", "registry_skill_tests", {
             "open_webui.config": types.SimpleNamespace(BYPASS_ADMIN_ACCESS_CONTROL=False),
@@ -324,6 +478,45 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
 class ChildSkillTests(SkillBehavior, PipeTestCase):
     path = "child"
 
+    async def test_child_skill_failure_restores_owned_loader_and_attachment_identifiers(self):
+        await self.prepare()
+        shared = self.metadata["tools"]
+        old_tools = dict(shared)
+        history = self.metadata["lite_child_messages"]
+        old_history = list(history)
+        self.models["agent-a"].meta.update(toolIds=["new-toolkit"], skillIds=["beta"])
+        self.records.pop("beta")
+        state = dict(self.metadata)
+        self.completion.reset_mock()
+        with self.assertRaisesRegex(ValueError, "Skills are unavailable: beta"):
+            await self.prepare()
+        self.completion.assert_not_awaited()
+        self.assertEqual(self.metadata, state)
+        self.assertIs(self.metadata["tools"], shared)
+        for name, tool in old_tools.items():
+            self.assertIs(shared[name], tool)
+        self.assertEqual(self.metadata["tool_ids"], ["toolkit"])
+        self.assertEqual(self.metadata["skill_ids"], ["alpha"])
+        self.assertIs(self.metadata["lite_child_messages"], history)
+        self.assertEqual(await old_tools["lookup"]["callable"](), old_history)
+        self.records["beta"] = types.SimpleNamespace(is_active=True, name="beta", description="current", content="current beta")
+        await self.prepare()
+        self.assertEqual(self.metadata["skill_ids"], ["beta"])
+        self.assertIn("<id>beta</id>", self.prompt())
+
 
 class StandaloneSkillTests(SkillBehavior, PipeTestCase):
     path = "standalone"
+
+    async def test_standalone_filter_uses_body_metadata_and_mirrors_managed_fields_only(self):
+        body_metadata = self.metadata
+        state = {"session_id": "platform session", "platform": "retained", "lite_active_agent_id": "stale"}
+        self.request.state.metadata = state
+        await self.prepare()
+        self.assertIs(self.body["metadata"], body_metadata)
+        self.assertIs(state["tools"], body_metadata["tools"])
+        self.assertTrue(state["skill_context_applied"])
+        self.assertEqual(state["lite_skill_loader"], body_metadata["lite_skill_loader"])
+        self.assertNotIn("lite_active_agent_id", state)
+        self.assertEqual(state["session_id"], "platform session")
+        self.assertEqual(state["platform"], "retained")

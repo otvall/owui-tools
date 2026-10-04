@@ -5,6 +5,8 @@ import html
 from dataclasses import dataclass
 from typing import Any
 
+from shared.request_runtime import SkillLoaderOwnership
+
 
 def normalize_skill_ids(values) -> list[str]:
     result = []
@@ -32,34 +34,20 @@ class SkillPreparation:
         if not isinstance(tools, dict):
             tools = {}
             metadata["tools"] = tools
-        owned = metadata.get("lite_skill_loader")
-        current = tools.get("view_skill")
-        owns_current = (
-            isinstance(owned, dict) and isinstance(current, dict)
-            and current.get("callable") is owned.get("callable")
-            and current.get("spec") == owned.get("spec")
-        )
+        ownership = SkillLoaderOwnership(metadata)
         schemas = list(body.get("tools") or [])
 
-        def owned_schema(schema):
-            return (
-                isinstance(owned, dict) and (current is None or owns_current)
-                and schema.get("function") == owned.get("spec")
-            )
-
         if prepared.loader is not None and (
-            (current is not None and not owns_current)
+            (ownership.current is not None and not ownership.owns_current)
             or any(
                 (schema.get("function") or {}).get("name") == "view_skill"
-                and not owned_schema(schema)
+                and not ownership.owns_schema(schema)
                 for schema in schemas
             )
         ):
             raise ValueError('Attached Tool name "view_skill" conflicts with the builtin Skill loader')
-        if owns_current:
-            tools.pop("view_skill", None)
-        schemas = [schema for schema in schemas if not owned_schema(schema)]
-        metadata.pop("lite_skill_loader", None)
+        ownership.remove(body)
+        schemas = list(body.get("tools") or [])
         if prepared.loader is not None:
             tools["view_skill"] = prepared.loader
             schemas.append({"type": "function", "function": prepared.loader["spec"]})
@@ -68,7 +56,7 @@ class SkillPreparation:
             }
         if schemas or "tools" in body:
             body["tools"] = schemas
-        if prepared.ids or owned is not None or "lite_view_skill_available" in metadata:
+        if prepared.ids or ownership.record is not None or "lite_view_skill_available" in metadata:
             metadata["lite_view_skill_available"] = prepared.loader is not None
             metadata["lite_view_skill_model_id"] = runtime_model.get("id") if prepared.loader is not None else None
 

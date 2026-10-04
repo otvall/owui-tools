@@ -533,6 +533,17 @@ class WorkspaceCapabilityTests(PipeTestCase):
 
 
 class CompletionTests(PipeTestCase):
+    async def test_provider_failure_keeps_committed_preparation_without_retry(self):
+        self.completion.side_effect = RuntimeError("provider failed")
+        with self.assertRaisesRegex(RuntimeError, "provider failed"):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_awaited_once()
+        self.assertEqual(self.metadata["lite_active_model_id"], "agent-a")
+        self.assertEqual(self.metadata["lite_target_model_id"], "agent-a")
+        self.assertTrue(self.metadata["skill_context_applied"])
+        self.assertEqual(await self.metadata["tools"]["lookup"]["callable"](), self.routed["messages"])
+        self.assertEqual(self.metadata["lite_child_messages"], self.routed["messages"])
+
     async def test_provider_http_error_retains_message_on_both_routes(self):
         self.completion.return_value = router.Response(
             content='{"error":{"message":"provider refused request"}}', status_code=403,
@@ -558,6 +569,141 @@ class CompletionTests(PipeTestCase):
 
 
 class ChildFilterPipelineTests(PipeTestCase):
+    async def test_additional_history_filters_do_not_change_required_child_trace(self):
+        previous = load_plain_module("previous_tool_context.py", "additional_previous_tests").Filter()
+        cleanup = load_plain_module("history_cleanup.py", "additional_cleanup_tests").Filter()
+        self.filters.extend([previous, cleanup])
+        await self.invoke(grouped_history()[:4])
+        self.assertEqual(self.metadata["lite_subagent_filter_pipeline"], [
+            "tool_call_filter", "subagent_context", "skill_context",
+        ])
+
+    async def test_pipe_metadata_is_authoritative_and_managed_state_is_mirrored(self):
+        foreign_body_metadata = {"lite_active_handoff": {"agent_id": "agent-b", "__lite_delegate__": "v2"}}
+        request_state = {
+            "lite_active_model_id": "obsolete", "lite_subagent_filter_run": True,
+            "lite_active_skill_id": "legacy", "platform": "keep request state",
+        }
+        self.request.state.metadata = request_state
+        self.metadata["platform"] = "keep supplied state"
+        shared = self.metadata["tools"]
+        await self.invoke_body({"metadata": foreign_body_metadata, "messages": grouped_history()[:4]})
+        self.assertEqual(self.routed["model"], "agent-a")
+        self.assertIs(self.routed["metadata"], self.metadata)
+        self.assertIs(request_state["tools"], shared)
+        for key in ("lite_active_model_id", "lite_active_handoff", "lite_target_skill_ids", "skill_ids",
+                    "tool_ids", "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
+                    "lite_subagent_filter_pipeline", "lite_view_skill_available"):
+            self.assertEqual(request_state[key], self.metadata[key])
+        self.assertNotIn("lite_subagent_filter_run", request_state)
+        self.assertNotIn("lite_active_skill_id", request_state)
+        self.assertEqual(request_state["platform"], "keep request state")
+        self.assertEqual(self.metadata["platform"], "keep supplied state")
+        self.assertEqual(foreign_body_metadata["lite_active_handoff"]["agent_id"], "agent-b")
+        snapshot = dict(self.metadata)
+        self.completion.reset_mock()
+
+        async def fail(body):
+            raise RuntimeError("failed continuation")
+
+        self.filters.insert(2, types.SimpleNamespace(inlet=fail))
+        with self.assertRaisesRegex(RuntimeError, "failed continuation"):
+            await self.invoke_body({"metadata": foreign_body_metadata, "messages": grouped_history()})
+        self.completion.assert_not_awaited()
+        self.assertEqual(self.metadata, snapshot)
+        for key in snapshot:
+            if key != "platform":
+                self.assertEqual(request_state[key], self.metadata[key])
+        self.assertNotIn("lite_subagent_filter_run", request_state)
+        self.assertIs(request_state["tools"], shared)
+
+    async def test_failed_switch_restores_live_history_tools_and_filter_trace(self):
+        await self.invoke(grouped_history()[:4])
+        shared = self.metadata["tools"]
+        lookup = shared["lookup"]["callable"]
+        history = self.metadata["lite_child_messages"]
+        previous_history = copy.deepcopy(history)
+        trace = self.metadata["lite_subagent_filter_pipeline"]
+        cache = self.metadata["lite_active_tool_runtime"]
+        self.metadata["lite_agents"]["agent-a"]["model_id"] = "agent-b"
+        state = dict(self.metadata)
+        self.completion.reset_mock()
+
+        async def fail(body):
+            body["metadata"]["lite_child_messages"].append({"role": "user", "content": "partial"})
+            raise RuntimeError("second filter failed")
+
+        self.filters.insert(2, types.SimpleNamespace(inlet=fail))
+        with self.assertRaisesRegex(RuntimeError, "second filter failed"):
+            await self.invoke(grouped_history())
+        self.completion.assert_not_awaited()
+        self.assertEqual(self.metadata, state)
+        self.assertIs(self.metadata["tools"], shared)
+        self.assertIs(shared["lookup"]["callable"], lookup)
+        self.assertIs(self.metadata["lite_child_messages"], history)
+        self.assertEqual(await lookup(), previous_history)
+        self.assertIs(self.metadata["lite_subagent_filter_pipeline"], trace)
+        self.assertEqual(trace, ["tool_call_filter", "subagent_context", "skill_context"])
+        self.assertIs(self.metadata["lite_active_tool_runtime"], cache)
+        self.assertEqual(self.metadata["lite_active_model_id"], "agent-a")
+        self.filters.pop(2)
+        await self.invoke(grouped_history())
+        self.assertEqual(self.routed["model"], "agent-b")
+        self.assertIs(self.metadata["lite_child_messages"], history)
+
+    async def test_invalid_body_restores_state_without_completion(self):
+        original = dict(self.metadata)
+
+        async def invalid(body):
+            return {**body, "messages": None}
+
+        self.filters.append(types.SimpleNamespace(inlet=invalid))
+        with self.assertRaisesRegex(TypeError, "invalid request body"):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_not_awaited()
+        self.assertEqual(self.metadata, original)
+
+    async def test_failed_preparation_keeps_new_mcp_client_registered(self):
+        client = types.SimpleNamespace(call_tool=AsyncMock(return_value="available"))
+        earlier_client = types.SimpleNamespace(call_tool=AsyncMock())
+        clients = {"old": earlier_client}
+        self.metadata["mcp_clients"] = clients
+        self.models["agent-a"].meta["toolIds"] = ["toolkit", "server:mcp:documents"]
+        self.connector.return_value = (client, [{"name": "fetch"}])
+        self.models["agent-a"].meta["skillIds"] = ["missing"]
+        self.skills.return_value = None
+        self.skills.side_effect = None
+        shared = self.metadata["tools"]
+        with self.assertRaisesRegex(ValueError, "Skills are unavailable"):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_not_awaited()
+        self.connector.assert_awaited_once()
+        self.assertIs(self.metadata["mcp_clients"], clients)
+        self.assertIs(clients["documents"], client)
+        self.assertIs(clients["old"], earlier_client)
+        self.assertIs(self.metadata["tools"], shared)
+        self.assertEqual(shared, {})
+        self.assertNotIn("lite_active_handoff", self.metadata)
+        self.assertNotIn("lite_active_tool_runtime", self.metadata)
+
+    async def test_failed_initial_preparation_restores_state_and_allows_next_invocation(self):
+        shared = self.metadata["tools"]
+        original = dict(self.metadata)
+
+        async def fail(body):
+            raise RuntimeError("partial filter failure")
+
+        self.filters.insert(1, types.SimpleNamespace(inlet=fail))
+        with self.assertRaisesRegex(RuntimeError, "partial filter failure"):
+            await self.invoke(grouped_history()[:4])
+        self.completion.assert_not_awaited()
+        self.assertEqual(self.metadata, original)
+        self.assertIs(self.metadata["tools"], shared)
+        self.assertEqual(shared, {})
+        self.filters.pop(1)
+        await self.invoke(grouped_history()[:4])
+        self.assertEqual(self.routed["model"], "agent-a")
+
     async def test_runs_destination_model_inlet_pipeline(self):
         self.metadata["filter_ids"] = ["enabled-toggle"]
         await self.invoke(grouped_history()[:4])
@@ -569,17 +715,21 @@ class ChildFilterPipelineTests(PipeTestCase):
         self.assertNotIn("lite_subagent_filter_run", self.metadata)
 
     async def test_reports_missing_required_destination_filters(self):
+        original = dict(self.metadata)
         self.filters = []
         with self.assertRaisesRegex(ValueError, "Required subagent filters"):
             await self.invoke(grouped_history()[:4])
         self.completion.assert_not_awaited()
+        self.assertEqual(self.metadata, original)
 
     async def test_reports_misordered_destination_filters_before_completion(self):
+        original = dict(self.metadata)
         self.filters = [self.skill_filter, self.tool_filter, self.context_filter]
         with self.assertRaisesRegex(ValueError, "must run before Skill Context"):
             await self.invoke(grouped_history()[:4])
         self.completion.assert_not_awaited()
         self.assertNotIn("lite_subagent_filter_run", self.metadata)
+        self.assertEqual(self.metadata, original)
 
 
 if __name__ == "__main__":

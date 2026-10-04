@@ -26,6 +26,258 @@ from open_webui.utils.tools import get_attached_knowledge, get_builtin_tools, ge
 from pydantic import BaseModel, Field
 from starlette.responses import Response, StreamingResponse
 
+# BEGIN GENERATED REQUEST RUNTIME
+# Edit shared/request_runtime.py; run python3 tools/generate_skill_preparation.py
+"""Authoritative local request lifecycle for independently uploaded Functions."""
+
+
+import copy
+from collections.abc import Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass(frozen=True)
+class CapabilitySet:
+    tool_ids: list[str]
+    skill_ids: list[str]
+    tools: dict
+
+
+class SkillLoaderOwnership:
+    """Inspect ownership before removing either the loader or its evidence."""
+
+    def __init__(self, metadata: dict):
+        self.record = metadata.get("lite_skill_loader")
+        tools = metadata.get("tools")
+        self.current = tools.get("view_skill") if isinstance(tools, dict) else None
+        self.owns_current = (
+            isinstance(self.record, dict) and isinstance(self.current, dict)
+            and self.current.get("callable") is self.record.get("callable")
+            and self.current.get("spec") == self.record.get("spec")
+        )
+
+    def owns_schema(self, schema: dict) -> bool:
+        return (
+            isinstance(self.record, dict) and (self.current is None or self.owns_current)
+            and schema.get("function") == self.record.get("spec")
+        )
+
+    def remove(self, body: dict) -> None:
+        metadata = body["metadata"]
+        if self.owns_current:
+            metadata["tools"].pop("view_skill", None)
+        if "tools" in body:
+            body["tools"] = [schema for schema in body["tools"] or [] if not self.owns_schema(schema)]
+        metadata.pop("lite_skill_loader", None)
+
+
+class RequestRuntime:
+    """Own the shared, request-scoped metadata and live Tool registries."""
+
+    RESET_FIELDS = (
+        "lite_history_boundary", "lite_child_messages", "lite_router_user_index",
+        "lite_active_handoff", "lite_active_agent_id", "lite_active_skill_id",
+        "lite_active_model_id", "lite_active_tool_runtime", "lite_base_tool_runtime",
+        "lite_orchestrator_skill_context", "lite_unfiltered_messages",
+        "previous_tool_context_applied", "history_cleanup_applied",
+        "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
+        "lite_subagent_filter_pipeline", "lite_subagent_filter_run",
+        "lite_target_agent_id", "lite_target_model_id", "lite_target_skill_ids",
+        "lite_view_skill_available", "lite_view_skill_model_id", "lite_skill_loader",
+    )
+    CONFIG_FIELDS = (
+        "lite_agents", "lite_router_model_id", "lite_router_owner_id",
+        "lite_base_tool_ids", "lite_orchestrator_skill_ids", "lite_registry_applied",
+    )
+    MANAGED_FIELDS = RESET_FIELDS + CONFIG_FIELDS + ("tools", "tool_ids", "skill_ids")
+    CHILD_FILTERS = {
+        "tool_call_filter": "Tool Call Filter",
+        "subagent_context": "Subagent Context",
+        "skill_context": "Skill Context",
+    }
+
+    def __init__(self, request, metadata: dict):
+        if not isinstance(metadata, dict):
+            raise TypeError("Lite Router metadata must be an object")
+        self.request = request
+        self.metadata = metadata
+
+    @staticmethod
+    def copy_body(body: dict) -> dict:
+        metadata = body.get("metadata") if isinstance(body, dict) else None
+        memo = {id(metadata): metadata} if isinstance(metadata, dict) else {}
+        return copy.deepcopy(body, memo)
+
+    def routed_body(self, body: dict) -> dict:
+        routed = self.copy_body(body)
+        routed["metadata"] = self.metadata
+        return routed
+
+    @property
+    def request_metadata(self) -> dict | None:
+        state = getattr(self.request, "state", None)
+        metadata = getattr(state, "metadata", None)
+        return metadata if isinstance(metadata, dict) else None
+
+    def sync(self, **values) -> None:
+        self.metadata.update(values)
+        self.publish()
+
+    def publish(self) -> None:
+        """Mirror only project-managed fields, including their absence."""
+        request_metadata = self.request_metadata
+        if request_metadata is not None and request_metadata is not self.metadata:
+            for key in self.MANAGED_FIELDS:
+                if key in self.metadata:
+                    request_metadata[key] = self.metadata[key]
+                else:
+                    request_metadata.pop(key, None)
+
+    def discard(self, *keys) -> None:
+        for key in keys:
+            self.metadata.pop(key, None)
+        self.publish()
+
+    def start_request(self, body: dict, **configuration) -> None:
+        body["metadata"] = self.metadata
+        SkillLoaderOwnership(self.metadata).remove(body)
+        self.discard(*self.RESET_FIELDS)
+        self.shared_tools()
+        self.sync(**configuration)
+
+    @contextmanager
+    def preparation(self) -> Iterator[RequestRuntime]:
+        """Commit on success; restore bounded local state on any preparation error.
+
+        Keep live registry/history identities and callable/client references. External
+        resources (notably mcp_clients) are deliberately outside this checkpoint.
+        """
+        saved = {key: self.metadata[key] for key in self.MANAGED_FIELDS if key in self.metadata}
+        contents: dict[str, Any] = {}
+        for key, value in saved.items():
+            if isinstance(value, list):
+                contents[key] = copy.deepcopy(value)
+            elif isinstance(value, dict):
+                contents[key] = dict(value)
+        try:
+            yield self
+        except BaseException:
+            for key in self.MANAGED_FIELDS:
+                if key not in saved:
+                    self.metadata.pop(key, None)
+                    continue
+                value = saved[key]
+                if isinstance(value, list):
+                    value[:] = contents[key]
+                elif isinstance(value, dict):
+                    value.clear()
+                    value.update(contents[key])
+                self.metadata[key] = value
+            self.publish()
+            raise
+        else:
+            self.publish()
+
+    @contextmanager
+    def child_filters(self) -> Iterator[None]:
+        self.discard(*(name + "_applied" for name in self.CHILD_FILTERS))
+        self.sync(lite_subagent_filter_pipeline=[], lite_subagent_filter_run=True)
+        try:
+            yield
+        finally:
+            self.discard("lite_subagent_filter_run")
+        missing = [label for name, label in self.CHILD_FILTERS.items() if not self.metadata.get(name + "_applied")]
+        if missing:
+            raise ValueError(
+                "Required subagent filters are not attached to the destination model: " + ", ".join(missing)
+            )
+        actual_order = self.metadata.get("lite_subagent_filter_pipeline")
+        if actual_order != list(self.CHILD_FILTERS):
+            raise ValueError(
+                "Subagent filters ran in the wrong order: " + " -> ".join(str(item) for item in actual_order or [])
+            )
+
+    def before_filter(self, name: str) -> None:
+        if not self.metadata.get("lite_subagent_filter_run"):
+            return
+        sequence = list(self.CHILD_FILTERS)
+        prior = sequence[:sequence.index(name)]
+        pipeline = self.metadata.get("lite_subagent_filter_pipeline") or []
+        if prior and pipeline[-len(prior):] != prior:
+            required = " and ".join(self.CHILD_FILTERS[item] for item in prior)
+            raise ValueError(f"{required} must run before {self.CHILD_FILTERS[name]}")
+
+    def finish_filter(self, name: str, **values) -> None:
+        self.metadata.update(values)
+        self.metadata[name + "_applied"] = True
+        if name in self.CHILD_FILTERS and self.metadata.get("lite_subagent_filter_run"):
+            self.metadata.setdefault("lite_subagent_filter_pipeline", []).append(name)
+        self.publish()
+
+    def shared_tools(self) -> dict:
+        tools = self.metadata.get("tools")
+        if not isinstance(tools, dict):
+            tools = {}
+            self.sync(tools=tools)
+        return tools
+
+    def bind_tools(self, tools: dict, tool_ids: list[str], *, replace: bool) -> dict:
+        shared = self.shared_tools()
+        if replace:
+            shared.clear()
+        shared.update(tools)
+        self.sync(tools=shared, tool_ids=list(tool_ids))
+        return shared
+
+    def cached_capabilities(
+        self,
+        cache_key: str,
+        model_id: str,
+        tool_ids: list[str],
+        skill_ids: list[str],
+    ) -> CapabilitySet | None:
+        cache = self.metadata.get(cache_key)
+        if (
+            isinstance(cache, dict)
+            and cache.get("model_id") == model_id
+            and cache.get("tool_ids") == tool_ids
+            and cache.get("skill_ids") == skill_ids
+            and isinstance(cache.get("tools"), dict)
+        ):
+            return CapabilitySet(
+                tool_ids=list(tool_ids),
+                skill_ids=list(skill_ids),
+                tools=cache["tools"],
+            )
+        return None
+
+    def cache_capabilities(
+        self,
+        cache_key: str,
+        model_id: str,
+        capabilities: CapabilitySet,
+    ) -> None:
+        self.sync(
+            **{
+                cache_key: {
+                    "model_id": model_id,
+                    "tool_ids": list(capabilities.tool_ids),
+                    "skill_ids": list(capabilities.skill_ids),
+                    "tools": capabilities.tools,
+                }
+            }
+        )
+
+    def activate(self, marker: Any, agent_id: str, model_id: str) -> None:
+        self.sync(
+            lite_active_agent_id=agent_id,
+            lite_active_model_id=model_id,
+            lite_active_handoff=marker.to_dict(),
+        )
+# END GENERATED REQUEST RUNTIME
+
 # BEGIN GENERATED SKILL PREPARATION
 # Edit shared/skill_preparation.py; run python3 tools/generate_skill_preparation.py
 """Authoritative Skill preparation, embedded into independently uploaded Functions."""
@@ -34,6 +286,7 @@ import copy
 import html
 from dataclasses import dataclass
 from typing import Any
+
 
 
 def normalize_skill_ids(values) -> list[str]:
@@ -62,34 +315,20 @@ class SkillPreparation:
         if not isinstance(tools, dict):
             tools = {}
             metadata["tools"] = tools
-        owned = metadata.get("lite_skill_loader")
-        current = tools.get("view_skill")
-        owns_current = (
-            isinstance(owned, dict) and isinstance(current, dict)
-            and current.get("callable") is owned.get("callable")
-            and current.get("spec") == owned.get("spec")
-        )
+        ownership = SkillLoaderOwnership(metadata)
         schemas = list(body.get("tools") or [])
 
-        def owned_schema(schema):
-            return (
-                isinstance(owned, dict) and (current is None or owns_current)
-                and schema.get("function") == owned.get("spec")
-            )
-
         if prepared.loader is not None and (
-            (current is not None and not owns_current)
+            (ownership.current is not None and not ownership.owns_current)
             or any(
                 (schema.get("function") or {}).get("name") == "view_skill"
-                and not owned_schema(schema)
+                and not ownership.owns_schema(schema)
                 for schema in schemas
             )
         ):
             raise ValueError('Attached Tool name "view_skill" conflicts with the builtin Skill loader')
-        if owns_current:
-            tools.pop("view_skill", None)
-        schemas = [schema for schema in schemas if not owned_schema(schema)]
-        metadata.pop("lite_skill_loader", None)
+        ownership.remove(body)
+        schemas = list(body.get("tools") or [])
         if prepared.loader is not None:
             tools["view_skill"] = prepared.loader
             schemas.append({"type": "function", "function": prepared.loader["spec"]})
@@ -98,7 +337,7 @@ class SkillPreparation:
             }
         if schemas or "tools" in body:
             body["tools"] = schemas
-        if prepared.ids or owned is not None or "lite_view_skill_available" in metadata:
+        if prepared.ids or ownership.record is not None or "lite_view_skill_available" in metadata:
             metadata["lite_view_skill_available"] = prepared.loader is not None
             metadata["lite_view_skill_model_id"] = runtime_model.get("id") if prepared.loader is not None else None
 
@@ -233,13 +472,6 @@ class AgentSpec:
 
 
 @dataclass(frozen=True)
-class CapabilitySet:
-    tool_ids: list[str]
-    skill_ids: list[str]
-    tools: dict[str, dict]
-
-
-@dataclass(frozen=True)
 class InvocationContext:
     request: Any
     user: Any
@@ -306,100 +538,6 @@ class MessageHistory:
              if messages[index].get("role") == "user"
              and not cls.is_tool_image_message(messages[index])),
             -1,
-        )
-
-
-class RequestRuntime:
-    """Own the shared, request-scoped metadata and live Tool registries."""
-
-    def __init__(self, request, metadata: dict):
-        if not isinstance(metadata, dict):
-            raise TypeError("Lite Router metadata must be an object")
-        self.request = request
-        self.metadata = metadata
-
-    @staticmethod
-    def copy_body(body: dict) -> dict:
-        metadata = body.get("metadata") if isinstance(body, dict) else None
-        memo = {id(metadata): metadata} if isinstance(metadata, dict) else {}
-        return copy.deepcopy(body, memo)
-
-    def routed_body(self, body: dict) -> dict:
-        routed = self.copy_body(body)
-        routed["metadata"] = self.metadata
-        return routed
-
-    @property
-    def request_metadata(self) -> dict | None:
-        state = getattr(self.request, "state", None)
-        metadata = getattr(state, "metadata", None)
-        return metadata if isinstance(metadata, dict) else None
-
-    def sync(self, **values) -> None:
-        self.metadata.update(values)
-        request_metadata = self.request_metadata
-        if request_metadata is not None and request_metadata is not self.metadata:
-            request_metadata.update(values)
-
-    def shared_tools(self) -> dict:
-        tools = self.metadata.get("tools")
-        if not isinstance(tools, dict):
-            tools = {}
-            self.sync(tools=tools)
-        return tools
-
-    def bind_tools(self, tools: dict, tool_ids: list[str], *, replace: bool) -> dict:
-        shared = self.shared_tools()
-        if replace:
-            shared.clear()
-        shared.update(tools)
-        self.sync(tools=shared, tool_ids=list(tool_ids))
-        return shared
-
-    def cached_capabilities(
-        self,
-        cache_key: str,
-        model_id: str,
-        tool_ids: list[str],
-        skill_ids: list[str],
-    ) -> CapabilitySet | None:
-        cache = self.metadata.get(cache_key)
-        if (
-            isinstance(cache, dict)
-            and cache.get("model_id") == model_id
-            and cache.get("tool_ids") == tool_ids
-            and cache.get("skill_ids") == skill_ids
-            and isinstance(cache.get("tools"), dict)
-        ):
-            return CapabilitySet(
-                tool_ids=list(tool_ids),
-                skill_ids=list(skill_ids),
-                tools=cache["tools"],
-            )
-        return None
-
-    def cache_capabilities(
-        self,
-        cache_key: str,
-        model_id: str,
-        capabilities: CapabilitySet,
-    ) -> None:
-        self.sync(
-            **{
-                cache_key: {
-                    "model_id": model_id,
-                    "tool_ids": list(capabilities.tool_ids),
-                    "skill_ids": list(capabilities.skill_ids),
-                    "tools": capabilities.tools,
-                }
-            }
-        )
-
-    def activate(self, marker: HandoffMarker, agent_id: str, model_id: str) -> None:
-        self.sync(
-            lite_active_agent_id=agent_id,
-            lite_active_model_id=model_id,
-            lite_active_handoff=marker.to_dict(),
         )
 
 
@@ -663,13 +801,6 @@ class ModelCapabilityResolver:
 
 
 class ChildFilterPipeline:
-    REQUIRED = (
-        ("Tool Call Filter", "tool_call_filter_applied"),
-        ("Subagent Context", "subagent_context_applied"),
-        ("Skill Context", "skill_context_applied"),
-    )
-    EXPECTED_ORDER = ["tool_call_filter", "subagent_context", "skill_context"]
-
     async def run(
         self,
         *,
@@ -679,11 +810,6 @@ class ChildFilterPipeline:
         context: InvocationContext,
     ) -> dict:
         metadata = runtime.metadata
-        for _name, key in self.REQUIRED:
-            metadata.pop(key, None)
-        metadata["lite_subagent_filter_pipeline"] = []
-        metadata["lite_subagent_filter_run"] = True
-
         user_data = (
             context.user.model_dump()
             if hasattr(context.user, "model_dump")
@@ -700,7 +826,7 @@ class ChildFilterPipeline:
             "__chat_id__": metadata.get("chat_id"),
             "__message_id__": metadata.get("message_id"),
         }
-        try:
+        with runtime.child_filters():
             filter_functions = await get_filter_functions(
                 context.request,
                 runtime_model,
@@ -713,21 +839,6 @@ class ChildFilterPipeline:
                 filter_type="inlet",
                 form_data=body,
                 extra_params=extra_params,
-            )
-        finally:
-            metadata.pop("lite_subagent_filter_run", None)
-
-        missing = [name for name, key in self.REQUIRED if not metadata.get(key)]
-        if missing:
-            raise ValueError(
-                "Required subagent filters are not attached to the destination model: "
-                + ", ".join(missing)
-            )
-        actual_order = metadata.get("lite_subagent_filter_pipeline")
-        if actual_order != self.EXPECTED_ORDER:
-            raise ValueError(
-                "Subagent filters ran in the wrong order: "
-                + " -> ".join(str(item) for item in actual_order or [])
             )
         if not isinstance(body, dict) or not isinstance(body.get("messages"), list):
             raise TypeError("Subagent filter pipeline returned an invalid request body")
@@ -1075,113 +1186,114 @@ class Pipe:
         runtime: RequestRuntime,
         context: InvocationContext,
     ):
-        routed = runtime.routed_body(body)
-        missing_filters = [
-            name
-            for name, key in (
-                ("Previous Tool Context", "previous_tool_context_applied"),
-                ("History Cleanup", "history_cleanup_applied"),
-            )
-            if not runtime.metadata.get(key)
-        ]
-        if missing_filters:
-            raise ValueError(
-                "Required Router filters are missing or out of order: "
-                + ", ".join(missing_filters)
-            )
-        base_tool_ids = normalize_ids(runtime.metadata.get("lite_base_tool_ids"))
-        skill_ids = normalize_skill_ids(runtime.metadata.get("lite_orchestrator_skill_ids"))
-        router_model_id = str(runtime.metadata.get("lite_router_model_id") or "").strip()
-        runtime_model = context.request.app.state.MODELS.get(router_model_id) or {"id": router_model_id}
-        if base_tool_ids or skill_ids:
-            capabilities = runtime.cached_capabilities(
-                BASE_RUNTIME_KEY,
-                router_model_id,
-                base_tool_ids,
-                skill_ids,
-            )
-            if capabilities is None:
-                capabilities = await self._capabilities.resolve(
-                    request=context.request,
-                    capability_owner_id=str(
-                        runtime.metadata.get("lite_router_owner_id") or ""
-                    ).strip(),
-                    execution_user=context.user,
-                    tool_ids=base_tool_ids,
-                    skill_ids=skill_ids,
-                    runtime_model=runtime_model,
-                    metadata=runtime.metadata,
-                    messages=routed.get("messages") or [],
-                    event_emitter=context.event_emitter,
-                    event_call=context.event_call,
-                    oauth_token=context.oauth_token,
-                    files=context.files,
-                    connector=McpRuntime.connect,
+        with runtime.preparation():
+            routed = runtime.routed_body(body)
+            missing_filters = [
+                name
+                for name, key in (
+                    ("Previous Tool Context", "previous_tool_context_applied"),
+                    ("History Cleanup", "history_cleanup_applied"),
                 )
-                runtime.cache_capabilities(
+                if not runtime.metadata.get(key)
+            ]
+            if missing_filters:
+                raise ValueError(
+                    "Required Router filters are missing or out of order: "
+                    + ", ".join(missing_filters)
+                )
+            base_tool_ids = normalize_ids(runtime.metadata.get("lite_base_tool_ids"))
+            skill_ids = normalize_skill_ids(runtime.metadata.get("lite_orchestrator_skill_ids"))
+            router_model_id = str(runtime.metadata.get("lite_router_model_id") or "").strip()
+            runtime_model = context.request.app.state.MODELS.get(router_model_id) or {"id": router_model_id}
+            if base_tool_ids or skill_ids:
+                capabilities = runtime.cached_capabilities(
                     BASE_RUNTIME_KEY,
                     router_model_id,
-                    capabilities,
+                    base_tool_ids,
+                    skill_ids,
                 )
-            tool_ids = normalize_ids(
-                [*(runtime.metadata.get("tool_ids") or []), *base_tool_ids]
-            )
-            runtime.bind_tools(capabilities.tools, tool_ids, replace=False)
-            self._merge_tool_schemas(routed, capabilities.tools)
-
-        messages = [
-            message
-            for message in routed.get("messages") or []
-            if not (
-                isinstance(message.get("content"), str)
-                and message["content"].startswith(
-                    (ORCHESTRATOR_SKILL_PROMPT_PREFIX, GENERIC_SKILL_PROMPT_PREFIX)
+                if capabilities is None:
+                    capabilities = await self._capabilities.resolve(
+                        request=context.request,
+                        capability_owner_id=str(
+                            runtime.metadata.get("lite_router_owner_id") or ""
+                        ).strip(),
+                        execution_user=context.user,
+                        tool_ids=base_tool_ids,
+                        skill_ids=skill_ids,
+                        runtime_model=runtime_model,
+                        metadata=runtime.metadata,
+                        messages=routed.get("messages") or [],
+                        event_emitter=context.event_emitter,
+                        event_call=context.event_call,
+                        oauth_token=context.oauth_token,
+                        files=context.files,
+                        connector=McpRuntime.connect,
+                    )
+                    runtime.cache_capabilities(
+                        BASE_RUNTIME_KEY,
+                        router_model_id,
+                        capabilities,
+                    )
+                tool_ids = normalize_ids(
+                    [*(runtime.metadata.get("tool_ids") or []), *base_tool_ids]
                 )
-            )
-        ]
-        async def load_builtin(ids):
-            owner = await Users.get_user_by_id(str(runtime.metadata.get("lite_router_owner_id") or "").strip())
-            if owner is None:
-                raise ValueError("Model capability owner is unavailable")
-            extra_params = self._capabilities._extra_params(
-                request=context.request, execution_user=context.user, runtime_model=runtime_model,
-                metadata=runtime.metadata, messages=messages, event_emitter=context.event_emitter,
-                event_call=context.event_call, oauth_token=context.oauth_token, files=context.files,
-            )
-            return await get_builtin_tools(
-                context.request,
-                {**extra_params, "__user__": owner.model_dump(), "__skill_ids__": ids},
-                model=runtime_model,
-            )
+                runtime.bind_tools(capabilities.tools, tool_ids, replace=False)
+                self._merge_tool_schemas(routed, capabilities.tools)
 
-        prepared = await SkillPreparation.prepare(
-            skill_ids=skill_ids, runtime_model=runtime_model, metadata=runtime.metadata,
-            lookup_skill=Skills.get_skill_by_id, load_builtin=load_builtin,
-        )
-        SkillPreparation.install_loader(prepared, routed, runtime_model)
-        runtime.sync(tools=runtime.shared_tools())
-        skill_prompt = prepared.context
-        if prepared.loader is not None:
-            skill_prompt = (
-                "The following Skills are available on demand. Inspect their descriptions "
-                "and call view_skill for any Skill that may apply before following its full "
-                "instructions. Load a relevant routing Skill before calling lite_delegate."
-                "\n\n" + skill_prompt
-            )
-        if skill_prompt:
-            messages.insert(
-                0,
-                {
-                    "role": "system",
-                    "content": ORCHESTRATOR_SKILL_PROMPT_PREFIX + skill_prompt,
-                },
-            )
-        routed["messages"] = messages
+            messages = [
+                message
+                for message in routed.get("messages") or []
+                if not (
+                    isinstance(message.get("content"), str)
+                    and message["content"].startswith(
+                        (ORCHESTRATOR_SKILL_PROMPT_PREFIX, GENERIC_SKILL_PROMPT_PREFIX)
+                    )
+                )
+            ]
+            async def load_builtin(ids):
+                owner = await Users.get_user_by_id(str(runtime.metadata.get("lite_router_owner_id") or "").strip())
+                if owner is None:
+                    raise ValueError("Model capability owner is unavailable")
+                extra_params = self._capabilities._extra_params(
+                    request=context.request, execution_user=context.user, runtime_model=runtime_model,
+                    metadata=runtime.metadata, messages=messages, event_emitter=context.event_emitter,
+                    event_call=context.event_call, oauth_token=context.oauth_token, files=context.files,
+                )
+                return await get_builtin_tools(
+                    context.request,
+                    {**extra_params, "__user__": owner.model_dump(), "__skill_ids__": ids},
+                    model=runtime_model,
+                )
 
-        model_id = self.valves.orchestrator_model_id.strip()
-        if not model_id:
-            raise ValueError("orchestrator_model_id is not configured")
-        routed["model"] = model_id
+            prepared = await SkillPreparation.prepare(
+                skill_ids=skill_ids, runtime_model=runtime_model, metadata=runtime.metadata,
+                lookup_skill=Skills.get_skill_by_id, load_builtin=load_builtin,
+            )
+            SkillPreparation.install_loader(prepared, routed, runtime_model)
+            runtime.sync(tools=runtime.shared_tools())
+            skill_prompt = prepared.context
+            if prepared.loader is not None:
+                skill_prompt = (
+                    "The following Skills are available on demand. Inspect their descriptions "
+                    "and call view_skill for any Skill that may apply before following its full "
+                    "instructions. Load a relevant routing Skill before calling lite_delegate."
+                    "\n\n" + skill_prompt
+                )
+            if skill_prompt:
+                messages.insert(
+                    0,
+                    {
+                        "role": "system",
+                        "content": ORCHESTRATOR_SKILL_PROMPT_PREFIX + skill_prompt,
+                    },
+                )
+            routed["messages"] = messages
+
+            model_id = self.valves.orchestrator_model_id.strip()
+            if not model_id:
+                raise ValueError("orchestrator_model_id is not configured")
+            routed["model"] = model_id
         self._debug("-> orchestrator %s", model_id)
         return await self._gateway.generate(request=context.request, body=routed, user=context.user)
 
@@ -1193,13 +1305,14 @@ class Pipe:
         runtime: RequestRuntime,
         context: InvocationContext,
     ):
-        routed, agent = await self._child_builder.prepare(
-            body=body,
-            marker=marker,
-            registry=registry,
-            runtime=runtime,
-            context=context,
-        )
+        with runtime.preparation():
+            routed, agent = await self._child_builder.prepare(
+                body=body,
+                marker=marker,
+                registry=registry,
+                runtime=runtime,
+                context=context,
+            )
         if self.valves.emit_handoff_status and context.event_emitter:
             try:
                 await context.event_emitter(
