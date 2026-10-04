@@ -192,6 +192,8 @@ class RequestRuntime:
             raise ValueError(
                 "Router filters ran in the wrong order; required: " + " -> ".join(self.ROUTER_FILTERS.values())
             )
+        if self.metadata.get("lite_router_request_key") != self.router_request_key():
+            raise ValueError("Lite Subagent Registry must run for the current request before Router dispatch")
 
     @contextmanager
     def preparation(self) -> Iterator[RequestRuntime]:

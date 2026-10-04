@@ -61,6 +61,70 @@ class RouterChainTests(PipeTestCase):
             await self.registry.inlet(copy.deepcopy(second), __request__=same_request, __user__={"id": "user"})
         self.completion.assert_awaited_once()
 
+    async def test_new_http_request_cannot_reuse_previous_router_evidence_without_registry(self):
+        self.begin_request()
+        first = {
+            "model": "router", "metadata": self.metadata,
+            "messages": grouped_history()[:4],
+        }
+        await self.router_inlets(first, registry=self.registry)
+        await self.invoke_body(first)
+        self.assertEqual(self.routed["model"], "agent-a")
+        shared = self.metadata["tools"]
+        self.completion.reset_mock()
+
+        request_metadata = {**self.metadata, "platform": "keep request state"}
+        self.begin_request(metadata=request_metadata)
+        second = {
+            "model": "router", "metadata": self.metadata,
+            "messages": [{"role": "user", "content": "A new task without a Handoff"}],
+        }
+        with self.assertRaisesRegex(ValueError, "Registry"):
+            await self.invoke_body(second)
+        self.completion.assert_not_awaited()
+        self.assertIs(self.metadata["tools"], shared)
+        self.assertIs(request_metadata["tools"], shared)
+        self.assertEqual(request_metadata["platform"], "keep request state")
+
+        # Running the required inlets makes this request routable and clears the old Handoff.
+        await self.router_inlets(second, registry=self.registry)
+        await self.invoke_body(second)
+        self.completion.assert_awaited_once()
+        self.assertEqual(self.routed["model"], "base-model")
+        self.assertEqual([m["content"] for m in self.routed["messages"] if m["role"] == "user"], [
+            "A new task without a Handoff",
+        ])
+        self.assertNotIn("lite_active_handoff", self.metadata)
+        self.assertIs(self.metadata["tools"], shared)
+
+    async def test_new_platform_message_cannot_reuse_previous_router_evidence_without_registry(self):
+        self.begin_request()
+        self.metadata.update(chat_id="chat", message_id="first-message")
+        first = {
+            "model": "router", "metadata": self.metadata,
+            "messages": grouped_history()[:4],
+        }
+        await self.router_inlets(first, registry=self.registry)
+        await self.invoke_body(first)
+        self.assertEqual(self.routed["model"], "agent-a")
+        self.completion.reset_mock()
+
+        self.metadata["message_id"] = "second-message"
+        self.begin_request()
+        second = {
+            "model": "router", "metadata": self.metadata,
+            "messages": [{"role": "user", "content": "A new platform message"}],
+        }
+        with self.assertRaisesRegex(ValueError, "Registry"):
+            await self.invoke_body(second)
+        self.completion.assert_not_awaited()
+
+        await self.router_inlets(second, registry=self.registry)
+        await self.invoke_body(second)
+        self.completion.assert_awaited_once()
+        self.assertEqual(self.routed["model"], "base-model")
+        self.assertNotIn("lite_active_handoff", self.metadata)
+
     async def test_standalone_context_flags_cannot_replace_registry(self):
         await self.previous.inlet(self.body, __request__=self.request)
         await self.cleanup.inlet(self.body, __request__=self.request)
