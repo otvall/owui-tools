@@ -26,6 +26,141 @@ from open_webui.utils.tools import get_attached_knowledge, get_builtin_tools, ge
 from pydantic import BaseModel, Field
 from starlette.responses import Response, StreamingResponse
 
+# BEGIN GENERATED SKILL PREPARATION
+# Edit shared/skill_preparation.py; run python3 tools/generate_skill_preparation.py
+"""Authoritative Skill preparation, embedded into independently uploaded Functions."""
+
+import copy
+import html
+from dataclasses import dataclass
+from typing import Any
+
+
+def normalize_skill_ids(values) -> list[str]:
+    result = []
+    seen = set()
+    for raw_value in values or []:
+        value = str(raw_value or "").strip().lower()
+        if value and value not in seen:
+            result.append(value)
+            seen.add(value)
+    return result
+
+
+@dataclass(frozen=True)
+class PreparedSkills:
+    ids: list[str]
+    context: str
+    loader: dict | None
+
+
+class SkillPreparation:
+    @staticmethod
+    def install_loader(prepared: PreparedSkills, body: dict, runtime_model: dict) -> None:
+        metadata = body["metadata"]
+        tools = metadata.get("tools")
+        if not isinstance(tools, dict):
+            tools = {}
+            metadata["tools"] = tools
+        owned = metadata.get("lite_skill_loader")
+        current = tools.get("view_skill")
+        owns_current = (
+            isinstance(owned, dict) and isinstance(current, dict)
+            and current.get("callable") is owned.get("callable")
+            and current.get("spec") == owned.get("spec")
+        )
+        schemas = list(body.get("tools") or [])
+
+        def owned_schema(schema):
+            return (
+                isinstance(owned, dict) and (current is None or owns_current)
+                and schema.get("function") == owned.get("spec")
+            )
+
+        if prepared.loader is not None and (
+            (current is not None and not owns_current)
+            or any(
+                (schema.get("function") or {}).get("name") == "view_skill"
+                and not owned_schema(schema)
+                for schema in schemas
+            )
+        ):
+            raise ValueError('Attached Tool name "view_skill" conflicts with the builtin Skill loader')
+        if owns_current:
+            tools.pop("view_skill", None)
+        schemas = [schema for schema in schemas if not owned_schema(schema)]
+        metadata.pop("lite_skill_loader", None)
+        if prepared.loader is not None:
+            tools["view_skill"] = prepared.loader
+            schemas.append({"type": "function", "function": prepared.loader["spec"]})
+            metadata["lite_skill_loader"] = {
+                "callable": prepared.loader["callable"], "spec": copy.deepcopy(prepared.loader["spec"]),
+            }
+        if schemas or "tools" in body:
+            body["tools"] = schemas
+        if prepared.ids or owned is not None or "lite_view_skill_available" in metadata:
+            metadata["lite_view_skill_available"] = prepared.loader is not None
+            metadata["lite_view_skill_model_id"] = runtime_model.get("id") if prepared.loader is not None else None
+
+    @staticmethod
+    async def prepare(
+        *, skill_ids, runtime_model: dict, metadata: dict, lookup_skill, load_builtin,
+    ) -> PreparedSkills:
+        ids = normalize_skill_ids(skill_ids)
+        skills: list[tuple[str, Any]] = []
+        missing = []
+        for skill_id in ids:
+            skill = await lookup_skill(skill_id)
+            if skill is None or not skill.is_active:
+                missing.append(skill_id)
+            else:
+                skills.append((skill_id, skill))
+        if missing:
+            raise ValueError("Attached model Skills are unavailable: " + ", ".join(missing))
+
+        meta = (runtime_model.get("info") or {}).get("meta") or {}
+        eligible = (
+            bool(metadata.get("session_id"))
+            and (metadata.get("params") or {}).get("function_calling") != "legacy"
+            and (meta.get("capabilities") or {}).get("builtin_tools", True) is not False
+        )
+        builtin = (await load_builtin(ids)).get("view_skill") if ids and eligible else None
+        loader = None
+        if builtin is not None:
+            allowed = frozenset(ids)
+            builtin_callable = builtin["callable"]
+
+            async def allowlisted_view_skill(id: str):
+                requested_id = next(iter(normalize_skill_ids([id])), "")
+                if requested_id not in allowed:
+                    return '{"error":"Skill is not available in the current model context"}'
+                return await builtin_callable(id=requested_id)
+
+            loader = {**builtin, "callable": allowlisted_view_skill}
+
+        entries = []
+        for skill_id, skill in skills:
+            name = str(skill.name or skill_id)
+            if loader is not None:
+                entries.append(
+                    "<skill>\n"
+                    f"<id>{html.escape(skill_id)}</id>\n"
+                    f"<name>{html.escape(name)}</name>\n"
+                    f"<description>{html.escape(str(skill.description or ''))}</description>\n"
+                    "</skill>"
+                )
+            else:
+                entries.append(
+                    f'<skill id="{html.escape(skill_id, quote=True)}" '
+                    f'name="{html.escape(name, quote=True)}">\n'
+                    f'{skill.content}\n</skill>'
+                )
+        context = "\n\n".join(entries)
+        if loader is not None:
+            context = "<available_skills>\n" + "\n".join(entries) + "\n</available_skills>"
+        return PreparedSkills(ids, context, loader)
+# END GENERATED SKILL PREPARATION
+
 log = logging.getLogger(__name__)
 
 DELEGATE_VERSION = "v2"
@@ -102,7 +237,6 @@ class CapabilitySet:
     tool_ids: list[str]
     skill_ids: list[str]
     tools: dict[str, dict]
-    skill_manifest: str = ""
 
 
 @dataclass(frozen=True)
@@ -236,13 +370,11 @@ class RequestRuntime:
             and cache.get("tool_ids") == tool_ids
             and cache.get("skill_ids") == skill_ids
             and isinstance(cache.get("tools"), dict)
-            and isinstance(cache.get("skill_manifest"), str)
         ):
             return CapabilitySet(
                 tool_ids=list(tool_ids),
                 skill_ids=list(skill_ids),
                 tools=cache["tools"],
-                skill_manifest=cache["skill_manifest"],
             )
         return None
 
@@ -259,7 +391,6 @@ class RequestRuntime:
                     "tool_ids": list(capabilities.tool_ids),
                     "skill_ids": list(capabilities.skill_ids),
                     "tools": capabilities.tools,
-                    "skill_manifest": capabilities.skill_manifest,
                 }
             }
         )
@@ -360,7 +491,7 @@ class ModelCapabilityResolver:
         self.mcp_runtime = mcp_runtime
 
     @staticmethod
-    def lazy_skills(runtime_model: dict) -> bool:
+    def builtin_tools_enabled(runtime_model: dict) -> bool:
         meta = (runtime_model or {}).get("info", {}).get("meta", {}) or {}
         return (meta.get("capabilities") or {}).get("builtin_tools", True) is not False
 
@@ -405,7 +536,7 @@ class ModelCapabilityResolver:
         metadata,
         extra_params: dict,
     ) -> dict:
-        if not self.lazy_skills(runtime_model):
+        if not self.builtin_tools_enabled(runtime_model):
             return {}
         if not isinstance(metadata, dict) or not metadata.get("session_id"):
             return {}
@@ -424,99 +555,6 @@ class ModelCapabilityResolver:
             if name not in BLOCKED_CHILD_BUILTIN_TOOLS and name != self.SKILL_TOOL_NAME
         }
 
-    @staticmethod
-    def orchestrator_prompt(skill_manifest: str) -> str:
-        if not skill_manifest:
-            return ""
-        if "<available_skills>" in skill_manifest:
-            return (
-                "The following Skills are available on demand. Inspect their descriptions "
-                "and call view_skill for any Skill that may apply before following its full "
-                "instructions. Load a relevant routing Skill before calling lite_delegate."
-                "\n\n"
-                + skill_manifest
-            )
-        return skill_manifest
-
-    @staticmethod
-    async def full_skill_context(skill_ids: list[str]) -> str:
-        blocks = []
-        for skill_id in normalize_ids(skill_ids):
-            skill = await Skills.get_skill_by_id(skill_id)
-            if skill is None or not skill.is_active:
-                raise ValueError(f"Attached model-bound Skill is unavailable: {skill_id}")
-            blocks.append(
-                f'<skill id="{html.escape(skill_id, quote=True)}" '
-                f'name="{html.escape(str(skill.name or skill_id), quote=True)}">\n'
-                f'{skill.content}\n</skill>'
-            )
-        return "\n\n".join(blocks)
-
-    @staticmethod
-    async def skill_manifest(skill_ids: list[str]) -> str:
-        entries = []
-        missing = []
-        for skill_id in normalize_ids(skill_ids):
-            skill = await Skills.get_skill_by_id(skill_id)
-            if skill is None or not skill.is_active:
-                missing.append(skill_id)
-            else:
-                entries.append(
-                    "<skill>\n"
-                    f"<id>{html.escape(skill_id)}</id>\n"
-                    f"<name>{html.escape(str(skill.name or skill_id))}</name>\n"
-                    f"<description>{html.escape(str(skill.description or ''))}</description>\n"
-                    "</skill>"
-                )
-        if missing:
-            raise ValueError(
-                "Attached model-bound Skills are unavailable: " + ", ".join(missing)
-            )
-        if not entries:
-            return ""
-        return "<available_skills>\n" + "\n".join(entries) + "\n</available_skills>"
-
-    @classmethod
-    async def resolve_builtin_skill_tool(
-        cls,
-        *,
-        request,
-        owner,
-        skill_ids: list[str],
-        runtime_model,
-        extra_params: dict,
-    ) -> dict | None:
-        allowed_ids = frozenset(skill_id.lower() for skill_id in normalize_ids(skill_ids))
-        if not allowed_ids:
-            return None
-
-        owner_params = {
-            **extra_params,
-            "__user__": owner.model_dump(),
-            "__skill_ids__": list(skill_ids),
-        }
-        builtin_tools = await get_builtin_tools(
-            request,
-            owner_params,
-            model=runtime_model,
-        )
-        builtin = builtin_tools.get(cls.SKILL_TOOL_NAME)
-        if builtin is None:
-            raise RuntimeError("Open WebUI builtin view_skill is unavailable")
-
-        builtin_callable = builtin["callable"]
-
-        async def allowlisted_view_skill(id: str):
-            requested_id = str(id or "").strip().lower()
-            if requested_id not in allowed_ids:
-                return json.dumps(
-                    {"error": "Skill is not available in the current model context"},
-                    ensure_ascii=False,
-                )
-            return await builtin_callable(id=requested_id)
-
-        return {**builtin, "callable": allowlisted_view_skill}
-
     async def resolve(
         self,
         *,
@@ -534,15 +572,14 @@ class ModelCapabilityResolver:
         files,
         connector: Callable,
         include_builtin_tools: bool = False,
-        resolve_skills: bool = True,
     ) -> CapabilitySet:
         requested_ids = normalize_ids(tool_ids)
-        requested_skill_ids = normalize_ids(skill_ids)
+        requested_skill_ids = normalize_skill_ids(skill_ids)
         if not requested_ids and not requested_skill_ids and not include_builtin_tools:
             return CapabilitySet([], [], {})
 
         owner = None
-        if requested_ids or (requested_skill_ids and resolve_skills):
+        if requested_ids:
             owner = await Users.get_user_by_id(capability_owner_id)
             if owner is None:
                 raise ValueError("Model capability owner is unavailable")
@@ -593,34 +630,7 @@ class ModelCapabilityResolver:
                 if name not in tools:
                     tools[name] = tool
 
-        lazy_skills = self.lazy_skills(runtime_model)
-        skill_manifest = ""
-        if requested_skill_ids and resolve_skills:
-            skill_manifest = await (
-                self.skill_manifest(requested_skill_ids)
-                if lazy_skills
-                else self.full_skill_context(requested_skill_ids)
-            )
-        if requested_skill_ids and resolve_skills and lazy_skills:
-            if self.SKILL_TOOL_NAME in tools:
-                raise ValueError(
-                    'Attached Tool name "view_skill" conflicts with the builtin Skill loader'
-                )
-            skill_tool = await self.resolve_builtin_skill_tool(
-                request=request,
-                owner=owner,
-                skill_ids=requested_skill_ids,
-                runtime_model=runtime_model,
-                extra_params=extra_params,
-            )
-            if skill_tool is not None:
-                tools[self.SKILL_TOOL_NAME] = skill_tool
-        return CapabilitySet(
-            requested_ids,
-            requested_skill_ids,
-            tools,
-            skill_manifest,
-        )
+        return CapabilitySet(requested_ids, requested_skill_ids, tools)
 
     @staticmethod
     def _extra_params(
@@ -910,7 +920,6 @@ class ChildRequestBuilder:
                 files=context.files,
                 connector=McpRuntime.connect,
                 include_builtin_tools=True,
-                resolve_skills=False,
             )
         runtime.cache_capabilities(CHILD_RUNTIME_KEY, model_id, capabilities)
         return capabilities
@@ -939,7 +948,7 @@ class ChildRequestBuilder:
             meta = dict(meta)
         else:
             meta = {}
-        return normalize_ids(meta.get("skillIds")), normalize_ids(meta.get("toolIds"))
+        return normalize_skill_ids(meta.get("skillIds")), normalize_ids(meta.get("toolIds"))
 
     @staticmethod
     def _system_prompt(workspace_context: str = "") -> str:
@@ -1081,10 +1090,10 @@ class Pipe:
                 + ", ".join(missing_filters)
             )
         base_tool_ids = normalize_ids(runtime.metadata.get("lite_base_tool_ids"))
-        skill_ids = normalize_ids(runtime.metadata.get("lite_orchestrator_skill_ids"))
-        skill_manifest = ""
+        skill_ids = normalize_skill_ids(runtime.metadata.get("lite_orchestrator_skill_ids"))
+        router_model_id = str(runtime.metadata.get("lite_router_model_id") or "").strip()
+        runtime_model = context.request.app.state.MODELS.get(router_model_id) or {"id": router_model_id}
         if base_tool_ids or skill_ids:
-            router_model_id = str(runtime.metadata.get("lite_router_model_id") or "").strip()
             capabilities = runtime.cached_capabilities(
                 BASE_RUNTIME_KEY,
                 router_model_id,
@@ -1092,9 +1101,6 @@ class Pipe:
                 skill_ids,
             )
             if capabilities is None:
-                runtime_model = context.request.app.state.MODELS.get(router_model_id) or {
-                    "id": router_model_id
-                }
                 capabilities = await self._capabilities.resolve(
                     request=context.request,
                     capability_owner_id=str(
@@ -1117,7 +1123,6 @@ class Pipe:
                     router_model_id,
                     capabilities,
                 )
-            skill_manifest = capabilities.skill_manifest
             tool_ids = normalize_ids(
                 [*(runtime.metadata.get("tool_ids") or []), *base_tool_ids]
             )
@@ -1134,7 +1139,35 @@ class Pipe:
                 )
             )
         ]
-        skill_prompt = self._capabilities.orchestrator_prompt(skill_manifest)
+        async def load_builtin(ids):
+            owner = await Users.get_user_by_id(str(runtime.metadata.get("lite_router_owner_id") or "").strip())
+            if owner is None:
+                raise ValueError("Model capability owner is unavailable")
+            extra_params = self._capabilities._extra_params(
+                request=context.request, execution_user=context.user, runtime_model=runtime_model,
+                metadata=runtime.metadata, messages=messages, event_emitter=context.event_emitter,
+                event_call=context.event_call, oauth_token=context.oauth_token, files=context.files,
+            )
+            return await get_builtin_tools(
+                context.request,
+                {**extra_params, "__user__": owner.model_dump(), "__skill_ids__": ids},
+                model=runtime_model,
+            )
+
+        prepared = await SkillPreparation.prepare(
+            skill_ids=skill_ids, runtime_model=runtime_model, metadata=runtime.metadata,
+            lookup_skill=Skills.get_skill_by_id, load_builtin=load_builtin,
+        )
+        SkillPreparation.install_loader(prepared, routed, runtime_model)
+        runtime.sync(tools=runtime.shared_tools())
+        skill_prompt = prepared.context
+        if prepared.loader is not None:
+            skill_prompt = (
+                "The following Skills are available on demand. Inspect their descriptions "
+                "and call view_skill for any Skill that may apply before following its full "
+                "instructions. Load a relevant routing Skill before calling lite_delegate."
+                "\n\n" + skill_prompt
+            )
         if skill_prompt:
             messages.insert(
                 0,

@@ -75,9 +75,10 @@ Pipe не запускает обычный inlet pipeline, поэтому Route
 3. History Cleanup оставляет штатную текстовую переписку, удаляет прошлые
    нативные `tool_calls` и сообщения `tool`, но сохраняет текущий запрос и его
    незавершённую цепочку без изменений.
-4. Router на основе уже разрешённых capabilities строит системный контекст
-   routing Skills. При доступном builtin `view_skill` это manifest; иначе —
-   полное содержимое Skills.
+4. Router заново читает прикреплённые routing Skills и строит их Skill context.
+   При доступном builtin `view_skill`, session и non-legacy calling mode это
+   manifest; иначе — полное содержимое Skills. Также учитывается builtin Tools
+   capability модели.
 5. Router подключает реальные callables оркестратора и вызывает
    `orchestrator_model_id`.
 
@@ -194,9 +195,23 @@ Handoff распознаёт только актуальный маркер
    Tool Calls выбираются только внутри сохранённых пар и не могут расширить
    число текстовых пар.
 3. Skill Context читает `skillIds` модели. При доступных builtin Tools он строит
-   manifest и добавляет разрешённый только для этих Skills `view_skill`. Если
-   builtin Tools выключены или используется legacy function calling, полное
-   содержимое Skills добавляется в системный промпт.
+   manifest и добавляет разрешённый только для этих Skills `view_skill`, если
+   есть session и builtin loader. Иначе полное содержимое Skills добавляется в
+   системный промпт. Эти же правила действуют для оркестратора и обычных моделей.
+
+Идентификаторы Skills приводятся к lowercase, пробелы по краям и повторы
+удаляются с сохранением порядка. Отсутствующий или неактивный Skill вызывает
+ошибку. На каждом запуске подготовки Skills перечитываются, поэтому изменения
+инструкций и доступности отражаются в следующем запросе. Обычные Tools и MCP
+продолжают использовать request-scoped cache с прежними критериями модели и
+прикреплённых Tool/Skill IDs.
+
+Оркестратор передаёт builtin loader контекст Workspace Model owner. Для
+сабагента и обычной модели используется Execution user. Allowlist ограничивает
+выбор Skills, а штатный builtin сохраняет собственные проверки доступа.
+Чужой callable или schema с именем `view_skill` вызывает явный конфликт при
+подключении loader. Повторная подготовка заменяет собственный loader и Skill
+context; переход к полным инструкциям или очистка Skills удаляет старый loader.
 
 Настройки находятся в Valves **Subagent Context**:
 
@@ -216,7 +231,29 @@ Valves Function хранятся на уровне экземпляра филь
 
 ## Локальная проверка
 
+Общий исходник подготовки Skills находится в `shared/skill_preparation.py`.
+Блоки между `BEGIN GENERATED SKILL PREPARATION` и `END GENERATED SKILL PREPARATION`
+в `lite_handoff_router.py` и `skill_context.py` генерируются из него. Меняйте
+общие правила в исходнике, затем обновляйте и коммитьте оба готовых Function-файла:
+
 ```sh
+python3 tools/generate_skill_preparation.py
+```
+
+В `lite_subagent_registry.py` этот же генератор встраивает только функцию
+нормализации Skill IDs из общего исходника: Registry проверяет Skills до вызова
+Pipe, поэтому его lookup должен использовать те же канонические IDs. Изменение
+этой функции требует регенерации и коммита всех трёх файлов. Tool и model IDs
+сохраняют исходный регистр.
+
+Код Router и Filter вне этих блоков редактируется напрямую. Генератор сохраняет
+его и при неизменном исходнике не переписывает файлы. Для проверки актуальности
+без записи используйте `--check`; stale output завершает команду с кодом `1`.
+Пользователям Open WebUI по-прежнему достаточно загрузить готовые Function-файлы:
+генератор и общий исходник при установке не нужны.
+
+```sh
+python3 tools/generate_skill_preparation.py --check
 python3 -B -m unittest discover -s tests -v
 ```
 
@@ -227,3 +264,7 @@ python3 -B -m unittest discover -s tests -v
 и подменяют только внешние операции Open WebUI. Проверки cache охватывают
 переиспользование capabilities, смену модели и прикреплённых Tools/Skills,
 обновление истории в cached callables и сохранение общих Tools и metadata.
+Одна матрица Skill-политики проверяет `Pipe.pipe` и `Filter.inlet`: lazy/full
+eligibility, fallback, canonical IDs, ownership, allowlist, конфликты и freshness.
+Тесты генератора проверяют read-only freshness check, воспроизводимость,
+сохранение независимого кода и импорт каждого Function без соседних модулей.

@@ -20,6 +20,19 @@ from open_webui.models.users import Users
 from open_webui.utils.models import check_model_access
 from pydantic import BaseModel, Field
 
+# BEGIN GENERATED SKILL PREPARATION
+# Edit shared/skill_preparation.py; run python3 tools/generate_skill_preparation.py
+def normalize_skill_ids(values) -> list[str]:
+    result = []
+    seen = set()
+    for raw_value in values or []:
+        value = str(raw_value or "").strip().lower()
+        if value and value not in seen:
+            result.append(value)
+            seen.add(value)
+    return result
+# END GENERATED SKILL PREPARATION
+
 log = logging.getLogger(__name__)
 
 # Workspace Model ID -> Routing Skill ID.
@@ -120,7 +133,7 @@ class ModelAccessPolicy:
 class SkillAvailabilityValidator:
     @staticmethod
     async def validate(skill_ids: list[str], *, strict: bool = True) -> list[str]:
-        ids = normalize_ids(skill_ids)
+        ids = normalize_skill_ids(skill_ids)
         skills = await asyncio.gather(*(Skills.get_skill_by_id(skill_id) for skill_id in ids))
         missing = [
             skill_id
@@ -151,7 +164,7 @@ class SubagentCatalog:
                     request=request,
                     user=user,
                     model_id=str(model_id or "").strip(),
-                    routing_skill_id=str(skill_id or "").strip(),
+                    routing_skill_id=next(iter(normalize_skill_ids([skill_id])), ""),
                 )
                 for model_id, skill_id in self._entries.items()
             )
@@ -251,18 +264,18 @@ class Filter:
             raise ValueError("User not found")
 
         registry = await self._build_registry(request=__request__, user=user)
-        base_skill_ids = normalize_ids(self.valves.base_skill_ids)
+        base_skill_ids = normalize_skill_ids(self.valves.base_skill_ids)
         if isinstance(registry, RegistryMap):
             await self._validate_skill_ids(base_skill_ids, strict=True)
             routing_skill_ids = registry.skill_ids
         else:
             # Preserve test/custom subclass compatibility without reloading in production.
-            routing_skill_ids = normalize_ids(registry)
+            routing_skill_ids = normalize_skill_ids(registry)
             await self._validate_skill_ids(
                 [*base_skill_ids, *registry],
                 strict=True,
             )
-        orchestrator_skill_ids = normalize_ids([*base_skill_ids, *routing_skill_ids])
+        orchestrator_skill_ids = normalize_skill_ids([*base_skill_ids, *routing_skill_ids])
 
         router_model_id = str(body.get("model") or "").strip()
         router_model = await Models.get_model_by_id(router_model_id)
