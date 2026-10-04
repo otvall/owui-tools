@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Embed authoritative Skill preparation and request lifecycle in standalone Functions."""
+"""Embed shared preparation, lifecycle and Tool pairing in standalone Functions."""
 
 import argparse
 import ast
@@ -12,6 +12,7 @@ TARGETS = ("lite_handoff_router.py", "skill_context.py", "lite_subagent_registry
 RUNTIME_TARGETS = TARGETS + (
     "previous_tool_context.py", "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
 )
+HISTORY_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py")
 
 
 def embed(original: str, source: str, region: str, source_name: str) -> str:
@@ -34,6 +35,7 @@ def main() -> int:
     runtime_source = (ROOT / "shared/request_runtime.py").read_text()
     # Future imports belong at the top of deployment files, which already use them.
     runtime_source = runtime_source.replace("from __future__ import annotations\n", "")
+    history_source = (ROOT / "shared/tool_history.py").read_text()
     normalizer = next(
         node for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef) and node.name == "normalize_skill_ids"
@@ -45,6 +47,8 @@ def main() -> int:
         original = path.read_text()
         try:
             generated = embed(original, runtime_source, "REQUEST RUNTIME", "shared/request_runtime.py")
+            if name in HISTORY_TARGETS:
+                generated = embed(generated, history_source, "TOOL HISTORY", "shared/tool_history.py")
             if name in TARGETS:
                 embedded = normalization_source if name == "lite_subagent_registry.py" else source
                 generated = embed(generated, embedded, "SKILL PREPARATION", "shared/skill_preparation.py")
