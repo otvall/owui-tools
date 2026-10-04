@@ -20,6 +20,9 @@ class SkillBehavior:
                 is_active=True, name="Beta", description="Beta description", content="Full beta instructions",
             ),
         }
+        if self.path == "standalone":
+            self.metadata.clear()
+            self.metadata["tools"] = {}
         self.skills.side_effect = self.records.get
         self.metadata.update(session_id="session", params={"function_calling": "native"})
         self.view_skill = AsyncMock(return_value="builtin checked permissions")
@@ -369,10 +372,14 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
                 if not include_schemas:
                     self.body.pop("tools")
                 self.body["model"] = "router"
+                self.body["messages"] += [
+                    {"role": "assistant", "content": "Done"},
+                    {"role": "user", "content": "question"},
+                ]
                 registry = self.registry_filter()
                 await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
                 self.assertNotIn("lite_skill_loader", self.metadata)
-                self.metadata.update(previous_tool_context_applied=True, history_cleanup_applied=True)
+                await self.context_inlets(self.body)
                 if replacement == "foreign":
                     self.assertIs(self.metadata["tools"]["view_skill"], foreign)
                     self.assertIn(old_schema, self.body["tools"])
@@ -383,7 +390,6 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
                 else:
                     self.assertNotIn("view_skill", self.metadata["tools"])
                     self.assertNotIn(old_schema, self.body.get("tools", []))
-                self.metadata.update(previous_tool_context_applied=True, history_cleanup_applied=True)
 
     async def test_registry_validation_failure_does_not_reset_previous_request(self):
         await self.prepare()
@@ -405,7 +411,7 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
         await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
         self.assertEqual(self.metadata["tools"], {})
         self.assertEqual(self.body["tools"], [schema])
-        self.metadata.update(previous_tool_context_applied=True, history_cleanup_applied=True)
+        await self.context_inlets(self.body)
         with self.assertRaisesRegex(ValueError, "conflicts with the builtin Skill loader"):
             await self.prepare()
         self.completion.assert_not_awaited()

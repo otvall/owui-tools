@@ -76,6 +76,19 @@ skill_filter_module = load_plain_module(
         "open_webui.utils.tools": types.SimpleNamespace(get_builtin_tools=router.get_builtin_tools),
     },
 )
+registry_module = load_plain_module(
+    "lite_subagent_registry.py", "registry_pipe_tests",
+    {
+        "open_webui.config": types.SimpleNamespace(BYPASS_ADMIN_ACCESS_CONTROL=False),
+        "open_webui.env": types.SimpleNamespace(BYPASS_MODEL_ACCESS_CONTROL=False),
+        "open_webui.models.models": types.SimpleNamespace(Models=router.Models),
+        "open_webui.models.skills": types.SimpleNamespace(Skills=router.Skills),
+        "open_webui.models.users": types.SimpleNamespace(Users=router.Users),
+        "open_webui.utils.models": types.SimpleNamespace(check_model_access=AsyncMock()),
+    },
+)
+previous_module = load_plain_module("previous_tool_context.py", "previous_pipe_tests")
+cleanup_module = load_plain_module("history_cleanup.py", "cleanup_pipe_tests")
 
 
 class PipeTestCase(unittest.IsolatedAsyncioTestCase):
@@ -84,15 +97,7 @@ class PipeTestCase(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.user = types.SimpleNamespace(model_dump=lambda: {"id": "user"})
         self.owner: Any = types.SimpleNamespace(model_dump=lambda: {"id": "owner"})
-        self.metadata: dict[str, Any] = {
-            "tools": {},
-            "previous_tool_context_applied": True,
-            "history_cleanup_applied": True,
-            "lite_agents": {
-                "agent-a": {"model_id": "agent-a", "name": "Agent A", "routing_skill_id": "route-a"},
-                "agent-b": {"model_id": "agent-b", "name": "Agent B", "routing_skill_id": "route-b"},
-            },
-        }
+        self.metadata: dict[str, Any] = {"tools": {}}
         self.models = {
             name: types.SimpleNamespace(is_active=True, user_id="owner", meta={"toolIds": ["toolkit"]})
             for name in ("agent-a", "agent-b")
@@ -119,7 +124,8 @@ class PipeTestCase(unittest.IsolatedAsyncioTestCase):
         self.enterContext(patch.object(skill_filter_module, "get_builtin_tools", self.builtins))
         self.skills = self.enterContext(patch.object(
             router.Skills, "get_skill_by_id", AsyncMock(side_effect=lambda id: types.SimpleNamespace(
-                is_active=True, name=id, description="Skill description", content="Skill instructions for " + id,
+                is_active=True, name={"route-a": "Agent A", "route-b": "Agent B"}.get(id, id),
+                description="Skill description", content="Skill instructions for " + id,
             )), create=True,
         ))
         self.connector = AsyncMock(return_value=None)
@@ -139,6 +145,13 @@ class PipeTestCase(unittest.IsolatedAsyncioTestCase):
         self.events = AsyncMock()
         self.pipe = router.Pipe()
         self.pipe.valves.orchestrator_model_id = "base-model"
+        await self.router_inlets(
+            {"model": "router", "metadata": self.metadata, "messages": []},
+            registry=PipeTestCase.registry_filter(self),
+        )
+        self.users.reset_mock()
+        self.model_lookup.reset_mock()
+        self.skills.reset_mock()
 
     async def load_tools(self, request, ids, owner, extra_params):
         history = extra_params["__messages__"]
@@ -150,6 +163,27 @@ class PipeTestCase(unittest.IsolatedAsyncioTestCase):
             name: {"tool_id": ids[0], "spec": {"name": name}, "callable": read_history}
             for name in self.tool_names
         }
+
+    def registry_filter(self):
+        self.enterContext(patch.dict(registry_module.SUBAGENTS, {
+            "agent-a": "route-a", "agent-b": "route-b",
+        }, clear=True))
+        self.user.id, self.user.role = "user", "user"
+        self.models["router"] = types.SimpleNamespace(is_active=True, user_id="owner")
+        registry = registry_module.Filter()
+        registry.valves.base_tool_ids = []
+        registry.valves.base_skill_ids = []
+        return registry
+
+    async def router_inlets(self, body, *, registry=None):
+        registry = registry or self.registry_filter()
+        await registry.inlet(body, __request__=self.request, __user__={"id": "user"})
+        return await self.context_inlets(body)
+
+    async def context_inlets(self, body):
+        await previous_module.Filter().inlet(body, __request__=self.request)
+        await cleanup_module.Filter().inlet(body, __request__=self.request)
+        return body
 
     async def process_filters(self, **kwargs):
         body = kwargs["form_data"]

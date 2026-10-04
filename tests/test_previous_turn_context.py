@@ -538,8 +538,7 @@ class StandaloneHistoryCleanupTests(unittest.IsolatedAsyncioTestCase):
 class SplitFilterPipelineTests(PipeTestCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        self.metadata = registry_metadata()
-        self.request.state.metadata = self.metadata
+        self.registry = self.registry_filter()
         self.previous = previous_filter.Filter()
         self.cleanup = cleanup_filter.Filter()
         self.child_tool_filter = self.tool_filter
@@ -555,15 +554,17 @@ class SplitFilterPipelineTests(PipeTestCase):
                 {"type": "function", "function": {"name": "lite_delegate"}}
             ],
         }
-        await self.previous.inlet(body)
-        await self.cleanup.inlet(body)
+        self.registry.valves.base_skill_ids = self.metadata.get("lite_orchestrator_skill_ids") or []
+        await self.registry.inlet(body, __request__=self.request, __user__={"id": "user"})
+        await self.previous.inlet(body, __request__=self.request)
+        await self.cleanup.inlet(body, __request__=self.request)
         return body
 
     async def route(self, messages):
         body = await self.apply_filters(messages)
-        filtered = copy.deepcopy(body)
+        filtered = copy.deepcopy({key: value for key, value in body.items() if key != "metadata"})
         await self.invoke_body(body)
-        self.assertEqual(body, filtered)
+        self.assertEqual({key: value for key, value in body.items() if key != "metadata"}, filtered)
         return self.routed
 
     async def test_priorities_define_required_order(self):

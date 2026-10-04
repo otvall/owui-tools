@@ -27,6 +27,7 @@ PIPELINE_KEY = "lite_subagent_filter_pipeline"
 
 
 import copy
+import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -76,6 +77,7 @@ class RequestRuntime:
         "lite_active_handoff", "lite_active_agent_id", "lite_active_skill_id",
         "lite_active_model_id", "lite_active_tool_runtime", "lite_base_tool_runtime",
         "lite_orchestrator_skill_context", "lite_unfiltered_messages",
+        "lite_router_filter_pipeline", "lite_router_request_key",
         "previous_tool_context_applied", "history_cleanup_applied",
         "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
         "lite_subagent_filter_pipeline", "lite_subagent_filter_run",
@@ -87,6 +89,11 @@ class RequestRuntime:
         "lite_base_tool_ids", "lite_orchestrator_skill_ids", "lite_registry_applied",
     )
     MANAGED_FIELDS = RESET_FIELDS + CONFIG_FIELDS + ("tools", "tool_ids", "skill_ids")
+    ROUTER_FILTERS = {
+        "lite_registry": "Lite Subagent Registry",
+        "previous_tool_context": "Previous Tool Context",
+        "history_cleanup": "History Cleanup",
+    }
     CHILD_FILTERS = {
         "tool_call_filter": "Tool Call Filter",
         "subagent_context": "Subagent Context",
@@ -136,11 +143,58 @@ class RequestRuntime:
         self.publish()
 
     def start_request(self, body: dict, **configuration) -> None:
+        request_key = self.router_request_key(body)
+        pipeline = self.metadata.get("lite_router_filter_pipeline")
+        pipeline = pipeline if isinstance(pipeline, list) else []
+        preceding = [
+            label for name, label in self.ROUTER_FILTERS.items()
+            if name != "lite_registry" and (name in pipeline or self.metadata.get(name + "_applied"))
+        ]
+        if preceding and (
+            not self.metadata.get("lite_registry_applied")
+            or self.metadata.get("lite_router_request_key") == request_key
+        ):
+            raise ValueError("Lite Subagent Registry must run before " + " and ".join(preceding))
         body["metadata"] = self.metadata
         SkillLoaderOwnership(self.metadata).remove(body)
         self.discard(*self.RESET_FIELDS)
         self.shared_tools()
-        self.sync(**configuration)
+        self.sync(**configuration, lite_router_filter_pipeline=["lite_registry"], lite_router_request_key=request_key)
+
+    def router_request_key(self, body: dict) -> dict:
+        """Recognize Registry re-entry; Pipe continuations never infer a new request."""
+        if self.metadata.get("message_id"):
+            return {"chat_id": self.metadata.get("chat_id"), "message_id": self.metadata["message_id"]}
+        users = [
+            message for message in body.get("messages") or []
+            if message.get("role") == "user" and not self.is_tool_image_message(message)
+        ]
+        return {
+            "user_count": len(users),
+            "user_content": json.dumps(users[-1].get("content") if users else None, sort_keys=True),
+        }
+
+    @staticmethod
+    def is_tool_image_message(message: dict) -> bool:
+        content = message.get("content")
+        return (
+            message.get("role") == "user"
+            and isinstance(content, list) and len(content) > 1
+            and isinstance(content[0], dict) and content[0].get("type") == "text"
+            and content[0].get("text") == "Here are the images from the tool results above. Please analyze them."
+            and all(isinstance(part, dict) and part.get("type") == "image_url" for part in content[1:])
+        )
+
+    def require_router_chain(self) -> None:
+        pipeline = self.metadata.get("lite_router_filter_pipeline")
+        pipeline = pipeline if isinstance(pipeline, list) else []
+        missing = [label for name, label in self.ROUTER_FILTERS.items() if name not in pipeline]
+        if missing:
+            raise ValueError("Required Router filters are missing or out of order: " + ", ".join(missing))
+        if pipeline != list(self.ROUTER_FILTERS):
+            raise ValueError(
+                "Router filters ran in the wrong order; required: " + " -> ".join(self.ROUTER_FILTERS.values())
+            )
 
     @contextmanager
     def preparation(self) -> Iterator[RequestRuntime]:
@@ -195,6 +249,21 @@ class RequestRuntime:
             )
 
     def before_filter(self, name: str) -> None:
+        if name in self.ROUTER_FILTERS:
+            if self.metadata.get("lite_subagent_filter_run") or not (
+                self.metadata.get("lite_registry_applied") or "lite_router_filter_pipeline" in self.metadata
+            ):
+                return
+            sequence = list(self.ROUTER_FILTERS)
+            prior = sequence[:sequence.index(name)]
+            pipeline = self.metadata.get("lite_router_filter_pipeline")
+            pipeline = pipeline if isinstance(pipeline, list) else []
+            if pipeline != prior:
+                # Keep the rejected order invalid even if a caller continues after the error.
+                self.sync(lite_router_filter_pipeline=[*pipeline, name])
+                required = " and ".join(self.ROUTER_FILTERS[item] for item in prior)
+                raise ValueError(f"{required} must run before {self.ROUTER_FILTERS[name]} in the Router inlet chain")
+            return
         if not self.metadata.get("lite_subagent_filter_run"):
             return
         sequence = list(self.CHILD_FILTERS)
@@ -204,11 +273,18 @@ class RequestRuntime:
             required = " and ".join(self.CHILD_FILTERS[item] for item in prior)
             raise ValueError(f"{required} must run before {self.CHILD_FILTERS[name]}")
 
-    def finish_filter(self, name: str, **values) -> None:
+    def finish_filter(self, name: str, *, body: dict | None = None, **values) -> None:
         self.metadata.update(values)
         self.metadata[name + "_applied"] = True
         if name in self.CHILD_FILTERS and self.metadata.get("lite_subagent_filter_run"):
             self.metadata.setdefault("lite_subagent_filter_pipeline", []).append(name)
+        if (
+            name in self.ROUTER_FILTERS and self.metadata.get("lite_registry_applied")
+            and not self.metadata.get("lite_subagent_filter_run")
+        ):
+            self.metadata.setdefault("lite_router_filter_pipeline", []).append(name)
+            if body is not None:
+                self.metadata["lite_router_request_key"] = self.router_request_key(body)
         self.publish()
 
     def shared_tools(self) -> dict:
