@@ -327,6 +327,7 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
         ], "tools": schemas}
         registry = self.registry_filter()
         registry.valves.base_skill_ids = ["alpha"]
+        self.begin_request(metadata=self.request.state.metadata)
         await registry.inlet(body, __request__=self.request, __user__={"id": "user"})
         for key in (*legacy_keys, "lite_active_handoff", "lite_active_model_id", "lite_active_tool_runtime",
                     "lite_base_tool_runtime", "lite_unfiltered_messages", "lite_child_messages", "lite_skill_loader",
@@ -377,6 +378,7 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
                     {"role": "user", "content": "question"},
                 ]
                 registry = self.registry_filter()
+                self.begin_request(metadata=self.request.state.metadata)
                 await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
                 self.assertNotIn("lite_skill_loader", self.metadata)
                 await self.context_inlets(self.body)
@@ -399,6 +401,7 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
         registry = self.registry_filter()
         self.records.pop("alpha")
         with self.assertRaisesRegex(ValueError, "Configured model-bound Skills are unavailable"):
+            self.begin_request(metadata=self.request.state.metadata)
             await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
         self.assertEqual(self.metadata, snapshot)
         self.assertIs(self.metadata["tools"]["view_skill"], old_loader)
@@ -408,6 +411,7 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
         schema = {"type": "function", "function": {"name": "view_skill", "description": "foreign"}}
         self.body["tools"] = [schema]
         registry = self.registry_filter()
+        self.begin_request(metadata=self.request.state.metadata)
         await registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
         self.assertEqual(self.metadata["tools"], {})
         self.assertEqual(self.body["tools"], [schema])
@@ -468,6 +472,7 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
         filter = registry.Filter()
         filter.valves.base_skill_ids = [" ALPHA ", "alpha", ""]
         filter.valves.base_tool_ids = ["Toolkit"]
+        self.begin_request(metadata=self.request.state.metadata)
         await filter.inlet(self.body, __request__=self.request, __user__={"id": "user"})
         previous = load_plain_module("previous_tool_context.py", "skill_registry_previous_tests").Filter()
         cleanup = load_plain_module("history_cleanup.py", "skill_registry_cleanup_tests").Filter()

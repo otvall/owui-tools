@@ -2,6 +2,8 @@
 
 import copy
 
+from starlette.requests import Request
+
 from test_handoff_history import (
     PipeTestCase, assistant, call, cleanup_module, grouped_history, marker, previous_module, result,
 )
@@ -20,6 +22,44 @@ class RouterChainTests(PipeTestCase):
             "model": "router", "metadata": self.metadata,
             "messages": previous_turn() + [{"role": "user", "content": "Next question"}],
         }
+
+    async def test_repeated_trimmed_new_request_without_message_id_resets_router_chain(self):
+        self.begin_request()
+        first = {
+            "model": "router", "metadata": self.metadata,
+            "messages": [{"role": "user", "content": "Repeat this"}],
+        }
+        await self.router_inlets(first, registry=self.registry)
+        await self.invoke_body(first)
+        shared = self.metadata["tools"]
+        self.completion.reset_mock()
+
+        # A new HTTP request can reuse metadata and present identical trimmed text.
+        request_metadata = {**self.metadata, "platform": "keep request state"}
+        self.begin_request(metadata=request_metadata)
+        second = {
+            "model": "router", "metadata": self.metadata,
+            "messages": [{"role": "user", "content": "Repeat this"}],
+        }
+        await self.registry.inlet(second, __request__=self.request, __user__={"id": "user"})
+        with self.assertRaisesRegex(ValueError, "Previous Tool Context"):
+            await self.invoke_body(second)
+        self.completion.assert_not_awaited()
+
+        await self.context_inlets(second)
+        await self.invoke_body(second)
+        self.completion.assert_awaited_once()
+        self.assertEqual(self.routed["model"], "base-model")
+        self.assertEqual([m["content"] for m in self.routed["messages"] if m["role"] == "user"], ["Repeat this"])
+        self.assertIs(self.metadata["tools"], shared)
+        self.assertIs(request_metadata["tools"], shared)
+        self.assertEqual(request_metadata["platform"], "keep request state")
+
+        # A fresh Request wrapper over the same HTTP scope is still the same request.
+        same_request = Request(self.request.scope)
+        with self.assertRaisesRegex(ValueError, "Registry.*before.*Previous Tool Context"):
+            await self.registry.inlet(copy.deepcopy(second), __request__=same_request, __user__={"id": "user"})
+        self.completion.assert_awaited_once()
 
     async def test_standalone_context_flags_cannot_replace_registry(self):
         await self.previous.inlet(self.body, __request__=self.request)
@@ -42,6 +82,7 @@ class RouterChainTests(PipeTestCase):
                 with self.subTest(component=label, child=len(messages) > 1):
                     self.completion.reset_mock()
                     body = {"model": "router", "metadata": self.metadata, "messages": copy.deepcopy(messages)}
+                    self.begin_request()
                     await self.registry.inlet(body, __request__=self.request, __user__={"id": "user"})
                     for context_filter in (self.previous, self.cleanup):
                         if context_filter is missing:
@@ -115,6 +156,7 @@ class RouterChainTests(PipeTestCase):
             {"role": "assistant", "content": "Configuration fixed"},
             copy.deepcopy(self.body["messages"][-1]),
         ]}
+        self.begin_request()
         await self.router_inlets(new_body, registry=self.registry)
         await self.invoke_body(new_body)
         self.assertEqual(self.routed["model"], "base-model")
@@ -136,6 +178,7 @@ class RouterChainTests(PipeTestCase):
         new_body = {"model": "router", "metadata": self.metadata, "messages": [
             copy.deepcopy(self.body["messages"][-1]),
         ]}
+        self.begin_request()
         await self.router_inlets(new_body, registry=self.registry)
         await self.invoke_body(new_body)
         self.assertEqual(self.routed["model"], "base-model")
@@ -146,6 +189,7 @@ class RouterChainTests(PipeTestCase):
             {"role": "assistant", "content": "Done"},
             copy.deepcopy(new_body["messages"][-1]),
         ]
+        self.begin_request()
         await self.router_inlets(new_body, registry=self.registry)
         continued = {**new_body, "messages": new_body["messages"] + [image]}
         with self.assertRaisesRegex(ValueError, "Registry.*before.*Previous Tool Context"):
@@ -234,6 +278,7 @@ class RouterChainTests(PipeTestCase):
             {"role": "user", "content": "New request"},
         ]}
 
+        self.begin_request(metadata=request_metadata)
         await self.registry.inlet(new_body, __request__=self.request, __user__={"id": "user"})
         self.assertEqual(self.metadata["lite_router_filter_pipeline"], ["lite_registry"])
         self.assertIs(request_metadata["lite_router_filter_pipeline"], self.metadata["lite_router_filter_pipeline"])

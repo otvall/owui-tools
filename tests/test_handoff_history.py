@@ -16,6 +16,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
+from starlette.requests import Request
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -152,6 +154,12 @@ class PipeTestCase(unittest.IsolatedAsyncioTestCase):
         self.users.reset_mock()
         self.model_lookup.reset_mock()
         self.skills.reset_mock()
+
+    def begin_request(self, *, metadata=None):
+        self.request = Request({
+            "type": "http", "app": self.request.app,
+            "state": {"metadata": self.metadata if metadata is None else metadata},
+        })
 
     async def load_tools(self, request, ids, owner, extra_params):
         history = extra_params["__messages__"]

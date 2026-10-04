@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import copy
-import json
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
+from uuid import uuid4
 
 
 @dataclass(frozen=True)
@@ -119,7 +119,7 @@ class RequestRuntime:
         self.publish()
 
     def start_request(self, body: dict, **configuration) -> None:
-        request_key = self.router_request_key(body)
+        request_key = self.router_request_key()
         pipeline = self.metadata.get("lite_router_filter_pipeline")
         pipeline = pipeline if isinstance(pipeline, list) else []
         preceding = [
@@ -137,18 +137,21 @@ class RequestRuntime:
         self.shared_tools()
         self.sync(**configuration, lite_router_filter_pipeline=["lite_registry"], lite_router_request_key=request_key)
 
-    def router_request_key(self, body: dict) -> dict:
-        """Recognize Registry re-entry; Pipe continuations never infer a new request."""
+    def router_request_key(self) -> dict:
+        """Recognize Registry re-entry without deriving identity from message text."""
         if self.metadata.get("message_id"):
             return {"chat_id": self.metadata.get("chat_id"), "message_id": self.metadata["message_id"]}
-        users = [
-            message for message in body.get("messages") or []
-            if message.get("role") == "user" and not self.is_tool_image_message(message)
-        ]
-        return {
-            "user_count": len(users),
-            "user_content": json.dumps(users[-1].get("content") if users else None, sort_keys=True),
-        }
+        scope = getattr(self.request, "scope", None)
+        if isinstance(scope, dict):
+            # Request wrappers over the same ASGI scope share one transport identity.
+            request_id = scope.setdefault("lite_router_request_id", uuid4().hex)
+        else:
+            # Lightweight request adapters need not implement the ASGI scope.
+            request_id = getattr(self.request, "_lite_router_request_id", None)
+            if request_id is None:
+                request_id = uuid4().hex
+                self.request._lite_router_request_id = request_id
+        return {"request_id": request_id}
 
     @staticmethod
     def is_tool_image_message(message: dict) -> bool:
@@ -249,7 +252,7 @@ class RequestRuntime:
             required = " and ".join(self.CHILD_FILTERS[item] for item in prior)
             raise ValueError(f"{required} must run before {self.CHILD_FILTERS[name]}")
 
-    def finish_filter(self, name: str, *, body: dict | None = None, **values) -> None:
+    def finish_filter(self, name: str, **values) -> None:
         self.metadata.update(values)
         self.metadata[name + "_applied"] = True
         if name in self.CHILD_FILTERS and self.metadata.get("lite_subagent_filter_run"):
@@ -259,8 +262,6 @@ class RequestRuntime:
             and not self.metadata.get("lite_subagent_filter_run")
         ):
             self.metadata.setdefault("lite_router_filter_pipeline", []).append(name)
-            if body is not None:
-                self.metadata["lite_router_request_key"] = self.router_request_key(body)
         self.publish()
 
     def shared_tools(self) -> dict:

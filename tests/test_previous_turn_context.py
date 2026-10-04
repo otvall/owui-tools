@@ -546,6 +546,7 @@ class SplitFilterPipelineTests(PipeTestCase):
         self.child_skill_filter = self.skill_filter
 
     async def apply_filters(self, messages):
+        self.begin_request()
         body = {
             "model": "router",
             "metadata": self.metadata,
