@@ -507,17 +507,17 @@ class Filter:
             if isinstance(__model__, dict)
             else __request__.app.state.MODELS.get(model_id) or {"id": model_id}
         )
-        model_meta = (runtime_model.get("info") or {}).get("meta") or {}
-        contextual_skill_ids = (
-            metadata.get("lite_target_skill_ids") or []
-            if metadata.get("lite_subagent_filter_run")
-            else metadata.get("lite_orchestrator_skill_ids") or []
-        )
-        skill_ids = [
-            *(body.get("skill_ids") or []),
-            *(model_meta.get("skillIds") or []),
-            *contextual_skill_ids,
-        ]
+        if metadata.get("lite_subagent_filter_run"):
+            # Router has already read the child's current database attachments.
+            # An empty selection is authoritative even when runtime metadata is stale.
+            skill_ids = metadata.get("lite_target_skill_ids") or []
+        else:
+            model_meta = (runtime_model.get("info") or {}).get("meta") or {}
+            skill_ids = [
+                *(body.get("skill_ids") or []),
+                *(model_meta.get("skillIds") or []),
+                *(metadata.get("lite_orchestrator_skill_ids") or []),
+            ]
 
         async def load_builtin(ids):
             return await self._load_skill_builtins(
