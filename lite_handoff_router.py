@@ -365,6 +365,25 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 
+def resolve_agent_id(value: str | None, registry: dict) -> str | None:
+    """Resolve a direct ID or an unambiguous accepted routing Skill alias."""
+    if not isinstance(registry, dict):
+        return None
+    agents = {
+        str(agent_id or "").strip(): config
+        for agent_id, config in registry.items()
+        if str(agent_id or "").strip() and isinstance(config, dict)
+        and str(config.get("model_id") or "").strip()
+    }
+    if value in agents:
+        return value
+    matches = [
+        agent_id for agent_id, config in agents.items()
+        if value and str(config.get("routing_skill_id") or "").strip() == value
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 @dataclass(frozen=True)
 class ToolExchange:
     message_index: int
@@ -1008,16 +1027,8 @@ class ChildRequestBuilder:
         runtime: RequestRuntime,
         context: InvocationContext,
     ) -> tuple[dict, AgentSpec]:
-        agent = registry.get(marker.agent_id)
-        if agent is None:
-            agent = next(
-                (
-                    candidate
-                    for candidate in registry.values()
-                    if candidate.routing_skill_id == marker.agent_id
-                ),
-                None,
-            )
+        agent_id = resolve_agent_id(marker.agent_id, runtime.metadata.get("lite_agents") or {})
+        agent = registry.get(agent_id) if agent_id is not None else None
         if agent is None:
             raise ValueError(
                 f'Agent ID "{marker.agent_id}" is not available in the current registry'

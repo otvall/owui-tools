@@ -4,6 +4,25 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 
+def resolve_agent_id(value: str | None, registry: dict) -> str | None:
+    """Resolve a direct ID or an unambiguous accepted routing Skill alias."""
+    if not isinstance(registry, dict):
+        return None
+    agents = {
+        str(agent_id or "").strip(): config
+        for agent_id, config in registry.items()
+        if str(agent_id or "").strip() and isinstance(config, dict)
+        and str(config.get("model_id") or "").strip()
+    }
+    if value in agents:
+        return value
+    matches = [
+        agent_id for agent_id, config in agents.items()
+        if value and str(config.get("routing_skill_id") or "").strip() == value
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 @dataclass(frozen=True)
 class ToolExchange:
     message_index: int

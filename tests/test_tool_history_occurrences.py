@@ -149,6 +149,7 @@ class PipeOccurrenceHistoryTests(PipeTestCase):
             assistant(call("shared", "private_tool")), result("shared", "PRIVATE_RESULT"),
             {"role": "assistant", "content": "private answer"},
             {"role": "user", "content": "allowed question"},
+            assistant(call("allowed-delegate", "lite_delegate")), result("allowed-delegate", marker()),
             assistant(call("shared", "lookup")), result("shared", "ALLOWED_RESULT"),
             {"role": "assistant", "content": "allowed answer"},
             {"role": "user", "content": "current question"},
@@ -165,9 +166,11 @@ class PipeOccurrenceHistoryTests(PipeTestCase):
         self.context_filter.valves.history_tool_calls = 1
         source = [
             {"role": "user", "content": "old question"},
+            assistant(call("old-delegate", "lite_delegate")), result("old-delegate", marker()),
             assistant(call("shared", "lookup")), result("shared", "OLD_RESULT"),
             {"role": "assistant", "content": "old answer"},
             {"role": "user", "content": "recent question"},
+            assistant(call("recent-delegate", "lite_delegate")), result("recent-delegate", marker()),
             assistant(call("shared", "lookup")), result("shared", "RECENT_RESULT"),
             {"role": "assistant", "content": "recent answer"},
             {"role": "user", "content": "current question"},
@@ -205,6 +208,7 @@ class PipeOccurrenceHistoryTests(PipeTestCase):
             assistant(call("private", "private_tool")), result("shared", "OTHER_BATCH_RESULT"),
             assistant(call("same-batch", "private_tool"), call("same-batch", "lookup")),
             result("same-batch", "AMBIGUOUS_RESULT"),
+            assistant(call("valid-delegate", "lite_delegate")), result("valid-delegate", marker()),
             assistant(call("valid", "lookup"), call("blocked", "private_tool")),
             result("blocked", "PRIVATE_RESULT"), result("valid", "VALID_RESULT"),
             {"role": "assistant", "content": "second answer"},

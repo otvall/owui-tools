@@ -351,6 +351,25 @@ from collections.abc import Callable
 from dataclasses import dataclass
 
 
+def resolve_agent_id(value: str | None, registry: dict) -> str | None:
+    """Resolve a direct ID or an unambiguous accepted routing Skill alias."""
+    if not isinstance(registry, dict):
+        return None
+    agents = {
+        str(agent_id or "").strip(): config
+        for agent_id, config in registry.items()
+        if str(agent_id or "").strip() and isinstance(config, dict)
+        and str(config.get("model_id") or "").strip()
+    }
+    if value in agents:
+        return value
+    matches = [
+        agent_id for agent_id, config in agents.items()
+        if value and str(config.get("routing_skill_id") or "").strip() == value
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
 @dataclass(frozen=True)
 class ToolExchange:
     message_index: int
@@ -498,29 +517,76 @@ class Filter:
         return {name for name in names if name}
 
     @staticmethod
+    def _historical_exchanges(
+        messages: list[dict], exchanges: list[ToolExchange],
+        selected_agent: str | None, registry: dict,
+    ) -> set[ToolExchange]:
+        """Attribute grouped calls at their results, before removing Handoffs."""
+        selected: set[ToolExchange] = set()
+        if selected_agent is None:
+            return selected
+        by_result = {exchange.result_index: exchange for exchange in exchanges}
+        completed_calls = {(exchange.message_index, exchange.call_index) for exchange in exchanges}
+        executor: str | None = None
+        uncertain_batch = False
+        for index, message in enumerate(messages):
+            if message.get("role") == "user" and not is_tool_image_message(message):
+                executor = None
+            if message.get("role") == "assistant":
+                uncertain_batch = any(
+                    (call.get("function") or {}).get("name") == "lite_delegate"
+                    and (index, call_index) not in completed_calls
+                    for call_index, call in enumerate(message.get("tool_calls") or [])
+                )
+                if uncertain_batch:
+                    # An unpaired delegate has no trustworthy transition position.
+                    executor = None
+            exchange = by_result.get(index)
+            if exchange is None:
+                continue
+            call = messages[exchange.message_index]["tool_calls"][exchange.call_index]
+            if (call.get("function") or {}).get("name") == "lite_delegate":
+                agent_id = parse_delegate_marker(message.get("content"))
+                executor = resolve_agent_id(agent_id, registry) if not uncertain_batch else None
+            elif executor == selected_agent:
+                selected.add(exchange)
+        return selected
+
+    @classmethod
     def _keep_supported_pairs(
-        messages: list[dict], allowed_names: set[str], target_agent_id: str,
+        cls, messages: list[dict], allowed_names: set[str], target_agent_id: str,
+        registry: dict,
     ) -> list[dict]:
         exchanges = completed_tool_exchanges(messages, is_tool_image_message=is_tool_image_message)
         current_user = last_user_index(messages)
-        marker_index = max(
-            (
-                exchange.result_index
-                for exchange in exchanges
-                if current_user >= 0 and target_agent_id
-                and exchange.message_index > current_user
-                and (messages[exchange.message_index]["tool_calls"][exchange.call_index].get("function") or {}).get("name") == "lite_delegate"
-                and parse_delegate_marker(messages[exchange.result_index].get("content"))
-                == target_agent_id
-            ),
-            default=-1,
+        selected_agent = resolve_agent_id(target_agent_id, registry)
+        historical = cls._historical_exchanges(
+            messages[:max(current_user, 0)], exchanges, selected_agent, registry,
         )
-        accepted = [
-            exchange for exchange in exchanges
-            if (exchange.message_index < current_user or exchange.result_index > marker_index)
-            and str((messages[exchange.message_index]["tool_calls"][exchange.call_index].get("function") or {}).get("name") or "").strip()
-            in allowed_names
-        ]
+        marker_index = -1
+        if current_user >= 0 and target_agent_id:
+            for exchange in exchanges:
+                call = messages[exchange.message_index]["tool_calls"][exchange.call_index]
+                if exchange.message_index <= current_user or (call.get("function") or {}).get("name") != "lite_delegate":
+                    continue
+                destination = parse_delegate_marker(messages[exchange.result_index].get("content"))
+                if registry:
+                    destination = resolve_agent_id(destination, registry)
+                if destination and destination == (selected_agent or target_agent_id):
+                    marker_index = max(marker_index, exchange.result_index)
+
+        accepted = []
+        for exchange in exchanges:
+            call = messages[exchange.message_index]["tool_calls"][exchange.call_index]
+            name = str((call.get("function") or {}).get("name") or "").strip()
+            if name not in allowed_names:
+                continue
+            if exchange.message_index < current_user:
+                if target_agent_id and exchange not in historical:
+                    continue
+            elif exchange.result_index <= marker_index:
+                continue
+            accepted.append(exchange)
         # Grouped child calls occur before the delegate result in OWUI's payload.
         # Recover only their concrete pairs, after matching the original batches.
         recovered_calls = [
@@ -560,9 +626,12 @@ class Filter:
         if not isinstance(messages, list):
             raise TypeError("Tool Call Filter messages must be a list")
         allowed_names = self._allowed_tool_names(body, metadata)
+        registry = metadata.get("lite_agents")
+        registry = registry if isinstance(registry, dict) else {}
         body["messages"] = self._keep_supported_pairs(
             messages, allowed_names,
             str(metadata.get("lite_target_agent_id") or "").strip(),
+            registry,
         )
         RequestRuntime(__request__, metadata).finish_filter("tool_call_filter")
         self._debug(
