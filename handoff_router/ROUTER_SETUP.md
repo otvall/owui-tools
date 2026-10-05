@@ -117,6 +117,17 @@ Routing Skills Router получает из `SUBAGENTS` автоматическ
 
 Для минимального запуска задайте Valves **Router Preparation**:
 
+В интерфейсе Valves поля списков принимают значения **через запятую**, а не JSON.
+Для `base_tool_ids` введите `lite_delegate` без скобок и кавычек.
+Для пустого `base_skill_ids` переключите поле в **Custom** и введите
+**одну запятую `,` без кавычек**, затем нажмите Save. Полностью пустое поле
+не проходит обязательную проверку формы, а `[]` сохранится как ID Skill.
+При сохранении запятая преобразуется в пустой список: редактор разделяет строку
+по запятым и удаляет пустые элементы. Это поведение проверено в
+[исходнике редактора Valves Open WebUI 0.11.1](https://github.com/open-webui/open-webui/blob/v0.11.1/src/lib/components/workspace/common/ValvesModal.svelte).
+
+Ниже — итоговые значения в формате JSON, а не текст для отдельных полей формы:
+
 ```json
 {
   "priority": -100,
@@ -177,7 +188,7 @@ routing Skill. Для примера выше: «Рассчитай 17% от 245
 | Симптом | Что проверить |
 |---|---|
 | `orchestrator_model_id is not configured` | Заполните Valves именно Pipe Lite Handoff Router |
-| `Configured model-bound Skills are unavailable` | Установите `base_skill_ids = []` либо укажите существующие активные базовые Skills |
+| `Configured model-bound Skills are unavailable` | В поле `base_skill_ids` введите одну запятую `,` для пустого списка либо IDs существующих активных базовых Skills через запятую |
 | `Router Model is unavailable` | Используйте сохранённую активную Workspace Model Router на основе Pipe |
 | Ошибка требует Router Preparation | Проверьте активность фильтра и attachment на Router; после исправления начните новый запрос |
 | Агент не выбирается | Проверьте IDs в `SUBAGENTS`, активность routing Skill, описание специализации и доступ пользователя к модели |
