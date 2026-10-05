@@ -158,6 +158,13 @@ class RequestRuntime:
         self.metadata.update(values)
         self.publish()
 
+    def select_model(self, model_id: str) -> None:
+        """Give Tools the inference model ID, preserving Workspace dispatch."""
+        self.metadata["model_id"] = model_id
+        request_metadata = self.request_metadata
+        if request_metadata is not None and request_metadata is not self.metadata:
+            request_metadata["model_id"] = model_id
+
     def publish(self) -> None:
         """Mirror only project-managed fields, including their absence."""
         request_metadata = self.request_metadata
@@ -249,6 +256,11 @@ class RequestRuntime:
         Keep live registry/history identities and callable/client references. External
         resources (notably mcp_clients) are deliberately outside this checkpoint.
         """
+        missing = object()
+        model_ids = [(self.metadata, self.metadata.get("model_id", missing))]
+        request_metadata = self.request_metadata
+        if request_metadata is not None and request_metadata is not self.metadata:
+            model_ids.append((request_metadata, request_metadata.get("model_id", missing)))
         saved = {key: self.metadata[key] for key in self.MANAGED_FIELDS if key in self.metadata}
         contents: dict[str, Any] = {}
         for key, value in saved.items():
@@ -270,6 +282,11 @@ class RequestRuntime:
                     value.clear()
                     value.update(contents[key])
                 self.metadata[key] = value
+            for metadata, model_id in model_ids:
+                if model_id is missing:
+                    metadata.pop("model_id", None)
+                else:
+                    metadata["model_id"] = model_id
             self.publish()
             raise
         else:
@@ -285,6 +302,16 @@ class RequestRuntime:
                 raise TypeError("Model preparation returned an invalid request body")
             prepared.body["metadata"] = self.metadata
             prepared.messages[:] = copy.deepcopy(prepared.body["messages"])
+            # Cached OWUI Tool wrappers can retain metadata from an earlier
+            # dispatch. Publish the selected identity only after preparation.
+            if "model_id" in self.metadata:
+                for tool in self.shared_tools().values():
+                    if not isinstance(tool, dict):
+                        continue
+                    injections = getattr(tool.get("callable"), "__extra_params__", None)
+                    metadata = injections.get("__metadata__") if isinstance(injections, dict) else None
+                    if isinstance(metadata, dict):
+                        metadata["model_id"] = self.metadata["model_id"]
 
     @contextmanager
     def child_filters(self) -> Iterator[None]:

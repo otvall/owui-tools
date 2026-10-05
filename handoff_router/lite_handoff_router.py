@@ -1,7 +1,7 @@
 """
 title: Lite Handoff Router
 description: Stateless same-response subagent handoff router.
-version: 0.21.0
+version: 0.21.1
 required_open_webui_version: 0.11.1
 """
 
@@ -175,6 +175,13 @@ class RequestRuntime:
         self.metadata.update(values)
         self.publish()
 
+    def select_model(self, model_id: str) -> None:
+        """Give Tools the inference model ID, preserving Workspace dispatch."""
+        self.metadata["model_id"] = model_id
+        request_metadata = self.request_metadata
+        if request_metadata is not None and request_metadata is not self.metadata:
+            request_metadata["model_id"] = model_id
+
     def publish(self) -> None:
         """Mirror only project-managed fields, including their absence."""
         request_metadata = self.request_metadata
@@ -266,6 +273,11 @@ class RequestRuntime:
         Keep live registry/history identities and callable/client references. External
         resources (notably mcp_clients) are deliberately outside this checkpoint.
         """
+        missing = object()
+        model_ids = [(self.metadata, self.metadata.get("model_id", missing))]
+        request_metadata = self.request_metadata
+        if request_metadata is not None and request_metadata is not self.metadata:
+            model_ids.append((request_metadata, request_metadata.get("model_id", missing)))
         saved = {key: self.metadata[key] for key in self.MANAGED_FIELDS if key in self.metadata}
         contents: dict[str, Any] = {}
         for key, value in saved.items():
@@ -287,6 +299,11 @@ class RequestRuntime:
                     value.clear()
                     value.update(contents[key])
                 self.metadata[key] = value
+            for metadata, model_id in model_ids:
+                if model_id is missing:
+                    metadata.pop("model_id", None)
+                else:
+                    metadata["model_id"] = model_id
             self.publish()
             raise
         else:
@@ -302,6 +319,16 @@ class RequestRuntime:
                 raise TypeError("Model preparation returned an invalid request body")
             prepared.body["metadata"] = self.metadata
             prepared.messages[:] = copy.deepcopy(prepared.body["messages"])
+            # Cached OWUI Tool wrappers can retain metadata from an earlier
+            # dispatch. Publish the selected identity only after preparation.
+            if "model_id" in self.metadata:
+                for tool in self.shared_tools().values():
+                    if not isinstance(tool, dict):
+                        continue
+                    injections = getattr(tool.get("callable"), "__extra_params__", None)
+                    metadata = injections.get("__metadata__") if isinstance(injections, dict) else None
+                    if isinstance(metadata, dict):
+                        metadata["model_id"] = self.metadata["model_id"]
 
     @contextmanager
     def child_filters(self) -> Iterator[None]:
@@ -1359,6 +1386,7 @@ class WorkspaceModelPreparation:
             )
         tool_ids = list(snapshot.tool_ids) if snapshot is not None else []
         skill_ids = list(snapshot.skill_ids) if snapshot is not None else []
+        runtime.select_model(model_id)
         self._clear_outer_inference_params(prepared.body)
         capability_model_id = str(runtime_model.get("id") or "").strip()
 
@@ -1698,6 +1726,10 @@ class Pipe:
     ):
         with runtime.prepare_model("orchestrator", body) as preparation:
             runtime.require_router_chain()
+            model_id = self.valves.orchestrator_model_id.strip()
+            if not model_id:
+                raise ValueError("orchestrator_model_id is not configured")
+            runtime.select_model(model_id)
             routed = preparation.body
             base_tool_ids = normalize_ids(runtime.metadata.get("lite_base_tool_ids"))
             skill_ids = normalize_skill_ids(runtime.metadata.get("lite_orchestrator_skill_ids"))
@@ -1783,9 +1815,6 @@ class Pipe:
                 )
             routed["messages"] = messages
 
-            model_id = self.valves.orchestrator_model_id.strip()
-            if not model_id:
-                raise ValueError("orchestrator_model_id is not configured")
             routed["model"] = model_id
         self._debug("-> orchestrator %s", model_id)
         return await self._gateway.generate(request=context.request, body=routed, user=context.user)
