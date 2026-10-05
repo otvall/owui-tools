@@ -2,8 +2,9 @@
 
 import copy
 import html
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 from shared.request_runtime import SkillLoaderOwnership
 
@@ -17,6 +18,80 @@ def normalize_skill_ids(values) -> list[str]:
             result.append(value)
             seen.add(value)
     return result
+
+
+@dataclass(frozen=True, kw_only=True)
+class SkillBuiltinInvocation:
+    profile: Literal["orchestrator", "child", "standalone"]
+    request: Any
+    runtime_model: dict
+    metadata: dict
+    event_emitter: Any = None
+    event_call: Any = None
+    oauth_token: Any = None
+    messages: list[dict] | None = None
+    files: Any = None
+
+
+class BuiltinSkillLoader:
+    """Load fresh OWUI builtins behind SkillPreparation's load_builtin seam.
+
+    The caller selects the user; resolve_user runs only when load is called.
+    Router profiles require their stable history list and history adapter.
+    Standalone retains its smaller injection set and OWUI's native binding.
+    This module neither checks Skill eligibility nor caches loaded Tools.
+    """
+
+    def __init__(
+        self,
+        *,
+        invocation: SkillBuiltinInvocation,
+        get_builtin_tools: Callable[..., Awaitable[dict]],
+        resolve_user: Callable[[], Awaitable[dict]],
+        bind_history: Callable[[dict, list[dict]], dict] | None = None,
+    ):
+        if invocation.profile not in ("orchestrator", "child", "standalone"):
+            raise ValueError(f"Unknown builtin Skill profile: {invocation.profile}")
+        if invocation.profile == "standalone":
+            if bind_history is not None:
+                raise ValueError("Standalone Skill loading cannot bind Router history")
+        elif invocation.messages is None or bind_history is None:
+            raise ValueError("Router Skill loading requires Tool history and its adapter")
+        self._invocation = invocation
+        self._get_builtin_tools = get_builtin_tools
+        self._resolve_user = resolve_user
+        self._bind_history = bind_history
+
+    async def load(self, skill_ids: list[str]) -> dict:
+        invocation = self._invocation
+        metadata = invocation.metadata
+        user = await self._resolve_user()
+        extra_params = {
+            "__user__": user,
+            "__metadata__": metadata,
+            "__model__": invocation.runtime_model,
+            "__event_emitter__": invocation.event_emitter,
+            "__event_call__": invocation.event_call,
+            "__oauth_token__": invocation.oauth_token,
+            "__chat_id__": metadata.get("chat_id"),
+            "__message_id__": metadata.get("message_id"),
+            "__skill_ids__": skill_ids,
+        }
+        options = {"model": invocation.runtime_model}
+        if invocation.profile != "orchestrator":
+            options["features"] = metadata.get("features", {})
+        if invocation.profile != "standalone":
+            extra_params.update({
+                "__request__": invocation.request,
+                "__session_id__": metadata.get("session_id"),
+                "__messages__": invocation.messages,
+                "__files__": invocation.files or metadata.get("files", []),
+                "__features__": metadata.get("features", {}),
+            })
+        tools = await self._get_builtin_tools(invocation.request, extra_params, **options)
+        if self._bind_history is not None:
+            tools = self._bind_history(tools, invocation.messages)
+        return tools
 
 
 @dataclass(frozen=True)

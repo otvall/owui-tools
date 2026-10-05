@@ -1,7 +1,7 @@
 """
 title: Lite Handoff Router
 description: Stateless same-response subagent handoff router.
-version: 0.20.0
+version: 0.20.4
 required_open_webui_version: 0.11.1
 """
 
@@ -12,7 +12,7 @@ import html
 import inspect
 import json
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, get_type_hints
@@ -638,8 +638,9 @@ def analyze_history(messages: list[dict], *, registry: dict | None = None) -> To
 
 import copy
 import html
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Literal
 
 
 
@@ -652,6 +653,80 @@ def normalize_skill_ids(values) -> list[str]:
             result.append(value)
             seen.add(value)
     return result
+
+
+@dataclass(frozen=True, kw_only=True)
+class SkillBuiltinInvocation:
+    profile: Literal["orchestrator", "child", "standalone"]
+    request: Any
+    runtime_model: dict
+    metadata: dict
+    event_emitter: Any = None
+    event_call: Any = None
+    oauth_token: Any = None
+    messages: list[dict] | None = None
+    files: Any = None
+
+
+class BuiltinSkillLoader:
+    """Load fresh OWUI builtins behind SkillPreparation's load_builtin seam.
+
+    The caller selects the user; resolve_user runs only when load is called.
+    Router profiles require their stable history list and history adapter.
+    Standalone retains its smaller injection set and OWUI's native binding.
+    This module neither checks Skill eligibility nor caches loaded Tools.
+    """
+
+    def __init__(
+        self,
+        *,
+        invocation: SkillBuiltinInvocation,
+        get_builtin_tools: Callable[..., Awaitable[dict]],
+        resolve_user: Callable[[], Awaitable[dict]],
+        bind_history: Callable[[dict, list[dict]], dict] | None = None,
+    ):
+        if invocation.profile not in ("orchestrator", "child", "standalone"):
+            raise ValueError(f"Unknown builtin Skill profile: {invocation.profile}")
+        if invocation.profile == "standalone":
+            if bind_history is not None:
+                raise ValueError("Standalone Skill loading cannot bind Router history")
+        elif invocation.messages is None or bind_history is None:
+            raise ValueError("Router Skill loading requires Tool history and its adapter")
+        self._invocation = invocation
+        self._get_builtin_tools = get_builtin_tools
+        self._resolve_user = resolve_user
+        self._bind_history = bind_history
+
+    async def load(self, skill_ids: list[str]) -> dict:
+        invocation = self._invocation
+        metadata = invocation.metadata
+        user = await self._resolve_user()
+        extra_params = {
+            "__user__": user,
+            "__metadata__": metadata,
+            "__model__": invocation.runtime_model,
+            "__event_emitter__": invocation.event_emitter,
+            "__event_call__": invocation.event_call,
+            "__oauth_token__": invocation.oauth_token,
+            "__chat_id__": metadata.get("chat_id"),
+            "__message_id__": metadata.get("message_id"),
+            "__skill_ids__": skill_ids,
+        }
+        options = {"model": invocation.runtime_model}
+        if invocation.profile != "orchestrator":
+            options["features"] = metadata.get("features", {})
+        if invocation.profile != "standalone":
+            extra_params.update({
+                "__request__": invocation.request,
+                "__session_id__": metadata.get("session_id"),
+                "__messages__": invocation.messages,
+                "__files__": invocation.files or metadata.get("files", []),
+                "__features__": metadata.get("features", {}),
+            })
+        tools = await self._get_builtin_tools(invocation.request, extra_params, **options)
+        if self._bind_history is not None:
+            tools = self._bind_history(tools, invocation.messages)
+        return tools
 
 
 @dataclass(frozen=True)
@@ -1147,6 +1222,123 @@ class ModelCapabilityResolver:
         }
 
 
+@dataclass(frozen=True)
+class PreparedWorkspaceModel:
+    runtime_model: dict
+    capabilities: CapabilitySet
+
+
+@dataclass(frozen=True)
+class _WorkspaceModelSnapshot:
+    owner_id: str
+    tool_ids: tuple[str, ...]
+    skill_ids: tuple[str, ...]
+
+
+class WorkspaceModelPreparation:
+    """Prepare fresh Workspace Model facts and request-local capabilities."""
+
+    def __init__(
+        self,
+        *,
+        lookup_model: Callable[[str], Awaitable[Any]],
+        capability_resolver: ModelCapabilityResolver,
+    ):
+        self._lookup_model = lookup_model
+        self._capabilities = capability_resolver
+
+    async def prepare(
+        self,
+        model_id: str,
+        *,
+        prepared: ModelPreparation,
+        runtime: RequestRuntime,
+        context: InvocationContext,
+    ) -> PreparedWorkspaceModel:
+        """Validate fresh selection before consulting the existing capability cache.
+
+        One preparation-local snapshot supplies attachments and their owner when
+        configured and runtime IDs match. Distinct IDs retain the separate owner
+        record lookup on a cache miss. No snapshot survives this operation.
+
+        Remove outer inference fields; provider handlers still apply the child's
+        base_model_id, inference/custom params and system prompt. The builder
+        prepares history, Skills and destination inlet filters afterward.
+        """
+        runtime_model = context.request.app.state.MODELS.get(model_id)
+        if runtime_model is None:
+            raise ValueError(f'Agent "{model_id}" is unavailable')
+        model_info = await self._lookup_model(model_id)
+        snapshot = None
+        if model_info is None:
+            is_pipe = (
+                isinstance(runtime_model, dict)
+                and isinstance(runtime_model.get("pipe"), dict)
+                and runtime_model["pipe"].get("type") == "pipe"
+            )
+            if not is_pipe:
+                raise ValueError(f'Agent "{model_id}" must be a Workspace Model or Pipe')
+        else:
+            if not model_info.is_active:
+                raise ValueError(f'Agent "{model_id}" is inactive')
+            meta = model_info.meta
+            if hasattr(meta, "model_dump"):
+                meta = meta.model_dump()
+            elif isinstance(meta, dict):
+                meta = dict(meta)
+            else:
+                meta = {}
+            snapshot = _WorkspaceModelSnapshot(
+                owner_id=str(model_info.user_id or ""),
+                tool_ids=tuple(normalize_ids(meta.get("toolIds"))),
+                skill_ids=tuple(normalize_skill_ids(meta.get("skillIds"))),
+            )
+        tool_ids = list(snapshot.tool_ids) if snapshot is not None else []
+        skill_ids = list(snapshot.skill_ids) if snapshot is not None else []
+        self._clear_outer_inference_params(prepared.body)
+        capability_model_id = str(runtime_model.get("id") or "").strip()
+
+        async def load(messages):
+            if capability_model_id == model_id:
+                owner_id = snapshot.owner_id if snapshot is not None else None
+            else:
+                capability_record = await self._lookup_model(capability_model_id)
+                if capability_record is not None and not capability_record.is_active:
+                    raise ValueError("Child Model capability owner is unavailable")
+                owner_id = str(capability_record.user_id or "") if capability_record is not None else None
+            if owner_id is None:
+                if tool_ids or skill_ids:
+                    raise ValueError("Child Model capability owner is unavailable")
+                return CapabilitySet([], [], {})
+            return await self._capabilities.resolve(
+                request=context.request,
+                capability_owner_id=owner_id,
+                execution_user=context.user,
+                tool_ids=tool_ids,
+                skill_ids=skill_ids,
+                runtime_model=runtime_model,
+                metadata=runtime.metadata,
+                messages=messages,
+                event_emitter=context.event_emitter,
+                event_call=context.event_call,
+                oauth_token=context.oauth_token,
+                files=context.files,
+                connector=McpRuntime.connect,
+                include_builtin_tools=True,
+            )
+
+        capabilities = await prepared.capabilities(
+            model_id=capability_model_id, tool_ids=tool_ids, skill_ids=skill_ids, load=load,
+        )
+        return PreparedWorkspaceModel(runtime_model, capabilities)
+
+    @staticmethod
+    def _clear_outer_inference_params(body: dict) -> None:
+        for key in tuple(body):
+            if key not in CHILD_REQUEST_ENVELOPE_KEYS:
+                body.pop(key, None)
+
+
 class ChildFilterPipeline:
     async def run(
         self,
@@ -1200,6 +1392,10 @@ class ChildRequestBuilder:
 
     def __init__(self):
         self._capabilities = ModelCapabilityResolver(McpRuntime())
+        self._workspace_models = WorkspaceModelPreparation(
+            lookup_model=lambda model_id: Models.get_model_by_id(model_id),
+            capability_resolver=self._capabilities,
+        )
         self._filters = ChildFilterPipeline()
 
     @staticmethod
@@ -1249,15 +1445,12 @@ class ChildRequestBuilder:
                     *raw_messages[:raw_user_index],
                     *source_messages[current_user_index:],
                 ]
-        runtime_model, child_skill_ids, child_tool_ids, capabilities = (
-            await self._prepare_workspace_model(
-                routed_body=routed_body,
-                agent=agent,
-                runtime=runtime,
-                context=context,
-                prepared=prepared,
-            )
+        child = await self._workspace_models.prepare(
+            agent.model_id, prepared=prepared, runtime=runtime, context=context,
         )
+        runtime_model = child.runtime_model
+        capabilities = child.capabilities
+        child_skill_ids = capabilities.skill_ids
         child_messages = copy.deepcopy(source_messages)
         child_messages.insert(
             0,
@@ -1273,7 +1466,7 @@ class ChildRequestBuilder:
         )
         routed_body["messages"] = child_messages
         routed_body["model"] = agent.model_id
-        runtime.bind_tools(capabilities.tools, child_tool_ids, replace=True)
+        runtime.bind_tools(capabilities.tools, capabilities.tool_ids, replace=True)
         runtime.sync(
             skill_ids=child_skill_ids,
             lite_target_agent_id=marker.agent_id,
@@ -1287,21 +1480,23 @@ class ChildRequestBuilder:
         ]
         routed_body.pop("tool_choice", None)
 
-        async def load_builtin(ids):
-            extra_params = self._capabilities._extra_params(
-                request=context.request, execution_user=context.user, runtime_model=runtime_model,
-                metadata=runtime.metadata, messages=prepared.messages, event_emitter=context.event_emitter,
-                event_call=context.event_call, oauth_token=context.oauth_token, files=context.files,
-            )
-            tools = await get_builtin_tools(
-                context.request, {**extra_params, "__skill_ids__": ids},
-                features=runtime.metadata.get("features", {}), model=runtime_model,
-            )
-            return self._capabilities.bind_history(tools, prepared.messages)
+        async def resolve_skill_user():
+            return context.user.model_dump()
+
+        skill_loader = BuiltinSkillLoader(
+            invocation=SkillBuiltinInvocation(
+                profile="child", request=context.request, runtime_model=runtime_model,
+                metadata=runtime.metadata, messages=prepared.messages, files=context.files,
+                event_emitter=context.event_emitter, event_call=context.event_call,
+                oauth_token=context.oauth_token,
+            ),
+            get_builtin_tools=get_builtin_tools, resolve_user=resolve_skill_user,
+            bind_history=self._capabilities.bind_history,
+        )
 
         prepared_skills = await SkillPreparation.prepare(
             skill_ids=child_skill_ids, runtime_model=runtime_model, metadata=runtime.metadata,
-            lookup_skill=Skills.get_skill_by_id, load_builtin=load_builtin,
+            lookup_skill=Skills.get_skill_by_id, load_builtin=skill_loader.load,
         )
         # Tool history must use this preparation's loader eligibility, not the previous run's.
         runtime.sync(
@@ -1318,106 +1513,6 @@ class ChildRequestBuilder:
         prepared.body = routed_body
         return routed_body, agent
 
-    async def _prepare_workspace_model(
-        self,
-        *,
-        routed_body: dict,
-        agent: AgentSpec,
-        runtime: RequestRuntime,
-        context: InvocationContext,
-        prepared: ModelPreparation,
-    ) -> tuple[dict, list[str], list[str], CapabilitySet]:
-        """Prepare only the Workspace Model state needed by a nested handoff.
-
-        Provider handlers still apply the child model's base_model_id, inference
-        params, custom params, and system prompt. This method removes the outer
-        model's already-expanded inference payload, then resolves the settings
-        that OWUI normally prepares before provider dispatch: attached Tools,
-        MCP servers and builtin Tools. The destination model's inlet filters
-        prepare history and Skills after this step.
-        """
-        runtime_model = context.request.app.state.MODELS.get(agent.model_id)
-        if runtime_model is None:
-            raise ValueError(f'Agent "{agent.model_id}" is unavailable')
-        child_skill_ids, child_tool_ids = await self._attachments(agent, runtime_model)
-        self._clear_outer_inference_params(routed_body)
-        capabilities = await self._model_capabilities(
-            runtime_model=runtime_model,
-            tool_ids=child_tool_ids,
-            skill_ids=child_skill_ids,
-            prepared=prepared,
-            runtime=runtime,
-            context=context,
-        )
-        return runtime_model, child_skill_ids, child_tool_ids, capabilities
-
-    async def _model_capabilities(
-        self,
-        *,
-        runtime_model: dict,
-        tool_ids: list[str],
-        skill_ids: list[str],
-        prepared: ModelPreparation,
-        runtime: RequestRuntime,
-        context: InvocationContext,
-    ) -> CapabilitySet:
-        model_id = str(runtime_model.get("id") or "").strip()
-
-        async def load(messages):
-            model_info = await Models.get_model_by_id(model_id)
-            if model_info is None:
-                if tool_ids or skill_ids:
-                    raise ValueError("Child Model capability owner is unavailable")
-                return CapabilitySet([], [], {})
-            if not model_info.is_active:
-                raise ValueError("Child Model capability owner is unavailable")
-            return await self._capabilities.resolve(
-                request=context.request,
-                capability_owner_id=str(model_info.user_id or ""),
-                execution_user=context.user,
-                tool_ids=tool_ids,
-                skill_ids=skill_ids,
-                runtime_model=runtime_model,
-                metadata=runtime.metadata,
-                messages=messages,
-                event_emitter=context.event_emitter,
-                event_call=context.event_call,
-                oauth_token=context.oauth_token,
-                files=context.files,
-                connector=McpRuntime.connect,
-                include_builtin_tools=True,
-            )
-
-        return await prepared.capabilities(
-            model_id=model_id, tool_ids=tool_ids, skill_ids=skill_ids, load=load,
-        )
-
-    @staticmethod
-    async def _attachments(agent: AgentSpec, runtime_model) -> tuple[list[str], list[str]]:
-        model_info = await Models.get_model_by_id(agent.model_id)
-        if model_info is None:
-            is_pipe = (
-                isinstance(runtime_model, dict)
-                and isinstance(runtime_model.get("pipe"), dict)
-                and runtime_model["pipe"].get("type") == "pipe"
-            )
-            if not is_pipe:
-                raise ValueError(
-                    f'Agent "{agent.model_id}" must be a Workspace Model or Pipe'
-                )
-            return [], []
-        if not model_info.is_active:
-            raise ValueError(f'Agent "{agent.model_id}" is inactive')
-
-        meta = model_info.meta
-        if hasattr(meta, "model_dump"):
-            meta = meta.model_dump()
-        elif isinstance(meta, dict):
-            meta = dict(meta)
-        else:
-            meta = {}
-        return normalize_skill_ids(meta.get("skillIds")), normalize_ids(meta.get("toolIds"))
-
     @staticmethod
     def _system_prompt(workspace_context: str = "") -> str:
         prompt = (
@@ -1432,12 +1527,6 @@ class ChildRequestBuilder:
         if workspace_context:
             prompt += "\n\n" + workspace_context
         return prompt
-
-    @staticmethod
-    def _clear_outer_inference_params(body: dict) -> None:
-        for key in tuple(body):
-            if key not in CHILD_REQUEST_ENVELOPE_KEYS:
-                body.pop(key, None)
 
 
 class CompletionGateway:
@@ -1589,25 +1678,26 @@ class Pipe:
                     )
                 )
             ]
-            async def load_builtin(ids):
+            async def resolve_skill_user():
                 owner = await Users.get_user_by_id(str(runtime.metadata.get("lite_router_owner_id") or "").strip())
                 if owner is None:
                     raise ValueError("Model capability owner is unavailable")
-                extra_params = self._capabilities._extra_params(
-                    request=context.request, execution_user=context.user, runtime_model=runtime_model,
-                    metadata=runtime.metadata, messages=preparation.messages, event_emitter=context.event_emitter,
-                    event_call=context.event_call, oauth_token=context.oauth_token, files=context.files,
-                )
-                tools = await get_builtin_tools(
-                    context.request,
-                    {**extra_params, "__user__": owner.model_dump(), "__skill_ids__": ids},
-                    model=runtime_model,
-                )
-                return self._capabilities.bind_history(tools, preparation.messages)
+                return owner.model_dump()
+
+            skill_loader = BuiltinSkillLoader(
+                invocation=SkillBuiltinInvocation(
+                    profile="orchestrator", request=context.request, runtime_model=runtime_model,
+                    metadata=runtime.metadata, messages=preparation.messages, files=context.files,
+                    event_emitter=context.event_emitter, event_call=context.event_call,
+                    oauth_token=context.oauth_token,
+                ),
+                get_builtin_tools=get_builtin_tools, resolve_user=resolve_skill_user,
+                bind_history=self._capabilities.bind_history,
+            )
 
             prepared = await SkillPreparation.prepare(
                 skill_ids=skill_ids, runtime_model=runtime_model, metadata=runtime.metadata,
-                lookup_skill=Skills.get_skill_by_id, load_builtin=load_builtin,
+                lookup_skill=Skills.get_skill_by_id, load_builtin=skill_loader.load,
             )
             SkillPreparation.install_loader(prepared, routed, runtime_model)
             runtime.sync(tools=runtime.shared_tools())

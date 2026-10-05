@@ -124,6 +124,10 @@ class SkillBehavior:
         self.assertIn("Full alpha instructions <unchanged>", self.prompt())
 
     async def test_loader_receives_role_specific_user_and_context(self):
+        self.metadata.update(
+            chat_id="chat", features={"web_search": True},
+            files=["attachment"],
+        )
         await self.prepare()
         params = self.builtins.call_args.args[1]
         self.assertEqual(params["__user__"], {"id": "owner" if self.path == "orchestrator" else "user"})
@@ -131,6 +135,28 @@ class SkillBehavior:
         self.assertIs(self.builtins.call_args.args[0], self.request)
         self.assertIs(params["__metadata__"], self.metadata)
         self.assertIs(params["__model__"], self.runtime_model)
+        self.assertEqual(params["__chat_id__"], "chat")
+        self.assertIsNone(params["__message_id__"])
+        self.assertIn("__event_emitter__", params)
+        self.assertIn("__event_call__", params)
+        self.assertIn("__oauth_token__", params)
+        self.assertEqual(set(params), {
+            "__user__", "__metadata__", "__model__", "__event_emitter__",
+            "__event_call__", "__oauth_token__", "__chat_id__", "__message_id__", "__skill_ids__",
+        } | (set() if self.path == "standalone" else {
+            "__request__", "__session_id__", "__messages__", "__files__", "__features__",
+        }))
+        if self.path == "orchestrator":
+            self.assertEqual(self.builtins.call_args.kwargs, {"model": self.runtime_model})
+        else:
+            self.assertEqual(self.builtins.call_args.kwargs, {
+                "model": self.runtime_model, "features": self.metadata["features"],
+            })
+        if self.path != "standalone":
+            history_key = "lite_base_messages" if self.path == "orchestrator" else "lite_child_messages"
+            self.assertIs(params["__messages__"], self.metadata[history_key])
+            self.assertIs(params["__files__"], self.metadata["files"])
+            self.assertIs(params["__features__"], self.metadata["features"])
 
     async def test_missing_and_inactive_skills_fail_in_both_modes(self):
         for mode, inactive in itertools.product(("native", "legacy"), (False, True)):
@@ -292,6 +318,46 @@ class SkillBehavior:
 
 class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
     path = "orchestrator"
+
+    async def test_owner_lookup_is_deferred_until_skills_are_valid_and_loader_is_eligible(self):
+        self.owner = None
+        for unavailable in ("empty", "missing", "inactive", "session", "legacy", "capability"):
+            with self.subTest(unavailable=unavailable):
+                self.select(["alpha"])
+                self.records["alpha"].is_active = True
+                self.metadata.update(session_id="session", params={"function_calling": "native"})
+                self.runtime_model["info"]["meta"]["capabilities"] = {"builtin_tools": True}
+                if unavailable == "empty":
+                    self.select([])
+                elif unavailable == "missing":
+                    self.select(["missing"])
+                elif unavailable == "inactive":
+                    self.records["alpha"].is_active = False
+                elif unavailable == "session":
+                    self.metadata["session_id"] = ""
+                elif unavailable == "legacy":
+                    self.metadata["params"]["function_calling"] = "legacy"
+                else:
+                    self.runtime_model["info"]["meta"]["capabilities"]["builtin_tools"] = False
+                self.users.reset_mock()
+                self.builtins.reset_mock()
+                if unavailable in ("missing", "inactive"):
+                    with self.assertRaisesRegex(ValueError, "Attached model Skills are unavailable"):
+                        await self.prepare()
+                else:
+                    await self.prepare()
+                self.assertEqual([item.args[0] for item in self.users.await_args_list], ["user"])
+                self.builtins.assert_not_awaited()
+
+        self.select(["alpha"])
+        self.records["alpha"].is_active = True
+        self.metadata.update(session_id="session", params={"function_calling": "native"})
+        self.runtime_model["info"]["meta"]["capabilities"] = {"builtin_tools": True}
+        self.users.reset_mock()
+        with self.assertRaisesRegex(ValueError, "Model capability owner is unavailable"):
+            await self.prepare()
+        self.assertEqual([item.args[0] for item in self.users.await_args_list], ["user", "owner"])
+        self.builtins.assert_not_awaited()
 
     def registry_filter(self):
         registry = load_plain_module("lite_subagent_registry.py", "registry_lifecycle_tests", {

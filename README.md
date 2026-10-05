@@ -1,6 +1,6 @@
 # Lite Handoff Router для Open WebUI v0.11.1
 
-Версия комплекта: **0.20.2**.
+Версия комплекта: **0.20.4**.
 
 Pipe отвечает за runtime-маршрутизацию и capabilities выбранной модели. Перед
 каждым вызовом сабагента он вручную запускает три inlet-фильтра, прикреплённые к
@@ -149,10 +149,32 @@ Subagent Context: они реализуют взаимоисключающие �
 текущая Tool-цепочка проверяется тем же способом.
 
 Подготовку дочернего запроса целиком ведёт `ChildRequestBuilder` внутри файла
-Router: он получает типизированные данные маршрутизации, подготавливает Workspace
-Model, разрешает и переиспользует capabilities и запускает фильтры адресата.
+Router: он получает типизированные данные маршрутизации, вызывает подготовку
+Workspace Model и запускает фильтры адресата.
 Pipe получает готовый запрос и выбранного агента, отправляет status и вызывает
 completion adapter.
+
+Module `WorkspaceModelPreparation` в Router предоставляет один interface:
+`prepare(model_id, prepared=..., runtime=..., context=...)`. Он проверяет
+доступность выбранной модели, читает свежую запись Workspace Model, нормализует
+прикреплённые Tools/Skills, очищает внешние inference fields и подготавливает
+capabilities через существующий кеш `RequestRuntime`. Результат
+`PreparedWorkspaceModel` содержит `runtime_model` и `CapabilitySet`; списки
+Tool/Skill IDs берутся из этого же `CapabilitySet`.
+
+При совпадении настроенного Model ID и нормализованного `runtime_model["id"]`
+attachments и Workspace Model owner берутся из одной записи на подготовку.
+При разных IDs сохраняется отдельное чтение записи владельца capabilities
+только при промахе кеша. Следующее продолжение заново проверяет active и
+attachments; смена owner сама по себе не сбрасывает совпавший кеш. Для Pipe
+без записи Workspace Model attachments пусты. При промахе кеша capabilities
+пусты, если настроенный и runtime IDs совпадают либо запись для runtime Model ID
+отсутствует. При разных IDs и активной записи для runtime Model ID сохраняется
+подготовка capabilities через эту запись, включая допустимые builtin Tools.
+Ранее загруженные capabilities с тем же ключом переиспользуются.
+Снимок записи остаётся локальным для подготовки. История, свежий Skill context
+и фильтры адресата подготавливаются в `ChildRequestBuilder`; откат и публикация
+Tool context остаются в `RequestRuntime`.
 
 Перед вызовом сабагента подготовщик оставляет в дочернем
 payload только сообщения, request metadata и параметры стрима. Благодаря этому
@@ -273,6 +295,22 @@ Router и фильтры сабагента: неоднозначные пары
 Оркестратор передаёт builtin loader контекст Workspace Model owner. Для
 сабагента и обычной модели используется Execution user. Allowlist ограничивает
 выбор Skills, а штатный builtin сохраняет собственные проверки доступа.
+Module `BuiltinSkillLoader` в `shared/skill_preparation.py` предоставляет
+interface `load(skill_ids)`, используемый как существующий `load_builtin`
+в `SkillPreparation.prepare`. На каждую подготовку создаётся loader с
+`SkillBuiltinInvocation`: profile, request, runtime model, metadata, события
+и OAuth; Router также передаёт стабильный Tool context и files.
+Адаптер вызывающего кода выбирает пользователя через ленивый `resolve_user`.
+Lookup Workspace Model owner выполняется после проверки Skills и eligibility,
+только если требуется загрузить builtin. Module собирает OWUI injections,
+вызывает переданный `get_builtin_tools` и применяет history adapter для Router.
+Standalone сохраняет сокращённый набор injections без Router history binding.
+Профили child и standalone передают `features` из metadata; orchestrator
+сохраняет вызов без аргумента `features`. Eligibility, allowlist, rendering,
+fallback и установка loader остаются в `SkillPreparation`; нового кеша нет.
+Генератор встраивает общий module в Router и Skill Context, поэтому готовые
+Functions по-прежнему загружаются независимо.
+
 Чужой callable или schema с именем `view_skill` вызывает явный конфликт при
 подключении loader. Повторная подготовка заменяет собственный loader и Skill
 context; переход к полным инструкциям или очистка Skills удаляет старый loader.
@@ -415,6 +453,12 @@ Context, History Cleanup, Tool Call Filter и Subagent Context.
 При обновлении до **0.20.2** обновите Tool Call Filter и Subagent Context:
 выбор и реконструкция истории теперь используют общий module без изменения
 правил истории, priorities или Valves.
+При обновлении с 0.20.2 до **0.20.3** достаточно обновить Router:
+подготовка Workspace Model использует единый свежий снимок записи при совпадающих
+IDs, с прежней политикой кеша и совместимостью разных IDs.
+При обновлении с 0.20.3 до **0.20.4** обновите Router и Skill Context:
+общий builtin Skill loader сохраняет пользователей, injections и историю
+каждого пути, с прежними Skill-политиками и свежей загрузкой.
 
 В `lite_subagent_registry.py` этот же генератор встраивает только функцию
 нормализации Skill IDs из общего исходника: Registry проверяет Skills до вызова
