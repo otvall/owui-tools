@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Embed shared preparation, lifecycle and Tool history in standalone Functions."""
+"""Embed shared preparation, lifecycle and Tool context in standalone Functions."""
 
 import argparse
 import ast
@@ -13,6 +13,7 @@ RUNTIME_TARGETS = TARGETS + (
     "previous_tool_context.py", "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
 )
 HISTORY_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py", "previous_tool_context.py")
+CONTEXT_TARGETS = ("tool_call_filter.py", "subagent_context.py")
 
 
 def embed(original: str, source: str, region: str, source_name: str) -> str:
@@ -37,6 +38,8 @@ def main() -> int:
     runtime_source = runtime_source.replace("from __future__ import annotations\n", "")
     history_source = (ROOT / "shared/tool_history.py").read_text()
     history_source = history_source.replace("from shared.request_runtime import RequestRuntime\n", "")
+    context_source = (ROOT / "shared/tool_context.py").read_text()
+    context_source = context_source.replace("from shared.tool_history import ToolExchange, analyze_history, resolve_agent_id\n", "")
     normalizer = next(
         node for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef) and node.name == "normalize_skill_ids"
@@ -50,6 +53,8 @@ def main() -> int:
             generated = embed(original, runtime_source, "REQUEST RUNTIME", "shared/request_runtime.py")
             if name in HISTORY_TARGETS:
                 generated = embed(generated, history_source, "TOOL HISTORY", "shared/tool_history.py")
+            if name in CONTEXT_TARGETS:
+                generated = embed(generated, context_source, "TOOL CONTEXT", "shared/tool_context.py")
             if name in TARGETS:
                 embedded = normalization_source if name == "lite_subagent_registry.py" else source
                 generated = embed(generated, embedded, "SKILL PREPARATION", "shared/skill_preparation.py")

@@ -19,7 +19,7 @@ class SkillGenerationTests(unittest.TestCase):
     def setUp(self):
         self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         for name in (
-            "shared/skill_preparation.py", "shared/request_runtime.py", "shared/tool_history.py",
+            "shared/skill_preparation.py", "shared/request_runtime.py", "shared/tool_history.py", "shared/tool_context.py",
             "tools/generate_skill_preparation.py",
             *FUNCTIONS,
         ):
@@ -110,6 +110,24 @@ class SkillGenerationTests(unittest.TestCase):
         source.write_text(source.read_text() + "\n# Updated Tool history source\n")
         before = self.outputs()
         consumers = {"lite_handoff_router.py", "tool_call_filter.py", "subagent_context.py", "previous_tool_context.py"}
+        checked = self.run_generator("--check")
+        self.assertEqual(checked.returncode, 1, checked.stderr)
+        for name in consumers:
+            self.assertIn(name, checked.stderr)
+        self.assertEqual(self.outputs(), before)
+        self.assertEqual(self.run_generator().returncode, 0)
+        for name, output in self.outputs().items():
+            if name in consumers:
+                self.assertNotEqual(output, before[name])
+            else:
+                self.assertEqual(output, before[name])
+        self.assertEqual(self.run_generator("--check").returncode, 0)
+
+    def test_tool_context_source_change_refreshes_only_projection_consumers(self):
+        source = self.root / "shared/tool_context.py"
+        source.write_text(source.read_text() + "\n# Updated Tool context source\n")
+        before = self.outputs()
+        consumers = {"tool_call_filter.py", "subagent_context.py"}
         checked = self.run_generator("--check")
         self.assertEqual(checked.returncode, 1, checked.stderr)
         for name in consumers:
