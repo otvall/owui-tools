@@ -90,6 +90,8 @@ class BuiltinSkillLoader:
             })
         tools = await self._get_builtin_tools(invocation.request, extra_params, **options)
         if self._bind_history is not None:
+            # Constructor validation guarantees history for the Router profiles.
+            assert invocation.messages is not None
             tools = self._bind_history(tools, invocation.messages)
         return tools
 
