@@ -1,7 +1,7 @@
 """
 title: Subagent Context
 description: Limits completed previous text turns and concrete Tool call occurrences for a model.
-version: 0.20.2
+version: 0.21.0
 required_open_webui_version: 0.11.1
 """
 
@@ -229,17 +229,18 @@ class RequestRuntime:
             self.sync(lite_context_filter_request_key=self.router_request_key())
 
     def require_router_chain(self) -> None:
+        guidance = "; attach Router Preparation to the Router Workspace Model"
         pipeline = self.metadata.get("lite_router_filter_pipeline")
         pipeline = pipeline if isinstance(pipeline, list) else []
         missing = [label for name, label in self.ROUTER_FILTERS.items() if name not in pipeline]
         if missing:
-            raise ValueError("Required Router filters are missing or out of order: " + ", ".join(missing))
+            raise ValueError("Required Router filters are missing or out of order: " + ", ".join(missing) + guidance)
         if pipeline != list(self.ROUTER_FILTERS):
             raise ValueError(
-                "Router filters ran in the wrong order; required: " + " -> ".join(self.ROUTER_FILTERS.values())
+                "Router filters ran in the wrong order; required: " + " -> ".join(self.ROUTER_FILTERS.values()) + guidance
             )
         if self.metadata.get("lite_router_request_key") != self.router_request_key():
-            raise ValueError("Lite Subagent Registry must run for the current request before Router dispatch")
+            raise ValueError("Lite Subagent Registry must run for the current request before Router dispatch" + guidance)
 
     @contextmanager
     def preparation(self) -> Iterator[RequestRuntime]:

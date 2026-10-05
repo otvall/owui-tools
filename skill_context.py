@@ -239,17 +239,18 @@ class RequestRuntime:
             self.sync(lite_context_filter_request_key=self.router_request_key())
 
     def require_router_chain(self) -> None:
+        guidance = "; attach Router Preparation to the Router Workspace Model"
         pipeline = self.metadata.get("lite_router_filter_pipeline")
         pipeline = pipeline if isinstance(pipeline, list) else []
         missing = [label for name, label in self.ROUTER_FILTERS.items() if name not in pipeline]
         if missing:
-            raise ValueError("Required Router filters are missing or out of order: " + ", ".join(missing))
+            raise ValueError("Required Router filters are missing or out of order: " + ", ".join(missing) + guidance)
         if pipeline != list(self.ROUTER_FILTERS):
             raise ValueError(
-                "Router filters ran in the wrong order; required: " + " -> ".join(self.ROUTER_FILTERS.values())
+                "Router filters ran in the wrong order; required: " + " -> ".join(self.ROUTER_FILTERS.values()) + guidance
             )
         if self.metadata.get("lite_router_request_key") != self.router_request_key():
-            raise ValueError("Lite Subagent Registry must run for the current request before Router dispatch")
+            raise ValueError("Lite Subagent Registry must run for the current request before Router dispatch" + guidance)
 
     @contextmanager
     def preparation(self) -> Iterator[RequestRuntime]:
@@ -514,6 +515,7 @@ class BuiltinSkillLoader:
             })
         tools = await self._get_builtin_tools(invocation.request, extra_params, **options)
         if self._bind_history is not None:
+            # Constructor validation guarantees history for the Router profiles.
             assert invocation.messages is not None
             tools = self._bind_history(tools, invocation.messages)
         return tools

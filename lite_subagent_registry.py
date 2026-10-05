@@ -1,7 +1,7 @@
 """
 title: Lite Subagent Registry
 description: Dynamically exposes accessible subagents to Lite Handoff Router.
-version: 0.20.0
+version: 0.21.0
 required_open_webui_version: 0.11.1
 """
 
@@ -238,17 +238,18 @@ class RequestRuntime:
             self.sync(lite_context_filter_request_key=self.router_request_key())
 
     def require_router_chain(self) -> None:
+        guidance = "; attach Router Preparation to the Router Workspace Model"
         pipeline = self.metadata.get("lite_router_filter_pipeline")
         pipeline = pipeline if isinstance(pipeline, list) else []
         missing = [label for name, label in self.ROUTER_FILTERS.items() if name not in pipeline]
         if missing:
-            raise ValueError("Required Router filters are missing or out of order: " + ", ".join(missing))
+            raise ValueError("Required Router filters are missing or out of order: " + ", ".join(missing) + guidance)
         if pipeline != list(self.ROUTER_FILTERS):
             raise ValueError(
-                "Router filters ran in the wrong order; required: " + " -> ".join(self.ROUTER_FILTERS.values())
+                "Router filters ran in the wrong order; required: " + " -> ".join(self.ROUTER_FILTERS.values()) + guidance
             )
         if self.metadata.get("lite_router_request_key") != self.router_request_key():
-            raise ValueError("Lite Subagent Registry must run for the current request before Router dispatch")
+            raise ValueError("Lite Subagent Registry must run for the current request before Router dispatch" + guidance)
 
     @contextmanager
     def preparation(self) -> Iterator[RequestRuntime]:
@@ -444,6 +445,22 @@ SUBAGENTS: dict[str, str] = {
 }
 
 
+# BEGIN GENERATED REGISTRY PREPARATION
+# Edit shared/registry_preparation.py; run python3 tools/generate_skill_preparation.py
+"""Registry initialization stage shared by Router and standalone adapters."""
+
+import asyncio
+import json
+from dataclasses import dataclass
+
+from open_webui.config import BYPASS_ADMIN_ACCESS_CONTROL
+from open_webui.env import BYPASS_MODEL_ACCESS_CONTROL
+from open_webui.models.models import Models
+from open_webui.models.skills import Skills
+from open_webui.models.users import Users
+from open_webui.utils.models import check_model_access
+
+
 def normalize_ids(values) -> list[str]:
     result = []
     seen = set()
@@ -603,33 +620,13 @@ class SubagentCatalog:
         )
 
 
-class Filter:
-    class Valves(BaseModel):
-        priority: int = Field(default=-100, description="Run this filter early.")
-        base_tool_ids: list[str] = Field(
-            default_factory=lambda: ["lite_delegate"],
-            description="Base orchestrator tools.",
-        )
-        base_skill_ids: list[str] = Field(
-            default_factory=lambda: [
-                "orchestrator-capability-guide",
-                "describe-available-agents",
-            ],
-            description="Base orchestrator skills.",
-        )
-        debug: bool = Field(default=False, description="Enable debug logs.")
-
-    def __init__(self):
-        self.valves = self.Valves()
+class RegistryPreparation:
+    def __init__(self, entries: dict[str, str], debug):
+        self._debug = debug
         self._skill_validator = SkillAvailabilityValidator()
-        self._access_policy = ModelAccessPolicy(self._debug)
-        self._catalog = SubagentCatalog(SUBAGENTS, self._access_policy, self._debug)
+        self._access_policy = ModelAccessPolicy(debug)
+        self._catalog = SubagentCatalog(entries, self._access_policy, debug)
 
-    def _debug(self, message: str, *args) -> None:
-        if self.valves.debug:
-            log.warning("[LITE_REGISTRY] " + message, *args)
-
-    # Compatibility adapters for installed-runtime characterization.
     async def _can_access_model(self, *, request, user, model_id: str) -> bool:
         return await self._access_policy.can_access(
             request=request,
@@ -648,11 +645,14 @@ class Filter:
     async def _build_registry(self, *, request, user) -> dict[str, dict]:
         return RegistryMap(await self._catalog.build(request=request, user=user))
 
-    async def inlet(
+    async def prepare(
         self,
         body: dict,
         __user__: dict | None = None,
         __request__=None,
+        *,
+        base_tool_ids: list[str],
+        base_skill_ids: list[str],
     ) -> dict:
         if __request__ is None:
             raise ValueError("Lite Subagent Registry requires __request__")
@@ -667,7 +667,7 @@ class Filter:
             raise ValueError("User not found")
 
         registry = await self._build_registry(request=__request__, user=user)
-        base_skill_ids = normalize_skill_ids(self.valves.base_skill_ids)
+        base_skill_ids = normalize_skill_ids(base_skill_ids)
         if isinstance(registry, RegistryMap):
             await self._validate_skill_ids(base_skill_ids, strict=True)
             routing_skill_ids = registry.skill_ids
@@ -699,7 +699,7 @@ class Filter:
             lite_agents=dict(registry),
             lite_router_model_id=router_model_id,
             lite_router_owner_id=router_owner_id,
-            lite_base_tool_ids=normalize_ids(self.valves.base_tool_ids),
+            lite_base_tool_ids=normalize_ids(base_tool_ids),
             lite_orchestrator_skill_ids=orchestrator_skill_ids,
             lite_registry_applied=True,
         )
@@ -707,3 +707,34 @@ class Filter:
         self._debug("model-bound base tools=%s", metadata["lite_base_tool_ids"])
         self._debug("model-bound skill count=%s", len(orchestrator_skill_ids))
         return body
+# END GENERATED REGISTRY PREPARATION
+
+class Filter(RegistryPreparation):
+    class Valves(BaseModel):
+        priority: int = Field(default=-100, description="Run this filter early.")
+        base_tool_ids: list[str] = Field(
+            default_factory=lambda: ["lite_delegate"],
+            description="Base orchestrator tools.",
+        )
+        base_skill_ids: list[str] = Field(
+            default_factory=lambda: [
+                "orchestrator-capability-guide",
+                "describe-available-agents",
+            ],
+            description="Base orchestrator skills.",
+        )
+        debug: bool = Field(default=False, description="Enable debug logs.")
+
+    def __init__(self):
+        self.valves = self.Valves()
+        super().__init__(SUBAGENTS, self._debug)
+
+    def _debug(self, message: str, *args) -> None:
+        if self.valves.debug:
+            log.warning("[LITE_REGISTRY] " + message, *args)
+
+    async def inlet(self, body: dict, __user__: dict | None = None, __request__=None) -> dict:
+        return await self.prepare(
+            body, __user__, __request__,
+            base_tool_ids=self.valves.base_tool_ids, base_skill_ids=self.valves.base_skill_ids,
+        )

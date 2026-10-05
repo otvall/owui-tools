@@ -8,12 +8,26 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ("lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py", "subagent_preparation.py")
+TARGETS = ("lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py", "router_preparation.py", "subagent_preparation.py")
+NORMALIZATION_TARGETS = ("lite_subagent_registry.py", "router_preparation.py")
 RUNTIME_TARGETS = TARGETS + (
     "previous_tool_context.py", "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
 )
-HISTORY_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py", "previous_tool_context.py", "subagent_preparation.py")
+HISTORY_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py", "previous_tool_context.py", "router_preparation.py", "subagent_preparation.py")
 CONTEXT_TARGETS = ("tool_call_filter.py", "subagent_context.py", "subagent_preparation.py")
+STAGE_TARGETS = {
+    "REGISTRY PREPARATION": ("shared/registry_preparation.py", ("lite_subagent_registry.py", "router_preparation.py")),
+    "PREVIOUS TOOL CONTEXT": ("shared/previous_tool_context.py", ("previous_tool_context.py", "router_preparation.py")),
+    "HISTORY CLEANUP": ("shared/history_cleanup.py", ("history_cleanup.py", "router_preparation.py")),
+}
+
+
+def deployment_source(path: str) -> str:
+    """Local imports are satisfied by earlier embedded regions."""
+    return "\n".join(
+        line for line in (ROOT / path).read_text().splitlines()
+        if not line.startswith("from shared.") and line != "from __future__ import annotations"
+    ) + "\n"
 
 
 def embed(original: str, source: str, region: str, source_name: str) -> str:
@@ -31,15 +45,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", help="Report stale output without writing files")
     args = parser.parse_args()
-    source = (ROOT / "shared/skill_preparation.py").read_text()
-    source = source.replace("from shared.request_runtime import SkillLoaderOwnership\n", "")
-    runtime_source = (ROOT / "shared/request_runtime.py").read_text()
-    # Future imports belong at the top of deployment files, which already use them.
-    runtime_source = runtime_source.replace("from __future__ import annotations\n", "")
-    history_source = (ROOT / "shared/tool_history.py").read_text()
-    history_source = history_source.replace("from shared.request_runtime import RequestRuntime\n", "")
-    context_source = (ROOT / "shared/tool_context.py").read_text()
-    context_source = context_source.replace("from shared.tool_history import ToolExchange, analyze_history, resolve_agent_id\n", "")
+    source = deployment_source("shared/skill_preparation.py")
+    runtime_source = deployment_source("shared/request_runtime.py")
+    history_source = deployment_source("shared/tool_history.py")
+    context_source = deployment_source("shared/tool_context.py")
     normalizer = next(
         node for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef) and node.name == "normalize_skill_ids"
@@ -56,8 +65,11 @@ def main() -> int:
             if name in CONTEXT_TARGETS:
                 generated = embed(generated, context_source, "TOOL CONTEXT", "shared/tool_context.py")
             if name in TARGETS:
-                embedded = normalization_source if name == "lite_subagent_registry.py" else source
+                embedded = normalization_source if name in NORMALIZATION_TARGETS else source
                 generated = embed(generated, embedded, "SKILL PREPARATION", "shared/skill_preparation.py")
+            for region, (stage_source, targets) in STAGE_TARGETS.items():
+                if name in targets:
+                    generated = embed(generated, deployment_source(stage_source), region, stage_source)
         except ValueError as exc:
             parser.error(f"{name}: {exc}")
         if original != generated:
