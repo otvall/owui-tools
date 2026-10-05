@@ -104,6 +104,67 @@ class PreparedSkills:
 
 
 class SkillPreparation:
+    CONTEXT_PREFIX = "Skill context:\n"
+    LEGACY_CONTEXT_PREFIX = "Lite orchestrator Skill context:\n"
+
+    @staticmethod
+    def install_context(prepared: PreparedSkills, body: dict, runtime_model: dict) -> None:
+        """Replace the managed Skill context while preserving administrator instructions."""
+        messages = SkillPreparation._remove_previous_context(body["messages"])
+        SkillPreparation.install_loader(prepared, body, runtime_model)
+        metadata = body["metadata"]
+        metadata.setdefault("lite_view_skill_available", False)
+        metadata.setdefault("lite_view_skill_model_id", None)
+        prompt = prepared.context
+        if prepared.loader is not None:
+            prompt = (
+                "The following Skills are available on demand. Inspect their descriptions "
+                "and call view_skill for any Skill that may apply before following its full "
+                "instructions.\n\n" + prompt
+            )
+        body["messages"] = SkillPreparation._append_system_context(messages, prompt)
+
+    @staticmethod
+    def _remove_previous_context(messages: list[dict]) -> list[dict]:
+        cleaned = []
+        for original in messages:
+            content = original.get("content")
+            if original.get("role") != "system" or not isinstance(content, str):
+                cleaned.append(original)
+                continue
+            before = None
+            for prefix in (SkillPreparation.CONTEXT_PREFIX, SkillPreparation.LEGACY_CONTEXT_PREFIX):
+                if content.startswith(prefix):
+                    before = ""
+                    break
+                separator = "\n\n" + prefix
+                if separator in content:
+                    before = content.rsplit(separator, 1)[0].rstrip()
+                    break
+            if before is None:
+                cleaned.append(original)
+                continue
+            if before:
+                message = dict(original)
+                message["content"] = before
+                cleaned.append(message)
+        return cleaned
+
+    @staticmethod
+    def _append_system_context(messages: list[dict], prompt: str) -> list[dict]:
+        if not prompt:
+            return messages
+        block = SkillPreparation.CONTEXT_PREFIX + prompt
+        for index, original in enumerate(messages):
+            if original.get("role") == "system":
+                message = dict(original)
+                content = str(message.get("content") or "").rstrip()
+                message["content"] = f"{content}\n\n{block}" if content else block
+                messages[index] = message
+                return messages
+        messages.insert(0, {"role": "system", "content": block})
+        return messages
+
     @staticmethod
     def install_loader(prepared: PreparedSkills, body: dict, runtime_model: dict) -> None:
         metadata = body["metadata"]
