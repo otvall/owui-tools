@@ -8,12 +8,12 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
-TARGETS = ("lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py")
+TARGETS = ("lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py", "subagent_preparation.py")
 RUNTIME_TARGETS = TARGETS + (
     "previous_tool_context.py", "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
 )
-HISTORY_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py", "previous_tool_context.py")
-CONTEXT_TARGETS = ("tool_call_filter.py", "subagent_context.py")
+HISTORY_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py", "previous_tool_context.py", "subagent_preparation.py")
+CONTEXT_TARGETS = ("tool_call_filter.py", "subagent_context.py", "subagent_preparation.py")
 
 
 def embed(original: str, source: str, region: str, source_name: str) -> str:

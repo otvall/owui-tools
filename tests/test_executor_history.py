@@ -337,7 +337,7 @@ class ExecutorHistoryTests(PipeTestCase):
             raise RuntimeError("preparation failed")
 
         # An additional installed filter may fail after the real history filters.
-        self.filters.insert(2, SimpleNamespace(inlet=fail))
+        self.filters.append(SimpleNamespace(inlet=fail))
         with self.assertRaisesRegex(RuntimeError, "preparation failed"):
             await self.invoke(source)
 
@@ -347,7 +347,7 @@ class ExecutorHistoryTests(PipeTestCase):
         self.assertEqual(history, saved_history)
         self.assertIs(self.metadata["tools"], tools)
         self.assertEqual(tools, saved_tools)
-        self.filters.pop(2)
+        self.filters.pop()
         await self.invoke(source)
         self.assertEqual(self.routed["messages"], saved_history)
 

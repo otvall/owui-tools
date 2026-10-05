@@ -1,6 +1,6 @@
 """
-title: Skill Context
-description: Builds Skill context and adds the allowlisted view_skill builtin when available.
+title: Subagent Preparation
+description: Projects eligible Tool history, applies common history limits and installs prepared Skills for Router destinations.
 version: 0.21.0
 required_open_webui_version: 0.11.1
 """
@@ -9,17 +9,7 @@ from __future__ import annotations
 
 import logging
 
-from open_webui.models.skills import Skills
-from open_webui.utils.tools import get_builtin_tools
 from pydantic import BaseModel, Field
-
-log = logging.getLogger(__name__)
-
-PROMPT_PREFIX = "Skill context:\n"
-LEGACY_PROMPT_PREFIX = "Lite orchestrator Skill context:\n"
-APPLIED_KEY = "skill_context_applied"
-PIPELINE_KEY = "lite_subagent_filter_pipeline"
-
 
 # BEGIN GENERATED REQUEST RUNTIME
 # Edit shared/request_runtime.py; run python3 tools/generate_skill_preparation.py
@@ -421,6 +411,426 @@ class RequestRuntime:
         )
 # END GENERATED REQUEST RUNTIME
 
+# BEGIN GENERATED TOOL HISTORY
+# Edit shared/tool_history.py; run python3 tools/generate_skill_preparation.py
+"""Interpret completed Tool history before consumers select or format it."""
+
+import json
+from dataclasses import dataclass
+from typing import Any
+
+
+
+def _agent_registry(registry: dict | None) -> dict:
+    if not isinstance(registry, dict):
+        return {}
+    return {
+        str(agent_id or "").strip(): config
+        for agent_id, config in registry.items()
+        if str(agent_id or "").strip() and isinstance(config, dict)
+        and str(config.get("model_id") or "").strip()
+    }
+
+
+def _resolve_agent_id(value: str | None, agents: dict) -> str | None:
+    if value in agents:
+        return value
+    matches = [
+        agent_id for agent_id, config in agents.items()
+        if value and str(config.get("routing_skill_id") or "").strip() == value
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+def resolve_agent_id(value: str | None, registry: dict) -> str | None:
+    """Resolve a direct ID or an unambiguous accepted routing Skill alias."""
+    return _resolve_agent_id(value, _agent_registry(registry))
+
+
+def parse_handoff(value: Any) -> str | None:
+    """Read a v2 destination without deciding whether it is available."""
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value.strip())
+            if isinstance(value, str):
+                value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict) or value.get("__lite_delegate__") != "v2":
+        return None
+    return str(value.get("agent_id") or "").strip() or None
+
+
+@dataclass(frozen=True)
+class ToolExecutor:
+    kind: str
+    agent_id: str | None = None
+    declared_agent_id: str | None = None
+    model_id: str | None = None
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class HandoffEvidence:
+    declared_agent_id: str
+    agent_id: str | None
+
+
+@dataclass(frozen=True)
+class ToolExchange:
+    message_index: int
+    call_index: int
+    result_index: int
+    executor: ToolExecutor
+    handoff: HandoffEvidence | None = None
+
+
+@dataclass(frozen=True)
+class ToolHistory:
+    """Immutable facts whose indices refer to the unmodified input history."""
+
+    user_indices: tuple[int, ...]
+    exchanges: tuple[ToolExchange, ...]
+
+    @property
+    def current_user_index(self) -> int:
+        return self.user_indices[-1] if self.user_indices else -1
+
+    @property
+    def current_handoff(self) -> str | None:
+        return next(
+            (
+                exchange.handoff.declared_agent_id
+                for exchange in reversed(self.exchanges)
+                if exchange.message_index > self.current_user_index
+                and exchange.handoff is not None
+            ),
+            None,
+        )
+
+
+def _completed_exchanges(messages: list[dict]) -> list[tuple[int, int, int]]:
+    """Match only within one assistant execution batch in one user request.
+
+    OWUI may group several sequential executions into one assistant message.
+    Unique IDs can still correlate those calls with their ordered results. Reused
+    IDs within that batch are ambiguous; a later batch cannot complete an earlier
+    one. Identical repeated results represent one exchange, conflicting ones none.
+    """
+    exchanges: list[tuple[int, int, int]] = []
+    calls: dict[str, list[tuple[int, int]]] = {}
+    results: dict[str, list[int]] = {}
+
+    def finish_batch() -> None:
+        for call_id, occurrences in calls.items():
+            matching_results = results.get(call_id, [])
+            if len(occurrences) != 1 or not matching_results:
+                continue
+            first_result = matching_results[0]
+            if any(messages[index] != messages[first_result] for index in matching_results[1:]):
+                continue
+            message_index, call_index = occurrences[0]
+            exchanges.append((message_index, call_index, first_result))
+        calls.clear()
+        results.clear()
+
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role == "assistant" or (role == "user" and not RequestRuntime.is_tool_image_message(message)):
+            finish_batch()
+        if role == "assistant":
+            for call_index, call in enumerate(message.get("tool_calls") or []):
+                call_id = call.get("id")
+                if isinstance(call_id, str) and call_id:
+                    calls.setdefault(call_id, []).append((index, call_index))
+        elif role == "tool":
+            call_id = message.get("tool_call_id")
+            if isinstance(call_id, str) and call_id in calls:
+                results.setdefault(call_id, []).append(index)
+    finish_batch()
+    return exchanges
+
+
+def analyze_history(messages: list[dict], *, registry: dict | None = None) -> ToolHistory:
+    """Pair and attribute exchanges in Tool Result order without changing input.
+
+    None means standalone execution: every executor stays model. A supplied
+    Registry, even empty, enables Router attribution. Missing or ambiguous
+    destinations remain Handoff evidence, but cannot prove a subagent executor.
+    """
+    if not isinstance(messages, list):
+        raise TypeError("Tool history messages must be a list")
+    if registry is not None and not isinstance(registry, dict):
+        raise TypeError("Tool history Registry must be an object")
+
+    agents = _agent_registry(registry)
+    pairs = _completed_exchanges(messages)
+    by_result = {result_index: (message_index, call_index) for message_index, call_index, result_index in pairs}
+    completed_calls = {(message_index, call_index) for message_index, call_index, _ in pairs}
+    root_executor = ToolExecutor("model" if registry is None else "orchestrator")
+    executor = root_executor
+    uncertain_batch = False
+    user_indices: list[int] = []
+    exchanges: list[ToolExchange] = []
+
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role == "user" and not RequestRuntime.is_tool_image_message(message):
+            user_indices.append(index)
+            executor = root_executor
+            uncertain_batch = False
+        if role == "assistant":
+            uncertain_batch = any(
+                (call.get("function") or {}).get("name") == "lite_delegate"
+                and (index, call_index) not in completed_calls
+                for call_index, call in enumerate(message.get("tool_calls") or [])
+            )
+            if registry is not None and uncertain_batch:
+                # An unpaired delegate has no trustworthy transition position.
+                executor = ToolExecutor("unknown")
+
+        pair = by_result.get(index)
+        if pair is None:
+            continue
+        message_index, call_index = pair
+        call = messages[message_index]["tool_calls"][call_index]
+        is_delegate = (call.get("function") or {}).get("name") == "lite_delegate"
+        declared_id = parse_handoff(message.get("content")) if is_delegate else None
+        agent_id = _resolve_agent_id(declared_id, agents) if declared_id is not None else None
+        handoff = HandoffEvidence(declared_id, agent_id) if declared_id is not None else None
+        exchanges.append(ToolExchange(message_index, call_index, index, executor, handoff))
+
+        # The delegate exchange itself belongs to the preceding executor.
+        if registry is not None and is_delegate:
+            if uncertain_batch or agent_id is None:
+                executor = ToolExecutor("unknown", declared_agent_id=declared_id)
+            else:
+                config = agents[agent_id]
+                executor = ToolExecutor(
+                    "subagent", agent_id=agent_id, declared_agent_id=declared_id,
+                    model_id=str(config.get("model_id") or "").strip(),
+                    name=str(config.get("name") or agent_id),
+                )
+
+    return ToolHistory(tuple(user_indices), tuple(exchanges))
+# END GENERATED TOOL HISTORY
+
+# BEGIN GENERATED TOOL CONTEXT
+# Edit shared/tool_context.py; run python3 tools/generate_skill_preparation.py
+"""Select and reconstruct Tool context for independently uploaded Filters."""
+
+import copy
+from dataclasses import dataclass
+
+
+
+@dataclass(frozen=True)
+class AvailableToolContext:
+    messages: list[dict]
+    allowed_tool_names: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _CompletedTurn:
+    start: int
+    end: int
+    final_answer: int
+
+
+@dataclass(frozen=True)
+class _ContextSelection:
+    exchanges: tuple[ToolExchange, ...]
+    current_user: int
+    handoff_end: int = -1
+    # None selects available Tools; a tuple selects completed historical turns.
+    turns: tuple[_CompletedTurn, ...] | None = None
+
+
+def _visible_assistant(message: dict) -> bool:
+    content = message.get("content")
+    return bool(
+        (content.strip() if isinstance(content, str) else content)
+        or message.get("tool_calls")
+        or message.get("reasoning_content")
+        or message.get("thinking")
+    )
+
+
+def _render_context(messages: list[dict], selection: _ContextSelection) -> list[dict]:
+    """Emit selected occurrences in source order with two fixed text profiles.
+
+    Available-Tools selection preserves ordinary messages and assistant fields.
+    Historical selection emits only chosen questions, final answers and minimal
+    Tool messages, then copies the whole current continuation without filtering.
+    """
+    selected_calls = {(item.message_index, item.call_index) for item in selection.exchanges}
+    selected_results = {item.result_index for item in selection.exchanges}
+    historical = selection.turns is not None
+    current_user = selection.current_user
+    marker_index = selection.handoff_end
+    questions = {turn.start for turn in selection.turns or ()}
+    answers = {turn.final_answer for turn in selection.turns or ()}
+    message_indices = (
+        (index for turn in selection.turns or () for index in range(turn.start, turn.end))
+        if historical else range(len(messages))
+    )
+    recovered_calls = [
+        messages[item.message_index]["tool_calls"][item.call_index]
+        for item in sorted(selection.exchanges, key=lambda item: (item.message_index, item.call_index))
+        if current_user < item.message_index < marker_index
+    ]
+    rendered = (
+        [copy.deepcopy(message) for message in messages[:current_user] if message.get("role") == "system"]
+        if historical else []
+    )
+
+    for index in message_indices:
+        original = messages[index]
+        if not historical and current_user < index <= marker_index:
+            # OWUI may group child calls before the selected Handoff result.
+            if index == marker_index and recovered_calls:
+                rendered.append({"role": "assistant", "content": "", "tool_calls": recovered_calls})
+            continue
+
+        role = original.get("role")
+        if role == "assistant" and original.get("tool_calls"):
+            kept = [
+                call for call_index, call in enumerate(original["tool_calls"])
+                if (index, call_index) in selected_calls
+            ]
+            if historical:
+                if kept:
+                    rendered.append({
+                        "role": "assistant", "content": "",
+                        "tool_calls": [copy.deepcopy(call) for call in kept],
+                    })
+            else:
+                message = dict(original)
+                message["tool_calls"] = kept
+                if not kept:
+                    if index < current_user:
+                        # Excluded Tool narration must not become a final answer.
+                        continue
+                    message.pop("tool_calls", None)
+                    message.pop("reasoning_items", None)
+                if _visible_assistant(message):
+                    rendered.append(message)
+        elif role == "tool":
+            if index in selected_results:
+                rendered.append(copy.deepcopy(original) if historical else original)
+        elif historical:
+            if index in questions and role == "user":
+                rendered.append(copy.deepcopy(original))
+            elif index in answers:
+                rendered.append({"role": "assistant", "content": copy.deepcopy(original.get("content"))})
+        else:
+            rendered.append(original)
+
+    if historical:
+        rendered.extend(copy.deepcopy(messages[current_user:]))
+    return rendered
+
+
+class ToolContextProjection:
+    """Two pure transformations; neither retains state or changes its input.
+
+    Each operation analyzes its own input. Occurrence indices never escape this
+    module or survive a transformation of the messages they refer to.
+    """
+
+    @staticmethod
+    def available_tools(body: dict) -> AvailableToolContext:
+        """Select completed exchanges allowed by the current model context.
+
+        The inlet adapter validates the body first. Read its Tool schemas and
+        metadata without changing either; retain current copy/field semantics.
+        """
+        metadata = body.get("metadata", {})
+        messages = body["messages"]
+        allowed_names = {
+            str(((schema or {}).get("function") or {}).get("name") or "").strip()
+            for schema in body.get("tools") or []
+        }
+        allowed_names.update(str(name or "").strip() for name in (metadata.get("tools") or {}))
+        if (
+            metadata.get("lite_view_skill_available")
+            and metadata.get("lite_view_skill_model_id") == metadata.get("lite_target_model_id")
+        ):
+            allowed_names.add("view_skill")
+        allowed_names.discard("")
+        registry = metadata.get("lite_agents")
+        registry = registry if isinstance(registry, dict) else {}
+        target_agent = str(metadata.get("lite_target_agent_id") or "").strip()
+        history = analyze_history(messages, registry=registry)
+        current_user = history.current_user_index
+        selected_agent = resolve_agent_id(target_agent, registry)
+        marker_index = -1
+        if current_user >= 0 and target_agent:
+            for exchange in history.exchanges:
+                if exchange.message_index <= current_user or exchange.handoff is None:
+                    continue
+                destination = exchange.handoff.agent_id if registry else exchange.handoff.declared_agent_id
+                if destination and destination == (selected_agent or target_agent):
+                    marker_index = max(marker_index, exchange.result_index)
+
+        accepted = []
+        for exchange in history.exchanges:
+            call = messages[exchange.message_index]["tool_calls"][exchange.call_index]
+            name = str((call.get("function") or {}).get("name") or "").strip()
+            if name not in allowed_names:
+                continue
+            if registry and target_agent and exchange.executor.kind == "unknown":
+                continue
+            if exchange.message_index < current_user:
+                if target_agent and (
+                    name == "lite_delegate" or exchange.executor.kind != "subagent"
+                    or exchange.executor.agent_id != selected_agent
+                ):
+                    continue
+            elif exchange.result_index <= marker_index:
+                continue
+            accepted.append(exchange)
+
+        selection = _ContextSelection(tuple(accepted), current_user, marker_index)
+        return AvailableToolContext(_render_context(messages, selection), frozenset(allowed_names))
+
+    @staticmethod
+    def completed_history(
+        messages: list[dict], *, history_turns: int, history_tool_calls: int,
+    ) -> list[dict]:
+        """Limit past completed turns and exchanges without limiting the current request.
+
+        Counts are nonnegative, as enforced by the inlet Valves. This operation
+        also works without available-Tools selection having run beforehand.
+        """
+        history = analyze_history(messages)
+        indices = history.user_indices
+        if not indices:
+            return list(messages)
+
+        completed = []
+        for start, end in zip(indices[:-1], indices[1:]):
+            final_answer = next(
+                (
+                    index for index in range(end - 1, start - 1, -1)
+                    if messages[index].get("role") == "assistant"
+                    and messages[index].get("content")
+                    and not messages[index].get("tool_calls")
+                ),
+                -1,
+            )
+            if final_answer >= 0:
+                completed.append(_CompletedTurn(start, end, final_answer))
+        turns = tuple(completed[-history_turns:]) if history_turns else ()
+        exchanges = [
+            exchange for exchange in history.exchanges
+            if any(turn.start <= exchange.message_index < exchange.result_index < turn.end for turn in turns)
+        ]
+        exchanges = exchanges[-history_tool_calls:] if history_tool_calls else []
+        selection = _ContextSelection(tuple(exchanges), indices[-1], turns=turns)
+        return _render_context(messages, selection)
+# END GENERATED TOOL CONTEXT
+
 # BEGIN GENERATED SKILL PREPARATION
 # Edit shared/skill_preparation.py; run python3 tools/generate_skill_preparation.py
 """Authoritative Skill preparation, embedded into independently uploaded Functions."""
@@ -680,80 +1090,63 @@ class SkillPreparation:
         return PreparedSkills(ids, context, loader)
 # END GENERATED SKILL PREPARATION
 
+log = logging.getLogger(__name__)
+
+
 class Filter:
     class Valves(BaseModel):
-        priority: int = Field(
-            default=-10,
-            description="Run after Tool Call Filter and Subagent Context.",
+        priority: int = Field(default=-30, description="Order relative to additional destination inlet filters.")
+        history_turns: int = Field(
+            default=0, ge=0,
+            description="Completed previous user/assistant turns to retain for every attached subagent.",
+        )
+        history_tool_calls: int = Field(
+            default=0, ge=0,
+            description="Maximum completed Tool call occurrences inside retained previous turns; repeated IDs count separately.",
         )
         debug: bool = Field(default=False, description="Enable debug logs.")
 
     def __init__(self):
         self.valves = self.Valves()
 
-    def _debug(self, message: str, *args) -> None:
-        if self.valves.debug:
-            log.warning("[SKILL_CONTEXT] " + message, *args)
-
     async def inlet(
-        self,
-        body: dict,
-        __request__=None,
-        __user__=None,
-        __model__=None,
-        __event_emitter__=None,
-        __event_call__=None,
-        __oauth_token__=None,
-        __prepared_skills__=None,
+        self, body: dict, __request__=None, __model__=None,
+        __prepared_skills__: PreparedSkills | None = None,
     ) -> dict:
-        if __request__ is None:
-            raise ValueError("Skill Context requires __request__")
         metadata = body.setdefault("metadata", {})
         if not isinstance(metadata, dict):
-            raise TypeError("Skill Context metadata must be an object")
+            raise TypeError("Subagent Preparation metadata must be an object")
         messages = body.get("messages")
         if not isinstance(messages, list):
-            raise TypeError("Skill Context messages must be a list")
+            raise TypeError("Subagent Preparation messages must be a list")
+        if __request__ is None or not metadata.get("lite_subagent_filter_run") or __prepared_skills__ is None:
+            raise ValueError("Subagent Preparation requires Router destination inlet preparation")
+        runtime = RequestRuntime(__request__, metadata)
 
-        RequestRuntime(__request__, metadata).before_filter("skill_context")
+        runtime.before_filter("tool_call_filter")
+        projection = ToolContextProjection.available_tools(body)
+        body["messages"] = projection.messages
+        runtime.finish_filter("tool_call_filter")
 
+        runtime.before_filter("subagent_context")
+        body["messages"] = ToolContextProjection.completed_history(
+            body["messages"], history_turns=self.valves.history_turns,
+            history_tool_calls=self.valves.history_tool_calls,
+        )
+        runtime.finish_filter("subagent_context")
+
+        runtime.before_filter("skill_context")
         model_id = str(body.get("model") or "").strip()
         runtime_model = (
-            __model__
-            if isinstance(__model__, dict)
+            __model__ if isinstance(__model__, dict)
             else __request__.app.state.MODELS.get(model_id) or {"id": model_id}
         )
-        if metadata.get("lite_subagent_filter_run"):
-            # Router has already read the child's current database attachments.
-            # An empty selection is authoritative even when runtime metadata is stale.
-            skill_ids = metadata.get("lite_target_skill_ids") or []
-        else:
-            model_meta = (runtime_model.get("info") or {}).get("meta") or {}
-            skill_ids = [
-                *(body.get("skill_ids") or []),
-                *(model_meta.get("skillIds") or []),
-                *(metadata.get("lite_orchestrator_skill_ids") or []),
-            ]
-
-        if metadata.get("lite_subagent_filter_run") and __prepared_skills__ is not None:
-            prepared = __prepared_skills__
-        else:
-            async def resolve_skill_user():
-                return __user__ if isinstance(__user__, dict) else {}
-
-            skill_loader = BuiltinSkillLoader(
-                invocation=SkillBuiltinInvocation(
-                    profile="standalone", request=__request__, runtime_model=runtime_model,
-                    metadata=metadata, event_emitter=__event_emitter__, event_call=__event_call__,
-                    oauth_token=__oauth_token__,
-                ),
-                get_builtin_tools=get_builtin_tools, resolve_user=resolve_skill_user,
+        SkillPreparation.install_context(__prepared_skills__, body, runtime_model)
+        runtime.finish_filter("skill_context")
+        if self.valves.debug:
+            log.warning(
+                "[SUBAGENT_PREPARATION] model=%s allowed=%s turns=%s tools=%s messages before=%s after=%s",
+                model_id, sorted(projection.allowed_tool_names), self.valves.history_turns,
+                self.valves.history_tool_calls, len(messages), len(body["messages"]),
             )
-            prepared = await SkillPreparation.prepare(
-                skill_ids=skill_ids, runtime_model=runtime_model, metadata=metadata,
-                lookup_skill=Skills.get_skill_by_id, load_builtin=skill_loader.load,
-            )
-        SkillPreparation.install_context(prepared, body, runtime_model)
-        RequestRuntime(__request__, metadata).finish_filter("skill_context")
-        self._debug("model=%s Skill count=%s", model_id, len(prepared.ids))
         return body
