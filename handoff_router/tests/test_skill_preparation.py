@@ -177,6 +177,8 @@ class SkillBehavior:
         self.assertNotIn("alpha", self.prompt())
         self.assertNotIn("view_skill", self.metadata["tools"])
         self.skills.assert_not_awaited()
+        if self.path == "child":
+            self.assertFalse(any(m["role"] == "system" for m in self.body["messages"]))
 
     async def test_foreign_loader_schema_is_rejected(self):
         foreign_schema = {"type": "function", "function": {"name": "view_skill", "description": "foreign"}}
@@ -209,7 +211,8 @@ class SkillBehavior:
         await self.prepare()
         self.assertIsNot(self.metadata["tools"]["view_skill"]["callable"], earlier)
         self.assertEqual(self.prompt().count("<available_skills>"), 1)
-        self.assertIn("specialist selected" if self.path == "child" else "Administrator prompt", self.prompt())
+        if self.path != "child":
+            self.assertIn("Administrator prompt", self.prompt())
         if self.path == "orchestrator":
             self.assertIn("Load a relevant routing Skill before calling lite_delegate", self.prompt())
 

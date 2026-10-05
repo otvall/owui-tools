@@ -160,6 +160,10 @@ payload только сообщения, request metadata и параметры 
 `base_model_id`, inference params и системный промпт сабагента затем штатно
 применяются провайдерным обработчиком Open WebUI.
 
+Router не добавляет сабагенту поведенческий системный промпт. Постоянные
+инструкции задаются в Workspace Model сабагента; подготовка добавляет только
+необходимые Knowledge и Skill context.
+
 Подготовщик отдельно подключает выбранные в карточке сабагента Tools, MCP и
 builtin Tools. Для Web Search, Image Generation, Code Interpreter и
 Memory дополнительно учитываются features текущего запроса, глобальные настройки

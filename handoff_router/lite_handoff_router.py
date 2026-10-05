@@ -1544,18 +1544,11 @@ class ChildRequestBuilder:
         capabilities = child.capabilities
         child_skill_ids = capabilities.skill_ids
         child_messages = copy.deepcopy(source_messages)
-        child_messages.insert(
-            0,
-            {
-                "role": "system",
-                "content": self._system_prompt(
-                    ModelCapabilityResolver.knowledge_context(
-                        runtime_model,
-                        runtime.metadata,
-                    ),
-                ),
-            },
+        workspace_context = ModelCapabilityResolver.knowledge_context(
+            runtime_model, runtime.metadata,
         )
+        if workspace_context:
+            child_messages.insert(0, {"role": "system", "content": workspace_context})
         routed_body["messages"] = child_messages
         routed_body["model"] = agent.model_id
         runtime.bind_tools(capabilities.tools, capabilities.tool_ids, replace=True)
@@ -1604,22 +1597,6 @@ class ChildRequestBuilder:
         )
         prepared.body = routed_body
         return routed_body, agent
-
-    @staticmethod
-    def _system_prompt(workspace_context: str = "") -> str:
-        prompt = (
-            "You are the specialist selected by an orchestrator.\n"
-            "Execute the delegated task directly and completely.\n"
-            "Continue the current assistant response as if the user had asked you directly.\n"
-            "Do not tell the user that the task was delegated.\n"
-            "Do not discuss routing, handoff, orchestrators, or internal agents.\n"
-            "Use your available tools whenever necessary.\n"
-            "Follow the supplied Skill instructions. "
-        )
-        if workspace_context:
-            prompt += "\n\n" + workspace_context
-        return prompt
-
 
 class CompletionGateway:
     @staticmethod
