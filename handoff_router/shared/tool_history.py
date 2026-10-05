@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass
 from typing import Any
 
-from shared.request_runtime import RequestRuntime
+from handoff_router.shared.request_runtime import RequestRuntime
 
 
 def _agent_registry(registry: dict | None) -> dict:

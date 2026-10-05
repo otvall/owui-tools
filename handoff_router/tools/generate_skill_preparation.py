@@ -26,7 +26,7 @@ def deployment_source(path: str) -> str:
     """Local imports are satisfied by earlier embedded regions."""
     return "\n".join(
         line for line in (ROOT / path).read_text().splitlines()
-        if not line.startswith("from shared.") and line != "from __future__ import annotations"
+        if not line.startswith("from handoff_router.shared.") and line != "from __future__ import annotations"
     ) + "\n"
 
 
@@ -37,7 +37,7 @@ def embed(original: str, source: str, region: str, source_name: str) -> str:
         raise ValueError(f"expected exactly one generated {region} region")
     before, remainder = original.split(begin)
     _old_block, after = remainder.split(end)
-    block = begin + f"# Edit {source_name}; run python3 tools/generate_skill_preparation.py\n" + source.rstrip() + "\n" + end
+    block = begin + f"# Edit handoff_router/{source_name}; run python3 handoff_router/tools/generate_skill_preparation.py\n" + source.rstrip() + "\n" + end
     return before + block + after
 
 

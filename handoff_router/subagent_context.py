@@ -12,7 +12,7 @@ import logging
 from pydantic import BaseModel, Field
 
 # BEGIN GENERATED REQUEST RUNTIME
-# Edit shared/request_runtime.py; run python3 tools/generate_skill_preparation.py
+# Edit handoff_router/shared/request_runtime.py; run python3 handoff_router/tools/generate_skill_preparation.py
 """Authoritative local request lifecycle for independently uploaded Functions."""
 
 
@@ -413,7 +413,7 @@ class RequestRuntime:
 # END GENERATED REQUEST RUNTIME
 
 # BEGIN GENERATED TOOL HISTORY
-# Edit shared/tool_history.py; run python3 tools/generate_skill_preparation.py
+# Edit handoff_router/shared/tool_history.py; run python3 handoff_router/tools/generate_skill_preparation.py
 """Interpret completed Tool history before consumers select or format it."""
 
 import json
@@ -617,7 +617,7 @@ def analyze_history(messages: list[dict], *, registry: dict | None = None) -> To
 # END GENERATED TOOL HISTORY
 
 # BEGIN GENERATED TOOL CONTEXT
-# Edit shared/tool_context.py; run python3 tools/generate_skill_preparation.py
+# Edit handoff_router/shared/tool_context.py; run python3 handoff_router/tools/generate_skill_preparation.py
 """Select and reconstruct Tool context for independently uploaded Filters."""
 
 import copy

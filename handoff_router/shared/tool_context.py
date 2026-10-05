@@ -3,7 +3,7 @@
 import copy
 from dataclasses import dataclass
 
-from shared.tool_history import ToolExchange, analyze_history, resolve_agent_id
+from handoff_router.shared.tool_history import ToolExchange, analyze_history, resolve_agent_id
 
 
 @dataclass(frozen=True)

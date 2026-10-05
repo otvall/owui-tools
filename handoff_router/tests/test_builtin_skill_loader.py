@@ -4,7 +4,7 @@ import copy
 import unittest
 from unittest.mock import AsyncMock
 
-from shared.skill_preparation import BuiltinSkillLoader, SkillBuiltinInvocation
+from handoff_router.shared.skill_preparation import BuiltinSkillLoader, SkillBuiltinInvocation
 from test_capability_context import owui_callable, owui_refresh
 from test_handoff_history import router
 

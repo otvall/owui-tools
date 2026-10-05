@@ -1,6 +1,6 @@
 """History Cleanup stage shared by Router and standalone adapters."""
 
-from shared.request_runtime import RequestRuntime
+from handoff_router.shared.request_runtime import RequestRuntime
 
 is_tool_image_message = RequestRuntime.is_tool_image_message
 

@@ -4,7 +4,7 @@ import copy
 import json
 import unittest
 
-from shared.tool_history import analyze_history
+from handoff_router.shared.tool_history import analyze_history
 from test_handoff_history import assistant, call, marker, result
 from test_previous_turn_context import registry_metadata
 

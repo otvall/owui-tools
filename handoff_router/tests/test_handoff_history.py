@@ -1,6 +1,6 @@
 """Regression tests for OWUI's reconstructed tool history, without an OWUI server.
 
-Run: python3 -m unittest discover -s tests -v
+Run from the repository root: python3 -m unittest discover -s handoff_router/tests -v
 OWUI boundary adapters are stubbed; Pipe.pipe and the context filters run unmodified.
 The fixture was generated with v0.11.1's convert_output_to_messages(raw=True).
 """

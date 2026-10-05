@@ -29,7 +29,7 @@ from pydantic import BaseModel, Field
 from starlette.responses import Response, StreamingResponse
 
 # BEGIN GENERATED REQUEST RUNTIME
-# Edit shared/request_runtime.py; run python3 tools/generate_skill_preparation.py
+# Edit handoff_router/shared/request_runtime.py; run python3 handoff_router/tools/generate_skill_preparation.py
 """Authoritative local request lifecycle for independently uploaded Functions."""
 
 
@@ -430,7 +430,7 @@ class RequestRuntime:
 # END GENERATED REQUEST RUNTIME
 
 # BEGIN GENERATED TOOL HISTORY
-# Edit shared/tool_history.py; run python3 tools/generate_skill_preparation.py
+# Edit handoff_router/shared/tool_history.py; run python3 handoff_router/tools/generate_skill_preparation.py
 """Interpret completed Tool history before consumers select or format it."""
 
 import json
@@ -634,7 +634,7 @@ def analyze_history(messages: list[dict], *, registry: dict | None = None) -> To
 # END GENERATED TOOL HISTORY
 
 # BEGIN GENERATED SKILL PREPARATION
-# Edit shared/skill_preparation.py; run python3 tools/generate_skill_preparation.py
+# Edit handoff_router/shared/skill_preparation.py; run python3 handoff_router/tools/generate_skill_preparation.py
 """Authoritative Skill preparation, embedded into independently uploaded Functions."""
 
 import copy

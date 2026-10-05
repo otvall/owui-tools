@@ -3,7 +3,7 @@
 import copy
 import unittest
 
-from shared.tool_context import ToolContextProjection
+from handoff_router.shared.tool_context import ToolContextProjection
 
 
 def tool_call(call_id, name):

@@ -6,7 +6,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from shared.request_runtime import SkillLoaderOwnership
+from handoff_router.shared.request_runtime import SkillLoaderOwnership
 
 
 def normalize_skill_ids(values) -> list[str]:

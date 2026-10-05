@@ -10,8 +10,8 @@ from open_webui.models.models import Models
 from open_webui.models.skills import Skills
 from open_webui.models.users import Users
 from open_webui.utils.models import check_model_access
-from shared.request_runtime import RequestRuntime
-from shared.skill_preparation import normalize_skill_ids
+from handoff_router.shared.request_runtime import RequestRuntime
+from handoff_router.shared.skill_preparation import normalize_skill_ids
 
 
 def normalize_ids(values) -> list[str]:

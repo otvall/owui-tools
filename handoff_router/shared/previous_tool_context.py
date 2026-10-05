@@ -3,8 +3,8 @@
 import copy
 import json
 
-from shared.request_runtime import RequestRuntime
-from shared.tool_history import ToolHistory, analyze_history
+from handoff_router.shared.request_runtime import RequestRuntime
+from handoff_router.shared.tool_history import ToolHistory, analyze_history
 
 CONTEXT_PREFIX = "Previous request execution record (reference data):\n"
 GUIDANCE_PREFIX = "Previous Tool context guidance:\n"
