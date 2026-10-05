@@ -18,6 +18,25 @@ class ExecutorHistoryTests(PipeTestCase):
         self.context_filter.valves.history_turns = 2
         self.context_filter.valves.history_tool_calls = 5
 
+    async def test_current_unknown_executor_exchanges_are_excluded_from_child_history(self):
+        await self.invoke([
+            {"role": "user", "content": "Current question"},
+            assistant(call("to-a", "lite_delegate", agent_id="agent-a")), result("to-a", marker()),
+            assistant(call("known", "lookup")), result("known", "KNOWN_A_RESULT"),
+            assistant(call("unfinished", "lite_delegate", agent_id="agent-b"), call("unknown", "lookup")),
+            result("unknown", "UNKNOWN_EXECUTOR_RESULT"),
+        ])
+
+        self.assertEqual({
+            "model": self.routed["model"],
+            "calls": [c for m in self.routed["messages"] for c in m.get("tool_calls", [])],
+            "results": [m for m in self.routed["messages"] if m["role"] == "tool"],
+        }, {
+            "model": "agent-a",
+            "calls": [call("known", "lookup")],
+            "results": [result("known", "KNOWN_A_RESULT")],
+        })
+
     async def test_reference_record_keeps_unknown_work_while_child_history_excludes_it(self):
         source = [
             {"role": "user", "content": "Old question"},

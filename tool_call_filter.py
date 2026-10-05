@@ -1,7 +1,7 @@
 """
 title: Tool Call Filter
 description: Keeps unambiguous completed Tool call occurrences permitted for the destination model.
-version: 0.20.0
+version: 0.20.1
 required_open_webui_version: 0.11.1
 """
 
@@ -686,6 +686,8 @@ class Filter:
             call = messages[exchange.message_index]["tool_calls"][exchange.call_index]
             name = str((call.get("function") or {}).get("name") or "").strip()
             if name not in allowed_names:
+                continue
+            if registry and target_agent_id and exchange.executor.kind == "unknown":
                 continue
             if exchange.message_index < current_user:
                 if target_agent_id and (
