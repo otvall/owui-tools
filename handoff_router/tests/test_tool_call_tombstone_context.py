@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2] / "optional_filters"
 SPEC = importlib.util.spec_from_file_location(
     "tool_call_tombstone_context_tests",
     ROOT / "tool_call_tombstone_context.py",

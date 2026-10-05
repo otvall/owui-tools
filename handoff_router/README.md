@@ -2,9 +2,10 @@
 
 Версия комплекта: **0.21.0**.
 
-Все файлы комплекта находятся в `handoff_router/`:
+Актуальный комплект состоит из **одного Pipe, двух фильтров и одного Tool**.
+Все четыре готовых Function-файла находятся в корне `handoff_router/`.
+Подкаталоги нужны для разработки:
 
-- `.py`-файлы в корне этой папки — готовые Functions для загрузки в Open WebUI.
 - `shared/` — общие исходники, встроенные генератором в готовые Functions.
 - `tools/` — генератор.
 - `tests/` — регрессии и fixtures.
@@ -19,17 +20,10 @@ Pipe отвечает за runtime-маршрутизацию и capabilities в
 
 | Файл | Тип Function | Назначение |
 |---|---|---|
-| `lite_delegate.py` | Tool | Возвращает маркер выбора сабагента |
-| `router_preparation.py` | Filter | Готовит реестр, исходную Tool history, справочную запись и очистку Router |
-| `lite_subagent_registry.py` | Filter | Прежний отдельный адаптер реестра |
-| `previous_tool_context.py` | Filter | Добавляет любой модели строковую запись Tool Calls предыдущего запроса |
-| `history_cleanup.py` | Filter | Удаляет прошлые нативные Tool Calls из контекста любой модели |
-| `tool_call_tombstone_context.py` | Filter | Обрезает обычный чат, сохраняя минимальные пары с использованными Tool Call ID |
-| `subagent_preparation.py` | Filter | Подготавливает Tool history, общие лимиты истории и Skill context всех сабагентов |
-| `tool_call_filter.py` | Filter | Оставляет только Tool Calls, доступные модели адресата |
-| `subagent_context.py` | Filter | Ограничивает прошлые пары сообщений и Tool Calls |
-| `skill_context.py` | Filter | Строит Skill-контекст и подключает `view_skill` |
-| `lite_handoff_router.py` | Pipe | Выбирает модель, запускает её фильтры и ведёт текущий handoff |
+| [lite_handoff_router.py](lite_handoff_router.py) | Pipe | Выбирает модель, запускает её фильтры и ведёт текущий Handoff |
+| [router_preparation.py](router_preparation.py) | Filter | Готовит реестр, исходную Tool history, справочную запись и очистку Router |
+| [subagent_preparation.py](subagent_preparation.py) | Filter | Подготавливает Tool history, общие лимиты истории и Skill context всех сабагентов |
+| [lite_delegate.py](lite_delegate.py) | Tool | Возвращает маркер выбора сабагента |
 
 Все файлы самостоятельны: при установке в Open WebUI они не импортируют друг
 друга как Python-модули. Фильтры обмениваются только request-scoped значениями
@@ -37,10 +31,10 @@ Pipe отвечает за runtime-маршрутизацию и capabilities в
 
 ## Установка обновления
 
-1. Загрузите Router Preparation из `router_preparation.py` и Subagent Preparation
-   из `subagent_preparation.py`. Обновите
-   `lite_handoff_router.py`, `tool_call_filter.py`, `subagent_context.py` и
-   `skill_context.py`. Сохраните установленный Tool `lite_delegate`.
+1. Загрузите Router Preparation из `router_preparation.py`, Subagent Preparation
+   из `subagent_preparation.py` и Pipe из `lite_handoff_router.py`.
+   Установите Tool из `lite_delegate.py` или сохраните уже установленный
+   `lite_delegate`.
 2. Прикрепите к публичной Router Workspace Model **Router Preparation** вместо
    **Lite Subagent Registry, Previous Tool Context и History Cleanup**. Снимите
    все три прежних attachment-а на Router, включая global attachments.
@@ -92,9 +86,8 @@ Subagent Preparation, Pipe и delegate Tool. Предварительная пр
 новых и прежних attachments и полный migration deliverable остаются отдельной
 задачей: здесь замените соответствующие attachments вручную по указанным ролям.
 
-Previous Tool Context и History Cleanup остаются самостоятельными: на обычной
-модели Registry не требуется. При совместном использовании сначала запускайте
-Previous Tool Context, затем History Cleanup.
+Самостоятельные фильтры для обычных моделей и прежние адаптеры находятся
+в [отдельном каталоге `optional_filters/`](../optional_filters/README.md).
 
 ## Поток запроса
 
@@ -122,53 +115,6 @@ Previous Tool Context, затем History Cleanup.
 не запускается. На новом сообщении пользователя её стадия Registry сбрасывает прежнее
 свидетельство, поэтому пропущенный фильтр не может использовать успех прошлого
 запроса.
-
-`skill_context.py` подключать к Router Model не нужно. Он остаётся самостоятельным
-и может применяться к обычным моделям без Lite Handoff Router.
-
-## Самостоятельное использование контекстных фильтров
-
-`previous_tool_context.py` и `history_cleanup.py` можно прикрепить к
-любой Workspace Model. Registry, Orchestrator Skills и Router Pipe для этого не
-нужны. Если нужны одновременно строковая запись и очистка нативной истории,
-прикрепите оба фильтра с priorities `-90` и `-80` соответственно.
-
-Previous Tool Context добавит перед текущим запросом обычное сообщение
-`assistant` с полными завершёнными парами `Tool Call` / `Tool Result`
-непосредственно предыдущего запроса. Без Registry исполнитель всех Tool exchanges
-отмечается как `model`, включая историю с Handoff-маркерами. С Registry фильтр
-определяет Handoff и подписывает сабагента.
-
-History Cleanup удалит нативные `tool_calls`, сообщения `tool` и служебные
-сообщения с изображениями Tools из прошлых запросов. Обычные вопросы, ответы и
-добавленная строковая запись останутся. Сообщения от последнего пользовательского
-запроса и дальше сохраняются без изменений, поэтому уже начатая текущая
-Tool-цепочка не повреждается.
-
-### Tool Call Tombstone Context для обычных чатов
-
-`tool_call_tombstone_context.py` — альтернативный самостоятельный фильтр для
-обычных Workspace/Base Models. По умолчанию он оставляет последние пять
-завершённых текстовых ходов и текущий запрос. Прошлые нативные вызовы и их
-результаты заменяются одним непрерывным tombstone-блоком сразу после системных
-сообщений: один `assistant.tool_calls` содержит использованные ID и имена
-функций с пустыми аргументами `{}`, а каждому ID соответствует минимальный
-`tool`-ответ `[omitted]`.
-
-Фильтр сохраняет только завершённые пары, удаляет исходные аргументы, результаты
-и служебные поля Open WebUI, дедуплицирует повторные ID и не создаёт tombstone
-для ID, уже присутствующего в текущей Tool-цепочке. Число сохранённых текстовых
-ходов задаётся Valve `history_turns` (по умолчанию `5`).
-
-Не подключайте Tool Call Tombstone Context одновременно с History Cleanup или
-Subagent Context или Subagent Preparation: они реализуют взаимоисключающие
-политики истории. Фильтр
-предоставляет модели старые ID как контекст, но продолжение числового счётчика
-остаётся поведением конкретной модели или backend. Если ID всё равно повторяются,
-их нужно переназначать на UUID до исполнения и сохранения Tool Call.
-
-Как и другие inlet-фильтры Open WebUI v0.11.1, он не запускается повторно при
-внутренних продолжениях Tool Calls.
 
 После `lite_delegate` pipe сам переключает модель и набор capabilities. Текущие
 вызовы и результаты сабагента остаются в нативном формате `tool_calls` / `tool`.
@@ -366,16 +312,12 @@ Subagent Preparation ко всем сабагентам: изменение ли
 модели. Per-model overrides, policy profiles и клонирование фильтра для разных
 лимитов в этой конфигурации не предусмотрены.
 
-Tool Call Filter, Subagent Context и Skill Context остаются самостоятельными
-адаптерами для обычных моделей. Subagent Context сохраняет свои Valves;
-альтернативная tombstone-политика обычных чатов сохраняет прежнее поведение.
-
 ## Локальная проверка
 
 Общий исходник подготовки Skills находится в `handoff_router/shared/skill_preparation.py`.
 Блоки между `BEGIN GENERATED SKILL PREPARATION` и `END GENERATED SKILL PREPARATION`
-в `lite_handoff_router.py`, `skill_context.py` и `subagent_preparation.py`
-генерируются из него. `SkillPreparation.install_context` заменяет прежний Skill
+в `lite_handoff_router.py`, `subagent_preparation.py` и самостоятельном
+[Skill Context](../optional_filters/skill_context.py) генерируются из него. `SkillPreparation.install_context` заменяет прежний Skill
 context и устанавливает loader, сохраняя инструкции Workspace Model owner;
 эту операцию используют оба Skill inlet-адаптера. Меняйте общие правила в
 исходнике, затем обновляйте и коммитьте готовые Function-файлы:
@@ -509,10 +451,11 @@ IDs, с прежней политикой кеша и совместимость
 При обновлении до **0.21.0** используйте замену attachments обеих ролей из
 раздела установки: Router Preparation на Router, общий Subagent Preparation
 на адресатах. Все девять Functions с `GENERATED REQUEST RUNTIME` актуальны;
-для самостоятельных обычных моделей также обновите соответствующие контекстные
-фильтры из текущих файлов.
+для самостоятельных обычных моделей обновите соответствующие контекстные
+фильтры из `optional_filters/`.
 
-В `lite_subagent_registry.py` и `router_preparation.py` генератор встраивает только функцию
+В `optional_filters/lite_subagent_registry.py` и `router_preparation.py`
+генератор встраивает только функцию
 нормализации Skill IDs из общего исходника: Registry проверяет Skills до вызова
 Pipe, поэтому его lookup должен использовать те же канонические IDs. Изменение
 этой функции требует регенерации и коммита всех пяти файлов. Tool и model IDs

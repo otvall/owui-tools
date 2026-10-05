@@ -9,6 +9,10 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+OPTIONAL_FUNCTIONS = {
+    "skill_context.py", "lite_subagent_registry.py", "previous_tool_context.py",
+    "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
+}
 FUNCTIONS = (
     "lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py",
     "previous_tool_context.py", "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
@@ -19,16 +23,21 @@ SKILL_ID_CONSUMERS = {"lite_handoff_router.py", "skill_context.py", "lite_subage
 
 class SkillGenerationTests(unittest.TestCase):
     def setUp(self):
-        self.root = Path(self.enterContext(tempfile.TemporaryDirectory()))
+        self.root = Path(self.enterContext(tempfile.TemporaryDirectory())) / "handoff_router"
         for name in (
             "shared/skill_preparation.py", "shared/request_runtime.py", "shared/tool_history.py", "shared/tool_context.py",
             "shared/registry_preparation.py", "shared/previous_tool_context.py", "shared/history_cleanup.py",
             "tools/generate_skill_preparation.py",
             *FUNCTIONS,
         ):
-            target = self.root / name
+            target = self.function_path(name)
             target.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copyfile(ROOT / name, target)
+            source = ROOT.parent / "optional_filters" / name if name in OPTIONAL_FUNCTIONS else ROOT / name
+            shutil.copyfile(source, target)
+
+    def function_path(self, name):
+        directory = self.root.parent / "optional_filters" if name in OPTIONAL_FUNCTIONS else self.root
+        return directory / name
 
     def run_generator(self, *args):
         return subprocess.run(
@@ -37,15 +46,15 @@ class SkillGenerationTests(unittest.TestCase):
         )
 
     def outputs(self):
-        return {name: (self.root / name).read_bytes() for name in FUNCTIONS}
+        return {name: self.function_path(name).read_bytes() for name in FUNCTIONS}
 
     def test_generation_is_reproducible_and_check_is_read_only(self):
         before = self.outputs()
-        mtimes = {name: (self.root / name).stat().st_mtime_ns for name in before}
+        mtimes = {name: self.function_path(name).stat().st_mtime_ns for name in before}
         checked = self.run_generator("--check")
         self.assertEqual(checked.returncode, 0, checked.stderr)
         self.assertEqual(self.outputs(), before)
-        self.assertEqual({name: (self.root / name).stat().st_mtime_ns for name in before}, mtimes)
+        self.assertEqual({name: self.function_path(name).stat().st_mtime_ns for name in before}, mtimes)
         for _ in range(2):
             generated = self.run_generator()
             self.assertEqual(generated.returncode, 0, generated.stderr)
@@ -224,7 +233,7 @@ getattr(module, sys.argv[2])()
         ):
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
                 target = Path(directory) / filename
-                shutil.copyfile(self.root / filename, target)
+                shutil.copyfile(self.function_path(filename), target)
                 imported = subprocess.run(
                     [sys.executable, "-I", "-B", "-c", script, str(target), entrypoint],
                     cwd=directory, capture_output=True, text=True, check=False,

@@ -62,7 +62,11 @@ router = load_router()
 
 
 def load_plain_module(filename, name, modules=None):
-    spec = importlib.util.spec_from_file_location(name, ROOT / filename)
+    directory = (
+        ROOT if filename in {"lite_handoff_router.py", "lite_delegate.py", "router_preparation.py", "subagent_preparation.py"}
+        else ROOT.parent / "optional_filters"
+    )
+    spec = importlib.util.spec_from_file_location(name, directory / filename)
     module = importlib.util.module_from_spec(spec)
     with patch.dict(sys.modules, {name: module, **(modules or {})}):
         spec.loader.exec_module(module)

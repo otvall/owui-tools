@@ -11,7 +11,7 @@ from unittest.mock import AsyncMock, patch
 
 from test_handoff_history import PipeTestCase, assistant, call, grouped_history, marker, result, router
 
-ROOT = Path(__file__).resolve().parents[1]
+ROOT = Path(__file__).resolve().parents[2] / "optional_filters"
 
 
 def load_module(filename, name, modules=None):

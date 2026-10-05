@@ -8,6 +8,10 @@ import sys
 
 
 ROOT = Path(__file__).resolve().parents[1]
+OPTIONAL_TARGETS = (
+    "skill_context.py", "lite_subagent_registry.py", "previous_tool_context.py",
+    "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
+)
 TARGETS = ("lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py", "router_preparation.py", "subagent_preparation.py")
 NORMALIZATION_TARGETS = ("lite_subagent_registry.py", "router_preparation.py")
 RUNTIME_TARGETS = TARGETS + (
@@ -56,7 +60,8 @@ def main() -> int:
     normalization_source = "\n".join(source.splitlines()[normalizer.lineno - 1:normalizer.end_lineno])
     outputs = []
     for name in RUNTIME_TARGETS:
-        path = ROOT / name
+        directory = ROOT.parent / "optional_filters" if name in OPTIONAL_TARGETS else ROOT
+        path = directory / name
         original = path.read_text()
         try:
             generated = embed(original, runtime_source, "REQUEST RUNTIME", "shared/request_runtime.py")
@@ -76,11 +81,11 @@ def main() -> int:
             outputs.append((path, generated))
     if args.check:
         for path, _output in outputs:
-            print(f"Stale generated preparation: {path.name}", file=sys.stderr)
+            print(f"Stale generated preparation: {path.relative_to(ROOT.parent)}", file=sys.stderr)
         return int(bool(outputs))
     for path, output in outputs:
         path.write_text(output)
-        print(f"Updated {path.name}")
+        print(f"Updated {path.relative_to(ROOT.parent)}")
     return 0
 
 
