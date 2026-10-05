@@ -1,7 +1,7 @@
 """
 title: Lite Handoff Router
 description: Stateless same-response subagent handoff router.
-version: 0.18.0
+version: 0.20.0
 required_open_webui_version: 0.11.1
 """
 
@@ -9,11 +9,13 @@ from __future__ import annotations
 
 import copy
 import html
+import inspect
 import json
 import logging
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from functools import wraps
+from typing import Any, get_type_hints
 
 from fastapi import HTTPException
 from open_webui.models.models import Models
@@ -32,7 +34,7 @@ from starlette.responses import Response, StreamingResponse
 
 
 import copy
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -44,6 +46,43 @@ class CapabilitySet:
     tool_ids: list[str]
     skill_ids: list[str]
     tools: dict
+
+
+class ModelPreparation:
+    """A model draft whose cached Tools share one request-local history."""
+
+    def __init__(self, runtime, branch: str, body: dict):
+        try:
+            self._cache_key, messages_key = runtime.CAPABILITY_FIELDS[branch]
+        except KeyError:
+            raise ValueError(f"Unknown model preparation branch: {branch}") from None
+        self._runtime = runtime
+        self.body = runtime.routed_body(body)
+        messages = runtime.metadata.get(messages_key)
+        self._messages = messages if isinstance(messages, list) else []
+        runtime.sync(**{messages_key: self._messages})
+
+    @property
+    def messages(self) -> list[dict]:
+        """Pass this stable list to loaders; preparation owns its contents."""
+        return self._messages
+
+    async def capabilities(
+        self,
+        *,
+        model_id: str,
+        tool_ids: list[str],
+        skill_ids: list[str],
+        load: Callable[[list[dict]], Awaitable[CapabilitySet]],
+    ) -> CapabilitySet:
+        cached = self._runtime._cached_capabilities(
+            self._cache_key, model_id, tool_ids, skill_ids,
+        )
+        if cached is not None:
+            return cached
+        capabilities = await load(self.messages)
+        self._runtime._cache_capabilities(self._cache_key, model_id, capabilities)
+        return capabilities
 
 
 class SkillLoaderOwnership:
@@ -78,7 +117,7 @@ class RequestRuntime:
     """Own the shared, request-scoped metadata and live Tool registries."""
 
     RESET_FIELDS = (
-        "lite_history_boundary", "lite_child_messages", "lite_router_user_index",
+        "lite_history_boundary", "lite_child_messages", "lite_base_messages", "lite_router_user_index",
         "lite_active_handoff", "lite_active_agent_id", "lite_active_skill_id",
         "lite_active_model_id", "lite_active_tool_runtime", "lite_base_tool_runtime",
         "lite_orchestrator_skill_context", "lite_unfiltered_messages",
@@ -94,6 +133,10 @@ class RequestRuntime:
         "lite_base_tool_ids", "lite_orchestrator_skill_ids", "lite_registry_applied",
     )
     MANAGED_FIELDS = RESET_FIELDS + CONFIG_FIELDS + ("tools", "tool_ids", "skill_ids")
+    CAPABILITY_FIELDS = {
+        "child": ("lite_active_tool_runtime", "lite_child_messages"),
+        "orchestrator": ("lite_base_tool_runtime", "lite_base_messages"),
+    }
     ROUTER_FILTERS = {
         "lite_registry": "Lite Subagent Registry",
         "previous_tool_context": "Previous Tool Context",
@@ -249,6 +292,17 @@ class RequestRuntime:
             self.publish()
 
     @contextmanager
+    def prepare_model(self, branch: str, body: dict) -> Iterator[ModelPreparation]:
+        """Publish final Tool context only when the whole model draft succeeds."""
+        with self.preparation():
+            prepared = ModelPreparation(self, branch, body)
+            yield prepared
+            if not isinstance(prepared.body, dict) or not isinstance(prepared.body.get("messages"), list):
+                raise TypeError("Model preparation returned an invalid request body")
+            prepared.body["metadata"] = self.metadata
+            prepared.messages[:] = copy.deepcopy(prepared.body["messages"])
+
+    @contextmanager
     def child_filters(self) -> Iterator[None]:
         self.discard(*(name + "_applied" for name in self.CHILD_FILTERS))
         self.sync(lite_subagent_filter_pipeline=[], lite_subagent_filter_run=True)
@@ -327,7 +381,7 @@ class RequestRuntime:
         self.sync(tools=shared, tool_ids=list(tool_ids))
         return shared
 
-    def cached_capabilities(
+    def _cached_capabilities(
         self,
         cache_key: str,
         model_id: str,
@@ -349,7 +403,7 @@ class RequestRuntime:
             )
         return None
 
-    def cache_capabilities(
+    def _cache_capabilities(
         self,
         cache_key: str,
         model_id: str,
@@ -376,22 +430,26 @@ class RequestRuntime:
 
 # BEGIN GENERATED TOOL HISTORY
 # Edit shared/tool_history.py; run python3 tools/generate_skill_preparation.py
-"""Pair concrete Tool exchanges without treating correlation IDs as global keys."""
+"""Interpret completed Tool history before consumers select or format it."""
 
-from collections.abc import Callable
+import json
 from dataclasses import dataclass
+from typing import Any
 
 
-def resolve_agent_id(value: str | None, registry: dict) -> str | None:
-    """Resolve a direct ID or an unambiguous accepted routing Skill alias."""
+
+def _agent_registry(registry: dict | None) -> dict:
     if not isinstance(registry, dict):
-        return None
-    agents = {
+        return {}
+    return {
         str(agent_id or "").strip(): config
         for agent_id, config in registry.items()
         if str(agent_id or "").strip() and isinstance(config, dict)
         and str(config.get("model_id") or "").strip()
     }
+
+
+def _resolve_agent_id(value: str | None, agents: dict) -> str | None:
     if value in agents:
         return value
     matches = [
@@ -401,16 +459,74 @@ def resolve_agent_id(value: str | None, registry: dict) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def resolve_agent_id(value: str | None, registry: dict) -> str | None:
+    """Resolve a direct ID or an unambiguous accepted routing Skill alias."""
+    return _resolve_agent_id(value, _agent_registry(registry))
+
+
+def parse_handoff(value: Any) -> str | None:
+    """Read a v2 destination without deciding whether it is available."""
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value.strip())
+            if isinstance(value, str):
+                value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict) or value.get("__lite_delegate__") != "v2":
+        return None
+    return str(value.get("agent_id") or "").strip() or None
+
+
+@dataclass(frozen=True)
+class ToolExecutor:
+    kind: str
+    agent_id: str | None = None
+    declared_agent_id: str | None = None
+    model_id: str | None = None
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class HandoffEvidence:
+    declared_agent_id: str
+    agent_id: str | None
+
+
 @dataclass(frozen=True)
 class ToolExchange:
     message_index: int
     call_index: int
     result_index: int
+    executor: ToolExecutor
+    handoff: HandoffEvidence | None = None
 
 
-def completed_tool_exchanges(
-    messages: list[dict], *, is_tool_image_message: Callable[[dict], bool],
-) -> list[ToolExchange]:
+@dataclass(frozen=True)
+class ToolHistory:
+    """Immutable facts whose indices refer to the unmodified input history."""
+
+    user_indices: tuple[int, ...]
+    exchanges: tuple[ToolExchange, ...]
+
+    @property
+    def current_user_index(self) -> int:
+        return self.user_indices[-1] if self.user_indices else -1
+
+    @property
+    def current_handoff(self) -> str | None:
+        return next(
+            (
+                exchange.handoff.declared_agent_id
+                for exchange in reversed(self.exchanges)
+                if exchange.message_index > self.current_user_index
+                and exchange.handoff is not None
+            ),
+            None,
+        )
+
+
+def _completed_exchanges(messages: list[dict]) -> list[tuple[int, int, int]]:
     """Match only within one assistant execution batch in one user request.
 
     OWUI may group several sequential executions into one assistant message.
@@ -418,7 +534,7 @@ def completed_tool_exchanges(
     IDs within that batch are ambiguous; a later batch cannot complete an earlier
     one. Identical repeated results represent one exchange, conflicting ones none.
     """
-    exchanges: list[ToolExchange] = []
+    exchanges: list[tuple[int, int, int]] = []
     calls: dict[str, list[tuple[int, int]]] = {}
     results: dict[str, list[int]] = {}
 
@@ -431,13 +547,13 @@ def completed_tool_exchanges(
             if any(messages[index] != messages[first_result] for index in matching_results[1:]):
                 continue
             message_index, call_index = occurrences[0]
-            exchanges.append(ToolExchange(message_index, call_index, first_result))
+            exchanges.append((message_index, call_index, first_result))
         calls.clear()
         results.clear()
 
     for index, message in enumerate(messages):
         role = message.get("role")
-        if role == "assistant" or (role == "user" and not is_tool_image_message(message)):
+        if role == "assistant" or (role == "user" and not RequestRuntime.is_tool_image_message(message)):
             finish_batch()
         if role == "assistant":
             for call_index, call in enumerate(message.get("tool_calls") or []):
@@ -450,6 +566,70 @@ def completed_tool_exchanges(
                 results.setdefault(call_id, []).append(index)
     finish_batch()
     return exchanges
+
+
+def analyze_history(messages: list[dict], *, registry: dict | None = None) -> ToolHistory:
+    """Pair and attribute exchanges in Tool Result order without changing input.
+
+    None means standalone execution: every executor stays model. A supplied
+    Registry, even empty, enables Router attribution. Missing or ambiguous
+    destinations remain Handoff evidence, but cannot prove a subagent executor.
+    """
+    if not isinstance(messages, list):
+        raise TypeError("Tool history messages must be a list")
+    if registry is not None and not isinstance(registry, dict):
+        raise TypeError("Tool history Registry must be an object")
+
+    agents = _agent_registry(registry)
+    pairs = _completed_exchanges(messages)
+    by_result = {result_index: (message_index, call_index) for message_index, call_index, result_index in pairs}
+    completed_calls = {(message_index, call_index) for message_index, call_index, _ in pairs}
+    root_executor = ToolExecutor("model" if registry is None else "orchestrator")
+    executor = root_executor
+    uncertain_batch = False
+    user_indices: list[int] = []
+    exchanges: list[ToolExchange] = []
+
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role == "user" and not RequestRuntime.is_tool_image_message(message):
+            user_indices.append(index)
+            executor = root_executor
+            uncertain_batch = False
+        if role == "assistant":
+            uncertain_batch = any(
+                (call.get("function") or {}).get("name") == "lite_delegate"
+                and (index, call_index) not in completed_calls
+                for call_index, call in enumerate(message.get("tool_calls") or [])
+            )
+            if registry is not None and uncertain_batch:
+                # An unpaired delegate has no trustworthy transition position.
+                executor = ToolExecutor("unknown")
+
+        pair = by_result.get(index)
+        if pair is None:
+            continue
+        message_index, call_index = pair
+        call = messages[message_index]["tool_calls"][call_index]
+        is_delegate = (call.get("function") or {}).get("name") == "lite_delegate"
+        declared_id = parse_handoff(message.get("content")) if is_delegate else None
+        agent_id = _resolve_agent_id(declared_id, agents) if declared_id is not None else None
+        handoff = HandoffEvidence(declared_id, agent_id) if declared_id is not None else None
+        exchanges.append(ToolExchange(message_index, call_index, index, executor, handoff))
+
+        # The delegate exchange itself belongs to the preceding executor.
+        if registry is not None and is_delegate:
+            if uncertain_batch or agent_id is None:
+                executor = ToolExecutor("unknown", declared_agent_id=declared_id)
+            else:
+                config = agents[agent_id]
+                executor = ToolExecutor(
+                    "subagent", agent_id=agent_id, declared_agent_id=declared_id,
+                    model_id=str(config.get("model_id") or "").strip(),
+                    name=str(config.get("name") or agent_id),
+                )
+
+    return ToolHistory(tuple(user_indices), tuple(exchanges))
 # END GENERATED TOOL HISTORY
 
 # BEGIN GENERATED SKILL PREPARATION
@@ -578,8 +758,6 @@ log = logging.getLogger(__name__)
 
 DELEGATE_VERSION = "v2"
 ACTIVE_HANDOFF_KEY = "lite_active_handoff"
-CHILD_RUNTIME_KEY = "lite_active_tool_runtime"
-BASE_RUNTIME_KEY = "lite_base_tool_runtime"
 ORCHESTRATOR_SKILL_PROMPT_PREFIX = "Lite orchestrator Skill context:\n"
 GENERIC_SKILL_PROMPT_PREFIX = "Skill context:\n"
 TOOL_IMAGE_TEXT = "Here are the images from the tool results above. Please analyze them."
@@ -612,24 +790,8 @@ class HandoffMarker:
 
     @classmethod
     def parse(cls, value: Any) -> HandoffMarker | None:
-        if isinstance(value, dict):
-            data = value
-        elif isinstance(value, str) and value.strip():
-            try:
-                data = json.loads(value.strip())
-                if isinstance(data, str):
-                    data = json.loads(data)
-            except (TypeError, ValueError, json.JSONDecodeError):
-                return None
-        else:
-            return None
-
-        if not isinstance(data, dict) or data.get("__lite_delegate__") != DELEGATE_VERSION:
-            return None
-        agent_id = str(data.get("agent_id") or "").strip()
-        if not agent_id:
-            return None
-        return cls(agent_id=agent_id)
+        agent_id = parse_handoff(value)
+        return cls(agent_id=agent_id) if agent_id is not None else None
 
     def to_dict(self) -> dict:
         return {
@@ -658,22 +820,8 @@ class InvocationContext:
 class HandoffProtocol:
     @staticmethod
     def find_current(messages: list[dict]) -> HandoffMarker | None:
-        exchange = HandoffProtocol._current_exchange(messages)
-        return exchange[0] if exchange is not None else None
-
-    @staticmethod
-    def _current_exchange(messages: list[dict]) -> tuple[HandoffMarker, int, int] | None:
-        last_user_index = MessageHistory.last_user_index(messages)
-
-        handoff = None
-        exchanges = completed_tool_exchanges(messages, is_tool_image_message=MessageHistory.is_tool_image_message)
-        for exchange in sorted(exchanges, key=lambda item: item.result_index):
-            call = messages[exchange.message_index]["tool_calls"][exchange.call_index]
-            if exchange.message_index > last_user_index and (call.get("function") or {}).get("name") == "lite_delegate":
-                marker = HandoffMarker.parse(messages[exchange.result_index].get("content"))
-                if marker is not None:
-                    handoff = (marker, exchange.result_index, last_user_index)
-        return handoff
+        agent_id = analyze_history(messages).current_handoff
+        return HandoffMarker(agent_id) if agent_id is not None else None
 
     @staticmethod
     def active(metadata: dict) -> HandoffMarker | None:
@@ -778,6 +926,54 @@ class ModelCapabilityResolver:
 
     def __init__(self, mcp_runtime: McpRuntime):
         self.mcp_runtime = mcp_runtime
+
+    @staticmethod
+    def bind_history(tools: dict, messages: list[dict]) -> dict:
+        """Keep Router history when OWUI refreshes callable extra parameters.
+
+        OWUI's native Tool loop injects its outer request history, including on
+        nested Router continuations. Bind only __messages__ at the original
+        function; retain OWUI's wrapper convention so __files__ still refreshes.
+        Custom closures already capture the live list supplied to their loader.
+        """
+        bound_tools = {}
+        for name, tool in tools.items():
+            loaded = tool["callable"]
+            original = getattr(loaded, "__function__", None)
+            extra_params = getattr(loaded, "__extra_params__", None)
+            if (
+                not callable(original) or not isinstance(extra_params, dict)
+                or "__messages__" not in inspect.signature(original).parameters
+            ):
+                bound_tools[name] = tool
+                continue
+
+            # Each closure must bind its own original function and history.
+            def bind(loaded, original, extra_params):
+                @wraps(original, updated=())
+                async def with_history(*args, **kwargs):
+                    kwargs["__messages__"] = messages
+                    result = original(*args, **kwargs)
+                    return await result if inspect.isawaitable(result) else result
+
+                with_history.__signature__ = inspect.signature(original)
+                try:
+                    with_history.__annotations__ = get_type_hints(original)
+                except Exception:  # Match OWUI's fallback for unresolved Tool annotations.
+                    pass
+
+                @wraps(loaded, updated=())
+                async def bound(*args, **kwargs):
+                    result = loaded(*args, **{**kwargs, "__messages__": messages})
+                    return await result if inspect.isawaitable(result) else result
+
+                bound.__signature__ = inspect.signature(loaded)
+                bound.__function__ = with_history
+                bound.__extra_params__ = {**extra_params, "__messages__": messages}
+                return bound
+
+            bound_tools[name] = {**tool, "callable": bind(loaded, original, extra_params)}
+        return bound_tools
 
     @staticmethod
     def builtin_tools_enabled(runtime_model: dict) -> bool:
@@ -919,7 +1115,7 @@ class ModelCapabilityResolver:
                 if name not in tools:
                     tools[name] = tool
 
-        return CapabilitySet(requested_ids, requested_skill_ids, tools)
+        return CapabilitySet(requested_ids, requested_skill_ids, self.bind_history(tools, messages))
 
     @staticmethod
     def _extra_params(
@@ -1028,7 +1224,7 @@ class ChildRequestBuilder:
     async def prepare(
         self,
         *,
-        body: dict,
+        prepared: ModelPreparation,
         marker: HandoffMarker,
         registry: dict[str, AgentSpec],
         runtime: RequestRuntime,
@@ -1041,7 +1237,7 @@ class ChildRequestBuilder:
                 f'Agent ID "{marker.agent_id}" is not available in the current registry'
             )
 
-        routed_body = runtime.routed_body(body)
+        routed_body = prepared.body
         source_messages = remove_system_message(routed_body.get("messages") or [])
         raw_messages = runtime.metadata.get("lite_unfiltered_messages")
         if isinstance(raw_messages, list):
@@ -1053,17 +1249,13 @@ class ChildRequestBuilder:
                     *raw_messages[:raw_user_index],
                     *source_messages[current_user_index:],
                 ]
-        capability_messages = runtime.metadata.get("lite_child_messages")
-        if not isinstance(capability_messages, list):
-            capability_messages = []
-            runtime.sync(lite_child_messages=capability_messages)
         runtime_model, child_skill_ids, child_tool_ids, capabilities = (
             await self._prepare_workspace_model(
                 routed_body=routed_body,
                 agent=agent,
                 runtime=runtime,
                 context=context,
-                capability_messages=capability_messages,
+                prepared=prepared,
             )
         )
         child_messages = copy.deepcopy(source_messages)
@@ -1098,13 +1290,14 @@ class ChildRequestBuilder:
         async def load_builtin(ids):
             extra_params = self._capabilities._extra_params(
                 request=context.request, execution_user=context.user, runtime_model=runtime_model,
-                metadata=runtime.metadata, messages=capability_messages, event_emitter=context.event_emitter,
+                metadata=runtime.metadata, messages=prepared.messages, event_emitter=context.event_emitter,
                 event_call=context.event_call, oauth_token=context.oauth_token, files=context.files,
             )
-            return await get_builtin_tools(
+            tools = await get_builtin_tools(
                 context.request, {**extra_params, "__skill_ids__": ids},
                 features=runtime.metadata.get("features", {}), model=runtime_model,
             )
+            return self._capabilities.bind_history(tools, prepared.messages)
 
         prepared_skills = await SkillPreparation.prepare(
             skill_ids=child_skill_ids, runtime_model=runtime_model, metadata=runtime.metadata,
@@ -1122,7 +1315,7 @@ class ChildRequestBuilder:
             context=context,
             prepared_skills=prepared_skills,
         )
-        capability_messages[:] = copy.deepcopy(routed_body["messages"])
+        prepared.body = routed_body
         return routed_body, agent
 
     async def _prepare_workspace_model(
@@ -1132,7 +1325,7 @@ class ChildRequestBuilder:
         agent: AgentSpec,
         runtime: RequestRuntime,
         context: InvocationContext,
-        capability_messages: list[dict],
+        prepared: ModelPreparation,
     ) -> tuple[dict, list[str], list[str], CapabilitySet]:
         """Prepare only the Workspace Model state needed by a nested handoff.
 
@@ -1152,7 +1345,7 @@ class ChildRequestBuilder:
             runtime_model=runtime_model,
             tool_ids=child_tool_ids,
             skill_ids=child_skill_ids,
-            messages=capability_messages,
+            prepared=prepared,
             runtime=runtime,
             context=context,
         )
@@ -1164,26 +1357,21 @@ class ChildRequestBuilder:
         runtime_model: dict,
         tool_ids: list[str],
         skill_ids: list[str],
-        messages: list[dict],
+        prepared: ModelPreparation,
         runtime: RequestRuntime,
         context: InvocationContext,
     ) -> CapabilitySet:
         model_id = str(runtime_model.get("id") or "").strip()
-        cached = runtime.cached_capabilities(
-            CHILD_RUNTIME_KEY, model_id, tool_ids, skill_ids,
-        )
-        if cached is not None:
-            return cached
 
-        model_info = await Models.get_model_by_id(model_id)
-        if model_info is None:
-            if tool_ids or skill_ids:
-                raise ValueError("Child Model capability owner is unavailable")
-            capabilities = CapabilitySet([], [], {})
-        else:
+        async def load(messages):
+            model_info = await Models.get_model_by_id(model_id)
+            if model_info is None:
+                if tool_ids or skill_ids:
+                    raise ValueError("Child Model capability owner is unavailable")
+                return CapabilitySet([], [], {})
             if not model_info.is_active:
                 raise ValueError("Child Model capability owner is unavailable")
-            capabilities = await self._capabilities.resolve(
+            return await self._capabilities.resolve(
                 request=context.request,
                 capability_owner_id=str(model_info.user_id or ""),
                 execution_user=context.user,
@@ -1199,8 +1387,10 @@ class ChildRequestBuilder:
                 connector=McpRuntime.connect,
                 include_builtin_tools=True,
             )
-        runtime.cache_capabilities(CHILD_RUNTIME_KEY, model_id, capabilities)
-        return capabilities
+
+        return await prepared.capabilities(
+            model_id=model_id, tool_ids=tool_ids, skill_ids=skill_ids, load=load,
+        )
 
     @staticmethod
     async def _attachments(agent: AgentSpec, runtime_model) -> tuple[list[str], list[str]]:
@@ -1353,22 +1543,16 @@ class Pipe:
         runtime: RequestRuntime,
         context: InvocationContext,
     ):
-        with runtime.preparation():
+        with runtime.prepare_model("orchestrator", body) as preparation:
             runtime.require_router_chain()
-            routed = runtime.routed_body(body)
+            routed = preparation.body
             base_tool_ids = normalize_ids(runtime.metadata.get("lite_base_tool_ids"))
             skill_ids = normalize_skill_ids(runtime.metadata.get("lite_orchestrator_skill_ids"))
             router_model_id = str(runtime.metadata.get("lite_router_model_id") or "").strip()
             runtime_model = context.request.app.state.MODELS.get(router_model_id) or {"id": router_model_id}
             if base_tool_ids or skill_ids:
-                capabilities = runtime.cached_capabilities(
-                    BASE_RUNTIME_KEY,
-                    router_model_id,
-                    base_tool_ids,
-                    skill_ids,
-                )
-                if capabilities is None:
-                    capabilities = await self._capabilities.resolve(
+                async def load(messages):
+                    return await self._capabilities.resolve(
                         request=context.request,
                         capability_owner_id=str(
                             runtime.metadata.get("lite_router_owner_id") or ""
@@ -1378,18 +1562,17 @@ class Pipe:
                         skill_ids=skill_ids,
                         runtime_model=runtime_model,
                         metadata=runtime.metadata,
-                        messages=routed.get("messages") or [],
+                        messages=messages,
                         event_emitter=context.event_emitter,
                         event_call=context.event_call,
                         oauth_token=context.oauth_token,
                         files=context.files,
                         connector=McpRuntime.connect,
                     )
-                    runtime.cache_capabilities(
-                        BASE_RUNTIME_KEY,
-                        router_model_id,
-                        capabilities,
-                    )
+                capabilities = await preparation.capabilities(
+                    model_id=router_model_id, tool_ids=base_tool_ids, skill_ids=skill_ids,
+                    load=load,
+                )
                 tool_ids = normalize_ids(
                     [*(runtime.metadata.get("tool_ids") or []), *base_tool_ids]
                 )
@@ -1412,14 +1595,15 @@ class Pipe:
                     raise ValueError("Model capability owner is unavailable")
                 extra_params = self._capabilities._extra_params(
                     request=context.request, execution_user=context.user, runtime_model=runtime_model,
-                    metadata=runtime.metadata, messages=messages, event_emitter=context.event_emitter,
+                    metadata=runtime.metadata, messages=preparation.messages, event_emitter=context.event_emitter,
                     event_call=context.event_call, oauth_token=context.oauth_token, files=context.files,
                 )
-                return await get_builtin_tools(
+                tools = await get_builtin_tools(
                     context.request,
                     {**extra_params, "__user__": owner.model_dump(), "__skill_ids__": ids},
                     model=runtime_model,
                 )
+                return self._capabilities.bind_history(tools, preparation.messages)
 
             prepared = await SkillPreparation.prepare(
                 skill_ids=skill_ids, runtime_model=runtime_model, metadata=runtime.metadata,
@@ -1460,10 +1644,10 @@ class Pipe:
         runtime: RequestRuntime,
         context: InvocationContext,
     ):
-        with runtime.preparation():
+        with runtime.prepare_model("child", body) as preparation:
             runtime.require_router_chain()
             routed, agent = await self._child_builder.prepare(
-                body=body,
+                prepared=preparation,
                 marker=marker,
                 registry=registry,
                 runtime=runtime,

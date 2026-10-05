@@ -100,17 +100,22 @@ def registry_metadata():
     }
 
 
-class PreviousToolContextTests(unittest.TestCase):
+class PreviousToolContextTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.registry = previous_filter.agent_registry(registry_metadata())
+        self.registry = registry_metadata()["lite_agents"]
 
-    def record(self, messages):
-        message = previous_filter.context_message(
-            messages,
-            user_index=len(messages),
-            registry=self.registry,
+    async def record(self, messages):
+        metadata = registry_metadata()
+        metadata.update(
+            lite_agents=self.registry,
+            lite_router_filter_pipeline=["lite_registry"],
         )
-        return unpack_record([message]) if message else None
+        body = {
+            "messages": [*messages, {"role": "user", "content": "Next request"}],
+            "metadata": metadata,
+        }
+        await previous_filter.Filter().inlet(body)
+        return unpack_record(body["messages"])
 
     def test_only_v2_agent_id_marker_is_supported(self):
         self.assertEqual(
@@ -130,7 +135,7 @@ class PreviousToolContextTests(unittest.TestCase):
             )
         )
 
-    def test_keeps_full_arguments_results_and_agent_identity(self):
+    async def test_keeps_full_arguments_results_and_agent_identity(self):
         messages = previous_turn()
         large_result = "Результат\n" + "x" * 20000 + "\nitem42"
         messages[4]["content"] = large_result
@@ -138,7 +143,7 @@ class PreviousToolContextTests(unittest.TestCase):
             '{ "query": "документы", "limit": 20 }'
         )
         original = copy.deepcopy(messages)
-        record = self.record(messages)
+        record = await self.record(messages)
         exchanges = record["tool_exchanges"]
         self.assertEqual(
             [item["call"]["id"] for item in exchanges],
@@ -159,17 +164,17 @@ class PreviousToolContextTests(unittest.TestCase):
         self.assertEqual(exchanges[2]["result"], messages[4])
         self.assertEqual(messages, original)
 
-    def test_only_immediately_previous_request_is_considered(self):
+    async def test_only_immediately_previous_request_is_considered(self):
         messages = previous_turn() + [
             {"role": "user", "content": "Say hello"},
             {"role": "assistant", "content": "Hello"},
         ]
-        self.assertIsNone(self.record(messages))
+        self.assertIsNone(await self.record(messages))
 
-    def test_first_request_has_no_record(self):
-        self.assertIsNone(self.record([]))
+    async def test_first_request_has_no_record(self):
+        self.assertIsNone(await self.record([]))
 
-    def test_tool_images_are_reference_data(self):
+    async def test_tool_images_are_reference_data(self):
         messages = previous_turn()
         image_message = {
             "role": "user",
@@ -182,17 +187,106 @@ class PreviousToolContextTests(unittest.TestCase):
             ],
         }
         messages.insert(-1, image_message)
-        record = self.record(messages)
+        record = await self.record(messages)
         self.assertEqual(record["tool_result_images"], [image_message["content"]])
 
-    def test_orphans_are_not_invented_as_executions(self):
+    async def test_orphans_are_not_invented_as_executions(self):
         messages = previous_turn()
         messages.insert(-1, assistant(call("unfinished", "lookup")))
         messages.insert(-1, result("orphan", "no matching call"))
-        self.assertEqual(len(self.record(messages)["tool_exchanges"]), 3)
+        self.assertEqual(len((await self.record(messages))["tool_exchanges"]), 3)
+
+    async def test_pairing_is_batch_scoped_and_repeated_results_are_unambiguous(self):
+        valid = [assistant(call("valid", "lookup")), result("valid", "VALID")]
+        for disputed in (
+            [assistant(call("same", "lookup")),
+             {"role": "assistant", "content": "Another execution batch"},
+             result("same", "LATE")],
+            [assistant(call("same", "private_tool"), call("same", "lookup")),
+             result("same", "AMBIGUOUS")],
+            [assistant(call("same", "lookup")),
+             result("same", "FIRST"), result("same", "CONFLICT")],
+        ):
+            with self.subTest(disputed=disputed):
+                record = await self.record([
+                    {"role": "user", "content": "Question"}, *disputed, *valid,
+                    {"role": "assistant", "content": "Answer"},
+                ])
+                self.assertEqual([item["call"]["id"] for item in record["tool_exchanges"]], ["valid"])
+
+        record = await self.record([
+            {"role": "user", "content": "Question"},
+            *valid, result("valid", "VALID"),
+            {"role": "assistant", "content": "Answer"},
+        ])
+        self.assertEqual(len(record["tool_exchanges"]), 1)
+
+    async def test_alias_uses_canonical_id_and_current_registry_enrichment(self):
+        messages = previous_turn()
+        messages[3]["content"] = marker("route-a")
+        self.registry["agent-a"].update(model_id="current-model", name="Current catalog")
+
+        record = await self.record(messages)
+
+        self.assertEqual(record["tool_exchanges"][-1]["executor"], {
+            "kind": "subagent", "agent_id": "agent-a",
+            "model_id": "current-model", "name": "Current catalog",
+        })
+        self.assertEqual(record["tool_exchanges"][1]["result"], messages[3])
+
+    async def test_ambiguous_alias_preserves_completed_work_with_unknown_executor(self):
+        self.registry["agent-b"]["routing_skill_id"] = "route-a"
+        messages = previous_turn()
+        messages[3]["content"] = marker("route-a")
+
+        record = await self.record(messages)
+
+        self.assertEqual(record["tool_exchanges"][-1]["executor"], {
+            "kind": "unknown", "declared_agent_id": "route-a",
+        })
+        self.assertEqual(record["tool_exchanges"][-1]["result"], messages[4])
+
+    async def test_removed_destination_preserves_declared_id_without_enrichment(self):
+        self.registry.pop("agent-a")
+
+        record = await self.record(previous_turn())
+
+        self.assertEqual(record["tool_exchanges"][-1]["executor"], {
+            "kind": "unknown", "declared_agent_id": "agent-a",
+        })
+
+    async def test_uncertain_handoff_keeps_work_and_later_proven_handoff_restores_executor(self):
+        record = await self.record([
+            {"role": "user", "content": "Question"},
+            assistant(call("to-a", "lite_delegate")), result("to-a", marker()),
+            assistant(call("unfinished", "lite_delegate"), call("uncertain-work", "lookup")),
+            result("uncertain-work", "COMPLETED_WITH_UNKNOWN_EXECUTOR"),
+            assistant(call("to-b", "lite_delegate")), result("to-b", marker("agent-b")),
+            assistant(call("confirmed-work", "lookup")), result("confirmed-work", "B_RESULT"),
+            {"role": "assistant", "content": "Answer"},
+        ])
+
+        self.assertEqual([item["call"]["id"] for item in record["tool_exchanges"]],
+                         ["to-a", "uncertain-work", "to-b", "confirmed-work"])
+        self.assertEqual([item["executor"]["kind"] for item in record["tool_exchanges"]],
+                         ["orchestrator", "unknown", "unknown", "subagent"])
+        self.assertEqual(record["tool_exchanges"][-1]["executor"]["agent_id"], "agent-b")
 
 
 class StandalonePreviousToolContextTests(unittest.IsolatedAsyncioTestCase):
+    async def test_handoff_does_not_change_model_executor_without_registry(self):
+        body = {
+            "messages": [*previous_turn(), {"role": "user", "content": "Next request"}],
+            "metadata": {"lite_agents": registry_metadata()["lite_agents"]},
+        }
+
+        await previous_filter.Filter().inlet(body)
+
+        record = unpack_record(body["messages"])
+        self.assertEqual([item["executor"] for item in record["tool_exchanges"]],
+                         [{"kind": "model"}] * 3)
+        self.assertEqual(record["tool_exchanges"][1]["result"], previous_turn()[3])
+
     async def test_runs_without_registry_and_works_with_cleanup(self):
         body = {
             "messages": [

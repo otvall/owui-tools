@@ -136,6 +136,16 @@ class PipeOccurrenceHistoryTests(PipeTestCase):
         self.context_filter.valves.history_turns = 2
         self.context_filter.valves.history_tool_calls = 5
 
+    async def test_grouped_current_calls_keep_source_order_when_results_arrive_in_another_order(self):
+        messages = await self.route_history([
+            {"role": "user", "content": "Question"},
+            assistant(call("second", "lookup"), call("delegate", "lite_delegate"), call("first", "lookup")),
+            result("delegate", marker()), result("first", "FIRST"), result("second", "SECOND"),
+        ])
+
+        self.assertEqual([c["id"] for m in messages for c in m.get("tool_calls", [])], ["second", "first"])
+        self.assertEqual([m["tool_call_id"] for m in messages if m["role"] == "tool"], ["first", "second"])
+
     async def test_private_reused_id_never_reaches_child_completion(self):
         messages = await self.route_history([
             {"role": "user", "content": "private question"},

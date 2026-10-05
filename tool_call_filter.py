@@ -1,13 +1,12 @@
 """
 title: Tool Call Filter
 description: Keeps unambiguous completed Tool call occurrences permitted for the destination model.
-version: 0.18.0
+version: 0.20.0
 required_open_webui_version: 0.11.1
 """
 
 from __future__ import annotations
 
-import json
 import logging
 
 from pydantic import BaseModel, Field
@@ -18,7 +17,7 @@ from pydantic import BaseModel, Field
 
 
 import copy
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -30,6 +29,43 @@ class CapabilitySet:
     tool_ids: list[str]
     skill_ids: list[str]
     tools: dict
+
+
+class ModelPreparation:
+    """A model draft whose cached Tools share one request-local history."""
+
+    def __init__(self, runtime, branch: str, body: dict):
+        try:
+            self._cache_key, messages_key = runtime.CAPABILITY_FIELDS[branch]
+        except KeyError:
+            raise ValueError(f"Unknown model preparation branch: {branch}") from None
+        self._runtime = runtime
+        self.body = runtime.routed_body(body)
+        messages = runtime.metadata.get(messages_key)
+        self._messages = messages if isinstance(messages, list) else []
+        runtime.sync(**{messages_key: self._messages})
+
+    @property
+    def messages(self) -> list[dict]:
+        """Pass this stable list to loaders; preparation owns its contents."""
+        return self._messages
+
+    async def capabilities(
+        self,
+        *,
+        model_id: str,
+        tool_ids: list[str],
+        skill_ids: list[str],
+        load: Callable[[list[dict]], Awaitable[CapabilitySet]],
+    ) -> CapabilitySet:
+        cached = self._runtime._cached_capabilities(
+            self._cache_key, model_id, tool_ids, skill_ids,
+        )
+        if cached is not None:
+            return cached
+        capabilities = await load(self.messages)
+        self._runtime._cache_capabilities(self._cache_key, model_id, capabilities)
+        return capabilities
 
 
 class SkillLoaderOwnership:
@@ -64,7 +100,7 @@ class RequestRuntime:
     """Own the shared, request-scoped metadata and live Tool registries."""
 
     RESET_FIELDS = (
-        "lite_history_boundary", "lite_child_messages", "lite_router_user_index",
+        "lite_history_boundary", "lite_child_messages", "lite_base_messages", "lite_router_user_index",
         "lite_active_handoff", "lite_active_agent_id", "lite_active_skill_id",
         "lite_active_model_id", "lite_active_tool_runtime", "lite_base_tool_runtime",
         "lite_orchestrator_skill_context", "lite_unfiltered_messages",
@@ -80,6 +116,10 @@ class RequestRuntime:
         "lite_base_tool_ids", "lite_orchestrator_skill_ids", "lite_registry_applied",
     )
     MANAGED_FIELDS = RESET_FIELDS + CONFIG_FIELDS + ("tools", "tool_ids", "skill_ids")
+    CAPABILITY_FIELDS = {
+        "child": ("lite_active_tool_runtime", "lite_child_messages"),
+        "orchestrator": ("lite_base_tool_runtime", "lite_base_messages"),
+    }
     ROUTER_FILTERS = {
         "lite_registry": "Lite Subagent Registry",
         "previous_tool_context": "Previous Tool Context",
@@ -235,6 +275,17 @@ class RequestRuntime:
             self.publish()
 
     @contextmanager
+    def prepare_model(self, branch: str, body: dict) -> Iterator[ModelPreparation]:
+        """Publish final Tool context only when the whole model draft succeeds."""
+        with self.preparation():
+            prepared = ModelPreparation(self, branch, body)
+            yield prepared
+            if not isinstance(prepared.body, dict) or not isinstance(prepared.body.get("messages"), list):
+                raise TypeError("Model preparation returned an invalid request body")
+            prepared.body["metadata"] = self.metadata
+            prepared.messages[:] = copy.deepcopy(prepared.body["messages"])
+
+    @contextmanager
     def child_filters(self) -> Iterator[None]:
         self.discard(*(name + "_applied" for name in self.CHILD_FILTERS))
         self.sync(lite_subagent_filter_pipeline=[], lite_subagent_filter_run=True)
@@ -313,7 +364,7 @@ class RequestRuntime:
         self.sync(tools=shared, tool_ids=list(tool_ids))
         return shared
 
-    def cached_capabilities(
+    def _cached_capabilities(
         self,
         cache_key: str,
         model_id: str,
@@ -335,7 +386,7 @@ class RequestRuntime:
             )
         return None
 
-    def cache_capabilities(
+    def _cache_capabilities(
         self,
         cache_key: str,
         model_id: str,
@@ -362,22 +413,26 @@ class RequestRuntime:
 
 # BEGIN GENERATED TOOL HISTORY
 # Edit shared/tool_history.py; run python3 tools/generate_skill_preparation.py
-"""Pair concrete Tool exchanges without treating correlation IDs as global keys."""
+"""Interpret completed Tool history before consumers select or format it."""
 
-from collections.abc import Callable
+import json
 from dataclasses import dataclass
+from typing import Any
 
 
-def resolve_agent_id(value: str | None, registry: dict) -> str | None:
-    """Resolve a direct ID or an unambiguous accepted routing Skill alias."""
+
+def _agent_registry(registry: dict | None) -> dict:
     if not isinstance(registry, dict):
-        return None
-    agents = {
+        return {}
+    return {
         str(agent_id or "").strip(): config
         for agent_id, config in registry.items()
         if str(agent_id or "").strip() and isinstance(config, dict)
         and str(config.get("model_id") or "").strip()
     }
+
+
+def _resolve_agent_id(value: str | None, agents: dict) -> str | None:
     if value in agents:
         return value
     matches = [
@@ -387,16 +442,74 @@ def resolve_agent_id(value: str | None, registry: dict) -> str | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def resolve_agent_id(value: str | None, registry: dict) -> str | None:
+    """Resolve a direct ID or an unambiguous accepted routing Skill alias."""
+    return _resolve_agent_id(value, _agent_registry(registry))
+
+
+def parse_handoff(value: Any) -> str | None:
+    """Read a v2 destination without deciding whether it is available."""
+    if isinstance(value, str) and value.strip():
+        try:
+            value = json.loads(value.strip())
+            if isinstance(value, str):
+                value = json.loads(value)
+        except (TypeError, ValueError):
+            return None
+    if not isinstance(value, dict) or value.get("__lite_delegate__") != "v2":
+        return None
+    return str(value.get("agent_id") or "").strip() or None
+
+
+@dataclass(frozen=True)
+class ToolExecutor:
+    kind: str
+    agent_id: str | None = None
+    declared_agent_id: str | None = None
+    model_id: str | None = None
+    name: str | None = None
+
+
+@dataclass(frozen=True)
+class HandoffEvidence:
+    declared_agent_id: str
+    agent_id: str | None
+
+
 @dataclass(frozen=True)
 class ToolExchange:
     message_index: int
     call_index: int
     result_index: int
+    executor: ToolExecutor
+    handoff: HandoffEvidence | None = None
 
 
-def completed_tool_exchanges(
-    messages: list[dict], *, is_tool_image_message: Callable[[dict], bool],
-) -> list[ToolExchange]:
+@dataclass(frozen=True)
+class ToolHistory:
+    """Immutable facts whose indices refer to the unmodified input history."""
+
+    user_indices: tuple[int, ...]
+    exchanges: tuple[ToolExchange, ...]
+
+    @property
+    def current_user_index(self) -> int:
+        return self.user_indices[-1] if self.user_indices else -1
+
+    @property
+    def current_handoff(self) -> str | None:
+        return next(
+            (
+                exchange.handoff.declared_agent_id
+                for exchange in reversed(self.exchanges)
+                if exchange.message_index > self.current_user_index
+                and exchange.handoff is not None
+            ),
+            None,
+        )
+
+
+def _completed_exchanges(messages: list[dict]) -> list[tuple[int, int, int]]:
     """Match only within one assistant execution batch in one user request.
 
     OWUI may group several sequential executions into one assistant message.
@@ -404,7 +517,7 @@ def completed_tool_exchanges(
     IDs within that batch are ambiguous; a later batch cannot complete an earlier
     one. Identical repeated results represent one exchange, conflicting ones none.
     """
-    exchanges: list[ToolExchange] = []
+    exchanges: list[tuple[int, int, int]] = []
     calls: dict[str, list[tuple[int, int]]] = {}
     results: dict[str, list[int]] = {}
 
@@ -417,13 +530,13 @@ def completed_tool_exchanges(
             if any(messages[index] != messages[first_result] for index in matching_results[1:]):
                 continue
             message_index, call_index = occurrences[0]
-            exchanges.append(ToolExchange(message_index, call_index, first_result))
+            exchanges.append((message_index, call_index, first_result))
         calls.clear()
         results.clear()
 
     for index, message in enumerate(messages):
         role = message.get("role")
-        if role == "assistant" or (role == "user" and not is_tool_image_message(message)):
+        if role == "assistant" or (role == "user" and not RequestRuntime.is_tool_image_message(message)):
             finish_batch()
         if role == "assistant":
             for call_index, call in enumerate(message.get("tool_calls") or []):
@@ -436,47 +549,77 @@ def completed_tool_exchanges(
                 results.setdefault(call_id, []).append(index)
     finish_batch()
     return exchanges
+
+
+def analyze_history(messages: list[dict], *, registry: dict | None = None) -> ToolHistory:
+    """Pair and attribute exchanges in Tool Result order without changing input.
+
+    None means standalone execution: every executor stays model. A supplied
+    Registry, even empty, enables Router attribution. Missing or ambiguous
+    destinations remain Handoff evidence, but cannot prove a subagent executor.
+    """
+    if not isinstance(messages, list):
+        raise TypeError("Tool history messages must be a list")
+    if registry is not None and not isinstance(registry, dict):
+        raise TypeError("Tool history Registry must be an object")
+
+    agents = _agent_registry(registry)
+    pairs = _completed_exchanges(messages)
+    by_result = {result_index: (message_index, call_index) for message_index, call_index, result_index in pairs}
+    completed_calls = {(message_index, call_index) for message_index, call_index, _ in pairs}
+    root_executor = ToolExecutor("model" if registry is None else "orchestrator")
+    executor = root_executor
+    uncertain_batch = False
+    user_indices: list[int] = []
+    exchanges: list[ToolExchange] = []
+
+    for index, message in enumerate(messages):
+        role = message.get("role")
+        if role == "user" and not RequestRuntime.is_tool_image_message(message):
+            user_indices.append(index)
+            executor = root_executor
+            uncertain_batch = False
+        if role == "assistant":
+            uncertain_batch = any(
+                (call.get("function") or {}).get("name") == "lite_delegate"
+                and (index, call_index) not in completed_calls
+                for call_index, call in enumerate(message.get("tool_calls") or [])
+            )
+            if registry is not None and uncertain_batch:
+                # An unpaired delegate has no trustworthy transition position.
+                executor = ToolExecutor("unknown")
+
+        pair = by_result.get(index)
+        if pair is None:
+            continue
+        message_index, call_index = pair
+        call = messages[message_index]["tool_calls"][call_index]
+        is_delegate = (call.get("function") or {}).get("name") == "lite_delegate"
+        declared_id = parse_handoff(message.get("content")) if is_delegate else None
+        agent_id = _resolve_agent_id(declared_id, agents) if declared_id is not None else None
+        handoff = HandoffEvidence(declared_id, agent_id) if declared_id is not None else None
+        exchanges.append(ToolExchange(message_index, call_index, index, executor, handoff))
+
+        # The delegate exchange itself belongs to the preceding executor.
+        if registry is not None and is_delegate:
+            if uncertain_batch or agent_id is None:
+                executor = ToolExecutor("unknown", declared_agent_id=declared_id)
+            else:
+                config = agents[agent_id]
+                executor = ToolExecutor(
+                    "subagent", agent_id=agent_id, declared_agent_id=declared_id,
+                    model_id=str(config.get("model_id") or "").strip(),
+                    name=str(config.get("name") or agent_id),
+                )
+
+    return ToolHistory(tuple(user_indices), tuple(exchanges))
 # END GENERATED TOOL HISTORY
 
 log = logging.getLogger(__name__)
 
-DELEGATE_VERSION = "v2"
 TOOL_IMAGE_TEXT = "Here are the images from the tool results above. Please analyze them."
 APPLIED_KEY = "tool_call_filter_applied"
 PIPELINE_KEY = "lite_subagent_filter_pipeline"
-
-
-is_tool_image_message = RequestRuntime.is_tool_image_message
-
-
-def last_user_index(messages: list[dict]) -> int:
-    return next(
-        (
-            index
-            for index in range(len(messages) - 1, -1, -1)
-            if messages[index].get("role") == "user"
-            and not is_tool_image_message(messages[index])
-        ),
-        -1,
-    )
-
-
-def parse_delegate_marker(value) -> str | None:
-    if isinstance(value, dict):
-        data = value
-    elif isinstance(value, str) and value.strip():
-        try:
-            data = json.loads(value)
-            if isinstance(data, str):
-                data = json.loads(data)
-        except (TypeError, ValueError, json.JSONDecodeError):
-            return None
-    else:
-        return None
-    if not isinstance(data, dict) or data.get("__lite_delegate__") != DELEGATE_VERSION:
-        return None
-    agent_id = str(data.get("agent_id") or "").strip()
-    return agent_id or None
 
 
 def visible_assistant(message: dict) -> bool:
@@ -521,61 +664,20 @@ class Filter:
         return {name for name in names if name}
 
     @staticmethod
-    def _historical_exchanges(
-        messages: list[dict], exchanges: list[ToolExchange],
-        selected_agent: str | None, registry: dict,
-    ) -> set[ToolExchange]:
-        """Attribute grouped calls at their results, before removing Handoffs."""
-        selected: set[ToolExchange] = set()
-        if selected_agent is None:
-            return selected
-        by_result = {exchange.result_index: exchange for exchange in exchanges}
-        completed_calls = {(exchange.message_index, exchange.call_index) for exchange in exchanges}
-        executor: str | None = None
-        uncertain_batch = False
-        for index, message in enumerate(messages):
-            if message.get("role") == "user" and not is_tool_image_message(message):
-                executor = None
-            if message.get("role") == "assistant":
-                uncertain_batch = any(
-                    (call.get("function") or {}).get("name") == "lite_delegate"
-                    and (index, call_index) not in completed_calls
-                    for call_index, call in enumerate(message.get("tool_calls") or [])
-                )
-                if uncertain_batch:
-                    # An unpaired delegate has no trustworthy transition position.
-                    executor = None
-            exchange = by_result.get(index)
-            if exchange is None:
-                continue
-            call = messages[exchange.message_index]["tool_calls"][exchange.call_index]
-            if (call.get("function") or {}).get("name") == "lite_delegate":
-                agent_id = parse_delegate_marker(message.get("content"))
-                executor = resolve_agent_id(agent_id, registry) if not uncertain_batch else None
-            elif executor == selected_agent:
-                selected.add(exchange)
-        return selected
-
-    @classmethod
     def _keep_supported_pairs(
-        cls, messages: list[dict], allowed_names: set[str], target_agent_id: str,
+        messages: list[dict], allowed_names: set[str], target_agent_id: str,
         registry: dict,
     ) -> list[dict]:
-        exchanges = completed_tool_exchanges(messages, is_tool_image_message=is_tool_image_message)
-        current_user = last_user_index(messages)
+        history = analyze_history(messages, registry=registry)
+        exchanges = history.exchanges
+        current_user = history.current_user_index
         selected_agent = resolve_agent_id(target_agent_id, registry)
-        historical = cls._historical_exchanges(
-            messages[:max(current_user, 0)], exchanges, selected_agent, registry,
-        )
         marker_index = -1
         if current_user >= 0 and target_agent_id:
             for exchange in exchanges:
-                call = messages[exchange.message_index]["tool_calls"][exchange.call_index]
-                if exchange.message_index <= current_user or (call.get("function") or {}).get("name") != "lite_delegate":
+                if exchange.message_index <= current_user or exchange.handoff is None:
                     continue
-                destination = parse_delegate_marker(messages[exchange.result_index].get("content"))
-                if registry:
-                    destination = resolve_agent_id(destination, registry)
+                destination = exchange.handoff.agent_id if registry else exchange.handoff.declared_agent_id
                 if destination and destination == (selected_agent or target_agent_id):
                     marker_index = max(marker_index, exchange.result_index)
 
@@ -586,7 +688,10 @@ class Filter:
             if name not in allowed_names:
                 continue
             if exchange.message_index < current_user:
-                if target_agent_id and exchange not in historical:
+                if target_agent_id and (
+                    name == "lite_delegate" or exchange.executor.kind != "subagent"
+                    or exchange.executor.agent_id != selected_agent
+                ):
                     continue
             elif exchange.result_index <= marker_index:
                 continue
@@ -595,7 +700,7 @@ class Filter:
         # Recover only their concrete pairs, after matching the original batches.
         recovered_calls = [
             messages[exchange.message_index]["tool_calls"][exchange.call_index]
-            for exchange in accepted
+            for exchange in sorted(accepted, key=lambda item: (item.message_index, item.call_index))
             if current_user < exchange.message_index < marker_index
         ]
         accepted_calls = {(exchange.message_index, exchange.call_index) for exchange in accepted}

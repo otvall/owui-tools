@@ -9,6 +9,7 @@ from test_handoff_history import (
     PipeTestCase, assistant, call, context_filter_module, grouped_history, marker,
     result, tool_filter_module,
 )
+from test_previous_turn_context import unpack_record
 
 
 class ExecutorHistoryTests(PipeTestCase):
@@ -16,6 +17,29 @@ class ExecutorHistoryTests(PipeTestCase):
         await super().asyncSetUp()
         self.context_filter.valves.history_turns = 2
         self.context_filter.valves.history_tool_calls = 5
+
+    async def test_reference_record_keeps_unknown_work_while_child_history_excludes_it(self):
+        source = [
+            {"role": "user", "content": "Old question"},
+            assistant(call("to-a", "lite_delegate")), result("to-a", marker()),
+            assistant(call("known", "lookup")), result("known", "KNOWN_A_RESULT"),
+            assistant(call("unfinished", "lite_delegate"), call("unknown", "lookup")),
+            result("unknown", "UNKNOWN_EXECUTOR_RESULT"),
+            {"role": "assistant", "content": "Old answer"},
+            {"role": "user", "content": "Current question"},
+            assistant(call("delegate", "lite_delegate")), result("delegate", marker()),
+        ]
+        self.begin_request()
+        body = {"model": "router", "metadata": self.metadata, "messages": source}
+        await self.router_inlets(body)
+        record = unpack_record(body["messages"])
+
+        await self.invoke_body(body)
+
+        self.assertEqual(record["tool_exchanges"][-1]["result"], result("unknown", "UNKNOWN_EXECUTOR_RESULT"))
+        self.assertEqual(record["tool_exchanges"][-1]["executor"], {"kind": "unknown"})
+        self.assertEqual([m for m in self.routed["messages"] if m["role"] == "tool"],
+                         [result("known", "KNOWN_A_RESULT")])
 
     async def test_selected_agent_gets_only_its_own_permitted_history_and_retained_text(self):
         history = [

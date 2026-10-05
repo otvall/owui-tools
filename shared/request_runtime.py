@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Iterator
+from collections.abc import Awaitable, Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
@@ -15,6 +15,43 @@ class CapabilitySet:
     tool_ids: list[str]
     skill_ids: list[str]
     tools: dict
+
+
+class ModelPreparation:
+    """A model draft whose cached Tools share one request-local history."""
+
+    def __init__(self, runtime, branch: str, body: dict):
+        try:
+            self._cache_key, messages_key = runtime.CAPABILITY_FIELDS[branch]
+        except KeyError:
+            raise ValueError(f"Unknown model preparation branch: {branch}") from None
+        self._runtime = runtime
+        self.body = runtime.routed_body(body)
+        messages = runtime.metadata.get(messages_key)
+        self._messages = messages if isinstance(messages, list) else []
+        runtime.sync(**{messages_key: self._messages})
+
+    @property
+    def messages(self) -> list[dict]:
+        """Pass this stable list to loaders; preparation owns its contents."""
+        return self._messages
+
+    async def capabilities(
+        self,
+        *,
+        model_id: str,
+        tool_ids: list[str],
+        skill_ids: list[str],
+        load: Callable[[list[dict]], Awaitable[CapabilitySet]],
+    ) -> CapabilitySet:
+        cached = self._runtime._cached_capabilities(
+            self._cache_key, model_id, tool_ids, skill_ids,
+        )
+        if cached is not None:
+            return cached
+        capabilities = await load(self.messages)
+        self._runtime._cache_capabilities(self._cache_key, model_id, capabilities)
+        return capabilities
 
 
 class SkillLoaderOwnership:
@@ -49,7 +86,7 @@ class RequestRuntime:
     """Own the shared, request-scoped metadata and live Tool registries."""
 
     RESET_FIELDS = (
-        "lite_history_boundary", "lite_child_messages", "lite_router_user_index",
+        "lite_history_boundary", "lite_child_messages", "lite_base_messages", "lite_router_user_index",
         "lite_active_handoff", "lite_active_agent_id", "lite_active_skill_id",
         "lite_active_model_id", "lite_active_tool_runtime", "lite_base_tool_runtime",
         "lite_orchestrator_skill_context", "lite_unfiltered_messages",
@@ -65,6 +102,10 @@ class RequestRuntime:
         "lite_base_tool_ids", "lite_orchestrator_skill_ids", "lite_registry_applied",
     )
     MANAGED_FIELDS = RESET_FIELDS + CONFIG_FIELDS + ("tools", "tool_ids", "skill_ids")
+    CAPABILITY_FIELDS = {
+        "child": ("lite_active_tool_runtime", "lite_child_messages"),
+        "orchestrator": ("lite_base_tool_runtime", "lite_base_messages"),
+    }
     ROUTER_FILTERS = {
         "lite_registry": "Lite Subagent Registry",
         "previous_tool_context": "Previous Tool Context",
@@ -220,6 +261,17 @@ class RequestRuntime:
             self.publish()
 
     @contextmanager
+    def prepare_model(self, branch: str, body: dict) -> Iterator[ModelPreparation]:
+        """Publish final Tool context only when the whole model draft succeeds."""
+        with self.preparation():
+            prepared = ModelPreparation(self, branch, body)
+            yield prepared
+            if not isinstance(prepared.body, dict) or not isinstance(prepared.body.get("messages"), list):
+                raise TypeError("Model preparation returned an invalid request body")
+            prepared.body["metadata"] = self.metadata
+            prepared.messages[:] = copy.deepcopy(prepared.body["messages"])
+
+    @contextmanager
     def child_filters(self) -> Iterator[None]:
         self.discard(*(name + "_applied" for name in self.CHILD_FILTERS))
         self.sync(lite_subagent_filter_pipeline=[], lite_subagent_filter_run=True)
@@ -298,7 +350,7 @@ class RequestRuntime:
         self.sync(tools=shared, tool_ids=list(tool_ids))
         return shared
 
-    def cached_capabilities(
+    def _cached_capabilities(
         self,
         cache_key: str,
         model_id: str,
@@ -320,7 +372,7 @@ class RequestRuntime:
             )
         return None
 
-    def cache_capabilities(
+    def _cache_capabilities(
         self,
         cache_key: str,
         model_id: str,

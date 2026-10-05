@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Embed shared preparation, lifecycle and Tool pairing in standalone Functions."""
+"""Embed shared preparation, lifecycle and Tool history in standalone Functions."""
 
 import argparse
 import ast
@@ -12,7 +12,7 @@ TARGETS = ("lite_handoff_router.py", "skill_context.py", "lite_subagent_registry
 RUNTIME_TARGETS = TARGETS + (
     "previous_tool_context.py", "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
 )
-HISTORY_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py")
+HISTORY_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py", "previous_tool_context.py")
 
 
 def embed(original: str, source: str, region: str, source_name: str) -> str:
@@ -36,6 +36,7 @@ def main() -> int:
     # Future imports belong at the top of deployment files, which already use them.
     runtime_source = runtime_source.replace("from __future__ import annotations\n", "")
     history_source = (ROOT / "shared/tool_history.py").read_text()
+    history_source = history_source.replace("from shared.request_runtime import RequestRuntime\n", "")
     normalizer = next(
         node for node in ast.parse(source).body
         if isinstance(node, ast.FunctionDef) and node.name == "normalize_skill_ids"

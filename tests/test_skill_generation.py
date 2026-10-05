@@ -105,11 +105,11 @@ class SkillGenerationTests(unittest.TestCase):
             self.assertNotEqual(output, before[name])
         self.assertEqual(self.run_generator("--check").returncode, 0)
 
-    def test_tool_pairing_source_change_refreshes_only_history_consumers(self):
+    def test_tool_history_source_change_refreshes_only_history_consumers(self):
         source = self.root / "shared/tool_history.py"
-        source.write_text(source.read_text() + "\n# Updated Tool pairing source\n")
+        source.write_text(source.read_text() + "\n# Updated Tool history source\n")
         before = self.outputs()
-        consumers = {"lite_handoff_router.py", "tool_call_filter.py", "subagent_context.py"}
+        consumers = {"lite_handoff_router.py", "tool_call_filter.py", "subagent_context.py", "previous_tool_context.py"}
         checked = self.run_generator("--check")
         self.assertEqual(checked.returncode, 1, checked.stderr)
         for name in consumers:
