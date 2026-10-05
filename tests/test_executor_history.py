@@ -17,13 +17,6 @@ class ExecutorHistoryTests(PipeTestCase):
         self.context_filter.valves.history_turns = 2
         self.context_filter.valves.history_tool_calls = 5
 
-    async def route_history(self, source):
-        body = {"model": "router", "metadata": self.metadata, "messages": copy.deepcopy(source)}
-        self.begin_request()
-        await self.router_inlets(body)
-        await self.invoke_body(body)
-        return self.routed["messages"]
-
     async def test_selected_agent_gets_only_its_own_permitted_history_and_retained_text(self):
         history = [
             {"role": "user", "content": "old question"},

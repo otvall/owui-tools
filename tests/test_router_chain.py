@@ -140,6 +140,90 @@ class RouterChainTests(PipeTestCase):
                 self.completion.assert_not_awaited()
                 self.assertEqual(self.metadata, original)
 
+    async def test_new_request_recovers_after_missing_registry(self):
+        for platform_ids, filter_request in ((False, True), (True, True), (False, False)):
+            with self.subTest(platform_ids=platform_ids, filter_request=filter_request):
+                self.metadata.clear()
+                self.metadata["tools"] = {}
+                if platform_ids:
+                    self.metadata.update(chat_id="chat", message_id="first-message")
+                self.begin_request()
+                first = {
+                    "model": "router", "metadata": self.metadata,
+                    "messages": [{"role": "user", "content": "Repeat this"}],
+                }
+                self.completion.reset_mock()
+                if filter_request:
+                    await self.context_inlets(first)
+                else:
+                    await self.previous.inlet(first)
+                    await self.cleanup.inlet(first)
+                with self.assertRaisesRegex(ValueError, "Registry"):
+                    await self.invoke_body(first)
+                self.completion.assert_not_awaited()
+                shared = self.metadata["tools"]
+
+                with self.assertRaisesRegex(ValueError, "Registry.*before.*Previous Tool Context"):
+                    await self.registry.inlet(
+                        copy.deepcopy(first), __request__=Request(self.request.scope), __user__={"id": "user"},
+                    )
+
+                # Reusing metadata and identical trimmed text must not retain the error.
+                if platform_ids:
+                    self.metadata["message_id"] = "second-message"
+                request_metadata = {**self.metadata, "platform": "keep request state"}
+                self.begin_request(metadata=request_metadata)
+                second = {
+                    "model": "router", "metadata": self.metadata,
+                    "messages": [{"role": "user", "content": "Repeat this"}],
+                }
+                await self.router_inlets(second, registry=self.registry)
+                await self.invoke_body(second)
+
+                self.completion.assert_awaited_once()
+                self.assertEqual(self.routed["model"], "base-model")
+                self.assertEqual(
+                    [m["content"] for m in self.routed["messages"] if m["role"] == "user"],
+                    ["Repeat this"],
+                )
+                self.assertIs(self.metadata["tools"], shared)
+                self.assertIs(request_metadata["tools"], shared)
+                self.assertEqual(request_metadata["platform"], "keep request state")
+
+    async def test_new_request_after_context_filters_without_request_dispatches(self):
+        self.begin_request()
+        await self.registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
+        await self.previous.inlet(self.body)
+        await self.cleanup.inlet(self.body)
+        await self.invoke_body(self.body)
+        self.completion.assert_awaited_once()
+        shared = self.metadata["tools"]
+        self.completion.reset_mock()
+
+        # A new wrapper on the same HTTP request must still reject late Registry.
+        with self.assertRaisesRegex(ValueError, "Registry.*before.*Previous Tool Context"):
+            await self.registry.inlet(
+                copy.deepcopy(self.body), __request__=Request(self.request.scope), __user__={"id": "user"},
+            )
+        self.completion.assert_not_awaited()
+
+        request_metadata = {**self.metadata, "platform": "keep request state"}
+        self.begin_request(metadata=request_metadata)
+        body = {
+            "model": "router", "metadata": self.metadata,
+            "messages": [{"role": "user", "content": "New request"}],
+        }
+        await self.router_inlets(body, registry=self.registry)
+        await self.invoke_body(body)
+        self.completion.assert_awaited_once()
+        self.assertEqual(self.routed["model"], "base-model")
+        self.assertEqual(
+            [m["content"] for m in self.routed["messages"] if m["role"] == "user"], ["New request"],
+        )
+        self.assertIs(self.metadata["tools"], shared)
+        self.assertIs(request_metadata["tools"], shared)
+        self.assertEqual(request_metadata["platform"], "keep request state")
+
     async def test_missing_context_component_blocks_both_completion_routes(self):
         for missing, label in ((self.previous, "Previous Tool Context"), (self.cleanup, "History Cleanup")):
             for messages in ([{"role": "user", "content": "question"}], grouped_history()[:4]):
@@ -192,6 +276,107 @@ class RouterChainTests(PipeTestCase):
                 with self.assertRaisesRegex(ValueError, "Registry"):
                     await self.invoke_body(body)
                 self.completion.assert_not_awaited()
+
+    async def test_registry_cannot_follow_context_filtering_without_request_identity(self):
+        await self.context_inlets(self.body)
+        self.begin_request()
+        body = {
+            "model": "router", "metadata": self.metadata,
+            "messages": previous_turn() + [{"role": "user", "content": "New request"}],
+        }
+        # Standalone callers may omit __request__; the earlier identity is no evidence
+        # that these freshly executed filters belong to the earlier request.
+        await self.previous.inlet(body)
+        await self.cleanup.inlet(body)
+        original_messages = copy.deepcopy(body["messages"])
+        with self.assertRaisesRegex(ValueError, "Registry.*before.*Previous Tool Context"):
+            await self.registry.inlet(body, __request__=self.request, __user__={"id": "user"})
+        self.assertEqual(body["messages"], original_messages)
+        with self.assertRaisesRegex(ValueError, "Registry"):
+            await self.invoke_body(body)
+        self.completion.assert_not_awaited()
+
+    async def test_new_request_recovers_after_late_registry_without_filter_request(self):
+        self.begin_request()
+        await self.previous.inlet(self.body)
+        await self.cleanup.inlet(self.body)
+        original_messages = copy.deepcopy(self.body["messages"])
+        shared = self.metadata["tools"]
+        with self.assertRaisesRegex(ValueError, "Registry.*before.*Previous Tool Context"):
+            await self.registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
+        self.assertEqual(self.body["messages"], original_messages)
+        self.completion.assert_not_awaited()
+
+        self.begin_request()
+        body = {
+            "model": "router", "metadata": self.metadata,
+            "messages": [{"role": "user", "content": "New request"}],
+        }
+        await self.router_inlets(body, registry=self.registry)
+        await self.invoke_body(body)
+        self.completion.assert_awaited_once()
+        self.assertEqual(self.routed["model"], "base-model")
+        self.assertIs(self.metadata["tools"], shared)
+
+    async def test_new_request_recovers_after_registry_skill_validation_failure(self):
+        self.begin_request()
+        await self.previous.inlet(self.body)
+        await self.cleanup.inlet(self.body)
+        original_messages = copy.deepcopy(self.body["messages"])
+        shared = self.metadata["tools"]
+        load_skill = self.skills.side_effect
+        self.skills.side_effect = lambda id: None if id == "missing" else load_skill(id)
+        self.registry.valves.base_skill_ids = ["missing"]
+
+        with self.assertRaisesRegex(ValueError, "Configured model-bound Skills are unavailable: missing"):
+            await self.registry.inlet(self.body, __request__=self.request, __user__={"id": "user"})
+        self.completion.assert_not_awaited()
+        self.assertEqual(self.body["messages"], original_messages)
+        self.assertIs(self.metadata["tools"], shared)
+
+        self.registry.valves.base_skill_ids = []
+        with self.assertRaisesRegex(ValueError, "Registry.*before.*Previous Tool Context"):
+            await self.registry.inlet(
+                copy.deepcopy(self.body), __request__=Request(self.request.scope), __user__={"id": "user"},
+            )
+        self.completion.assert_not_awaited()
+        self.begin_request()
+        body = {
+            "model": "router", "metadata": self.metadata,
+            "messages": [{"role": "user", "content": "New request"}],
+        }
+        await self.router_inlets(body, registry=self.registry)
+        await self.invoke_body(body)
+        self.completion.assert_awaited_once()
+        self.assertEqual(self.routed["model"], "base-model")
+        self.assertIs(self.metadata["tools"], shared)
+
+    async def test_new_request_recovers_after_pipe_user_lookup_failure(self):
+        self.begin_request()
+        await self.previous.inlet(self.body)
+        await self.cleanup.inlet(self.body)
+        original_messages = copy.deepcopy(self.body["messages"])
+        shared = self.metadata["tools"]
+        load_user = self.users.side_effect
+        self.users.side_effect = RuntimeError("user lookup unavailable")
+
+        with self.assertRaisesRegex(RuntimeError, "user lookup unavailable"):
+            await self.invoke_body(self.body)
+        self.completion.assert_not_awaited()
+        self.assertEqual(self.body["messages"], original_messages)
+        self.assertIs(self.metadata["tools"], shared)
+
+        self.users.side_effect = load_user
+        self.begin_request()
+        body = {
+            "model": "router", "metadata": self.metadata,
+            "messages": [{"role": "user", "content": "New request"}],
+        }
+        await self.router_inlets(body, registry=self.registry)
+        await self.invoke_body(body)
+        self.completion.assert_awaited_once()
+        self.assertEqual(self.routed["model"], "base-model")
+        self.assertIs(self.metadata["tools"], shared)
 
     async def test_registry_reentry_cannot_recertify_the_same_cleaned_request(self):
         await self.router_inlets(self.body, registry=self.registry)

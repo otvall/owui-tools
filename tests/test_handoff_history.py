@@ -212,6 +212,13 @@ class PipeTestCase(unittest.IsolatedAsyncioTestCase):
             __event_emitter__=self.events,
         )
 
+    async def route_history(self, messages):
+        body = {"model": "router", "metadata": self.metadata, "messages": copy.deepcopy(messages)}
+        self.begin_request()
+        await self.router_inlets(body)
+        await self.invoke_body(body)
+        return self.routed["messages"]
+
     @property
     def routed(self):
         return self.completion.call_args.args[1]

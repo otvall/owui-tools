@@ -136,13 +136,6 @@ class PipeOccurrenceHistoryTests(PipeTestCase):
         self.context_filter.valves.history_turns = 2
         self.context_filter.valves.history_tool_calls = 5
 
-    async def route_history(self, messages):
-        body = {"model": "router", "metadata": self.metadata, "messages": copy.deepcopy(messages)}
-        self.begin_request()
-        await self.router_inlets(body)
-        await self.invoke_body(body)
-        return self.routed["messages"]
-
     async def test_private_reused_id_never_reaches_child_completion(self):
         messages = await self.route_history([
             {"role": "user", "content": "private question"},

@@ -491,6 +491,66 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
 class ChildSkillTests(SkillBehavior, PipeTestCase):
     path = "child"
 
+    async def test_removing_skills_filters_previous_loader_exchange_on_the_next_continuation(self):
+        self.runtime_model["info"]["meta"]["skillIds"] = ["alpha"]
+        await self.prepare()
+        self.body["messages"] += [
+            assistant(call("loaded-alpha", "view_skill", id="alpha")),
+            result("loaded-alpha", "Full alpha instructions <unchanged>"),
+            assistant(call("lookup", "lookup")), result("lookup", "CURRENT_RESULT"),
+        ]
+        await self.prepare()
+        self.assertEqual(
+            [message for message in self.body["messages"] if message.get("tool_calls") or message["role"] == "tool"],
+            [
+                assistant(call("loaded-alpha", "view_skill", id="alpha")),
+                result("loaded-alpha", "Full alpha instructions <unchanged>"),
+                assistant(call("lookup", "lookup")), result("lookup", "CURRENT_RESULT"),
+            ],
+        )
+        self.select([])
+
+        await self.prepare()
+
+        self.assertEqual(
+            [message for message in self.body["messages"] if message.get("tool_calls") or message["role"] == "tool"],
+            [assistant(call("lookup", "lookup")), result("lookup", "CURRENT_RESULT")],
+        )
+        self.assertNotIn("view_skill", self.metadata["tools"])
+        self.assertFalse(any(schema["function"]["name"] == "view_skill" for schema in self.body["tools"]))
+
+    async def test_loader_eligibility_changes_filter_the_exchange_without_detaching_skills(self):
+        available_builtins = self.builtins.return_value
+        for unavailable in ("legacy", "session", "capability", "builtin"):
+            with self.subTest(unavailable=unavailable):
+                self.metadata.update(session_id="session", params={"function_calling": "native"})
+                self.runtime_model["info"]["meta"]["capabilities"] = {"builtin_tools": True}
+                self.builtins.return_value = available_builtins
+                self.body["messages"] = grouped_history()[:4]
+                await self.prepare()
+                self.body["messages"] += [
+                    assistant(call("loaded-alpha", "view_skill", id="alpha")),
+                    result("loaded-alpha", "Full alpha instructions <unchanged>"),
+                    assistant(call("lookup", "lookup")), result("lookup", "CURRENT_RESULT"),
+                ]
+                if unavailable == "legacy":
+                    self.metadata["params"] = {"function_calling": "legacy"}
+                elif unavailable == "session":
+                    self.metadata.pop("session_id")
+                elif unavailable == "capability":
+                    self.runtime_model["info"]["meta"]["capabilities"]["builtin_tools"] = False
+                else:
+                    self.builtins.return_value = {}
+
+                await self.prepare()
+
+                self.assertEqual(
+                    [message for message in self.body["messages"] if message.get("tool_calls") or message["role"] == "tool"],
+                    [assistant(call("lookup", "lookup")), result("lookup", "CURRENT_RESULT")],
+                )
+                self.assertIn("Full alpha instructions <unchanged>", self.prompt())
+                self.assertNotIn("view_skill", self.metadata["tools"])
+
     async def test_database_removal_clears_skills_despite_stale_runtime_and_outer_selection(self):
         self.runtime_model["info"]["meta"]["skillIds"] = ["alpha"]
         request_state = {"platform": "keep request"}

@@ -53,7 +53,7 @@ class RequestRuntime:
         "lite_active_handoff", "lite_active_agent_id", "lite_active_skill_id",
         "lite_active_model_id", "lite_active_tool_runtime", "lite_base_tool_runtime",
         "lite_orchestrator_skill_context", "lite_unfiltered_messages",
-        "lite_router_filter_pipeline", "lite_router_request_key",
+        "lite_router_filter_pipeline", "lite_router_request_key", "lite_context_filter_request_key",
         "previous_tool_context_applied", "history_cleanup_applied",
         "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
         "lite_subagent_filter_pipeline", "lite_subagent_filter_run",
@@ -119,6 +119,7 @@ class RequestRuntime:
         self.publish()
 
     def start_request(self, body: dict, **configuration) -> None:
+        self.bind_context_request()
         request_key = self.router_request_key()
         pipeline = self.metadata.get("lite_router_filter_pipeline")
         pipeline = pipeline if isinstance(pipeline, list) else []
@@ -126,10 +127,10 @@ class RequestRuntime:
             label for name, label in self.ROUTER_FILTERS.items()
             if name != "lite_registry" and (name in pipeline or self.metadata.get(name + "_applied"))
         ]
-        if preceding and (
-            not self.metadata.get("lite_registry_applied")
-            or self.metadata.get("lite_router_request_key") == request_key
-        ):
+        context_request_key = self.metadata.get(
+            "lite_context_filter_request_key", self.metadata.get("lite_router_request_key"),
+        )
+        if preceding and (context_request_key is None or context_request_key == request_key):
             raise ValueError("Lite Subagent Registry must run before " + " and ".join(preceding))
         body["metadata"] = self.metadata
         SkillLoaderOwnership(self.metadata).remove(body)
@@ -163,6 +164,14 @@ class RequestRuntime:
             and content[0].get("text") == "Here are the images from the tool results above. Please analyze them."
             and all(isinstance(part, dict) and part.get("type") == "image_url" for part in content[1:])
         )
+
+    def bind_context_request(self) -> None:
+        """Bind observed inlet evidence before the reversible preparation starts."""
+        if (
+            "lite_context_filter_request_key" in self.metadata
+            and self.metadata["lite_context_filter_request_key"] is None
+        ):
+            self.sync(lite_context_filter_request_key=self.router_request_key())
 
     def require_router_chain(self) -> None:
         pipeline = self.metadata.get("lite_router_filter_pipeline")
@@ -231,7 +240,15 @@ class RequestRuntime:
 
     def before_filter(self, name: str) -> None:
         if name in self.ROUTER_FILTERS:
-            if self.metadata.get("lite_subagent_filter_run") or not (
+            if self.metadata.get("lite_subagent_filter_run"):
+                return
+            # Standalone filtering also belongs to a request, even without Registry.
+            context_request_key = (
+                self.router_request_key()
+                if self.request is not None or self.metadata.get("message_id") else None
+            )
+            self.sync(lite_context_filter_request_key=context_request_key)
+            if not (
                 self.metadata.get("lite_registry_applied") or "lite_router_filter_pipeline" in self.metadata
             ):
                 return

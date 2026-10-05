@@ -82,7 +82,7 @@ class RequestRuntime:
         "lite_active_handoff", "lite_active_agent_id", "lite_active_skill_id",
         "lite_active_model_id", "lite_active_tool_runtime", "lite_base_tool_runtime",
         "lite_orchestrator_skill_context", "lite_unfiltered_messages",
-        "lite_router_filter_pipeline", "lite_router_request_key",
+        "lite_router_filter_pipeline", "lite_router_request_key", "lite_context_filter_request_key",
         "previous_tool_context_applied", "history_cleanup_applied",
         "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
         "lite_subagent_filter_pipeline", "lite_subagent_filter_run",
@@ -148,6 +148,7 @@ class RequestRuntime:
         self.publish()
 
     def start_request(self, body: dict, **configuration) -> None:
+        self.bind_context_request()
         request_key = self.router_request_key()
         pipeline = self.metadata.get("lite_router_filter_pipeline")
         pipeline = pipeline if isinstance(pipeline, list) else []
@@ -155,10 +156,10 @@ class RequestRuntime:
             label for name, label in self.ROUTER_FILTERS.items()
             if name != "lite_registry" and (name in pipeline or self.metadata.get(name + "_applied"))
         ]
-        if preceding and (
-            not self.metadata.get("lite_registry_applied")
-            or self.metadata.get("lite_router_request_key") == request_key
-        ):
+        context_request_key = self.metadata.get(
+            "lite_context_filter_request_key", self.metadata.get("lite_router_request_key"),
+        )
+        if preceding and (context_request_key is None or context_request_key == request_key):
             raise ValueError("Lite Subagent Registry must run before " + " and ".join(preceding))
         body["metadata"] = self.metadata
         SkillLoaderOwnership(self.metadata).remove(body)
@@ -192,6 +193,14 @@ class RequestRuntime:
             and content[0].get("text") == "Here are the images from the tool results above. Please analyze them."
             and all(isinstance(part, dict) and part.get("type") == "image_url" for part in content[1:])
         )
+
+    def bind_context_request(self) -> None:
+        """Bind observed inlet evidence before the reversible preparation starts."""
+        if (
+            "lite_context_filter_request_key" in self.metadata
+            and self.metadata["lite_context_filter_request_key"] is None
+        ):
+            self.sync(lite_context_filter_request_key=self.router_request_key())
 
     def require_router_chain(self) -> None:
         pipeline = self.metadata.get("lite_router_filter_pipeline")
@@ -260,7 +269,15 @@ class RequestRuntime:
 
     def before_filter(self, name: str) -> None:
         if name in self.ROUTER_FILTERS:
-            if self.metadata.get("lite_subagent_filter_run") or not (
+            if self.metadata.get("lite_subagent_filter_run"):
+                return
+            # Standalone filtering also belongs to a request, even without Registry.
+            context_request_key = (
+                self.router_request_key()
+                if self.request is not None or self.metadata.get("message_id") else None
+            )
+            self.sync(lite_context_filter_request_key=context_request_key)
+            if not (
                 self.metadata.get("lite_registry_applied") or "lite_router_filter_pipeline" in self.metadata
             ):
                 return
@@ -663,19 +680,7 @@ class HandoffProtocol:
         return HandoffMarker.parse(metadata.get(ACTIVE_HANDOFF_KEY))
 
 class MessageHistory:
-    @staticmethod
-    def is_tool_image_message(message: dict) -> bool:
-        # OWUI 0.11.1 flattens tool images into this synthetic user message.
-        content = message.get("content")
-        return (
-            message.get("role") == "user"
-            and isinstance(content, list)
-            and len(content) > 1
-            and isinstance(content[0], dict)
-            and content[0].get("type") == "text"
-            and content[0].get("text") == TOOL_IMAGE_TEXT
-            and all(isinstance(part, dict) and part.get("type") == "image_url" for part in content[1:])
-        )
+    is_tool_image_message = staticmethod(RequestRuntime.is_tool_image_message)
 
     @classmethod
     def last_user_index(cls, messages: list[dict]) -> int:
@@ -954,6 +959,7 @@ class ChildFilterPipeline:
         runtime_model: dict,
         runtime: RequestRuntime,
         context: InvocationContext,
+        prepared_skills: PreparedSkills,
     ) -> dict:
         metadata = runtime.metadata
         user_data = (
@@ -969,6 +975,7 @@ class ChildFilterPipeline:
             "__oauth_token__": context.oauth_token,
             "__request__": context.request,
             "__model__": runtime_model,
+            "__prepared_skills__": prepared_skills,
             "__chat_id__": metadata.get("chat_id"),
             "__message_id__": metadata.get("message_id"),
         }
@@ -1087,11 +1094,33 @@ class ChildRequestBuilder:
             for tool in capabilities.tools.values()
         ]
         routed_body.pop("tool_choice", None)
+
+        async def load_builtin(ids):
+            extra_params = self._capabilities._extra_params(
+                request=context.request, execution_user=context.user, runtime_model=runtime_model,
+                metadata=runtime.metadata, messages=capability_messages, event_emitter=context.event_emitter,
+                event_call=context.event_call, oauth_token=context.oauth_token, files=context.files,
+            )
+            return await get_builtin_tools(
+                context.request, {**extra_params, "__skill_ids__": ids},
+                features=runtime.metadata.get("features", {}), model=runtime_model,
+            )
+
+        prepared_skills = await SkillPreparation.prepare(
+            skill_ids=child_skill_ids, runtime_model=runtime_model, metadata=runtime.metadata,
+            lookup_skill=Skills.get_skill_by_id, load_builtin=load_builtin,
+        )
+        # Tool history must use this preparation's loader eligibility, not the previous run's.
+        runtime.sync(
+            lite_view_skill_available=prepared_skills.loader is not None,
+            lite_view_skill_model_id=agent.model_id if prepared_skills.loader is not None else None,
+        )
         routed_body = await self._filters.run(
             body=routed_body,
             runtime_model=runtime_model,
             runtime=runtime,
             context=context,
+            prepared_skills=prepared_skills,
         )
         capability_messages[:] = copy.deepcopy(routed_body["messages"])
         return routed_body, agent
@@ -1473,6 +1502,8 @@ class Pipe:
         __oauth_token__=None,
         __files__=None,
     ):
+        runtime = RequestRuntime(__request__, __metadata__)
+        runtime.bind_context_request()
         user_id = (__user__ or {}).get("id")
         if not user_id:
             raise ValueError("Missing user id")
@@ -1480,7 +1511,6 @@ class Pipe:
         if user is None:
             raise ValueError("User not found")
 
-        runtime = RequestRuntime(__request__, __metadata__)
         context = InvocationContext(
             request=__request__,
             user=user,
