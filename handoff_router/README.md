@@ -29,6 +29,10 @@ Pipe отвечает за runtime-маршрутизацию и capabilities в
 друга как Python-модули. Фильтры обмениваются только request-scoped значениями
 в `metadata`.
 
+Для первой установки используйте [настройку Router-модели и готовый системный
+промпт](ROUTER_SETUP.md). Текст для вставки в System Prompt вынесен в
+[ROUTER_SYSTEM_PROMPT.md](ROUTER_SYSTEM_PROMPT.md).
+
 ## Установка обновления
 
 1. Загрузите Router Preparation из `router_preparation.py`, Subagent Preparation
@@ -161,7 +165,7 @@ builtin Tools. Для Web Search, Image Generation, Code Interpreter и
 Memory дополнительно учитываются features текущего запроса, глобальные настройки
 сервера, native function calling и права пользователя. Прикреплённые Knowledge
 передаются builtin Tools и описываются в системном контексте. Skills обрабатывает
-третий фильтр. Встроенные
+Subagent Preparation. Встроенные
 `delegate_task` и `timer`
 исключаются, чтобы сабагент не запускал параллельную систему вложенной
 оркестрации поверх Lite Handoff Router.

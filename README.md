@@ -9,5 +9,8 @@
   и примеры SQL-графиков.
 
 Для установки Router откройте инструкцию в `handoff_router/README.md`.
+Настройка модели в интерфейсе и готовый системный промпт находятся в
+[ROUTER_SETUP.md](handoff_router/ROUTER_SETUP.md).
+Сам промпт: [ROUTER_SYSTEM_PROMPT.md](handoff_router/ROUTER_SYSTEM_PROMPT.md).
 Четыре актуальных `.py`-файла для загрузки в Open WebUI лежат непосредственно
 в `handoff_router/`.
