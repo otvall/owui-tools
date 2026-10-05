@@ -1,7 +1,7 @@
 """
 title: History Cleanup
 description: Keeps conversation text and removes historical native Tool messages from model context.
-version: 0.20.0
+version: 0.21.0
 required_open_webui_version: 0.11.1
 """
 
@@ -229,17 +229,18 @@ class RequestRuntime:
             self.sync(lite_context_filter_request_key=self.router_request_key())
 
     def require_router_chain(self) -> None:
+        guidance = "; attach Router Preparation to the Router Workspace Model"
         pipeline = self.metadata.get("lite_router_filter_pipeline")
         pipeline = pipeline if isinstance(pipeline, list) else []
         missing = [label for name, label in self.ROUTER_FILTERS.items() if name not in pipeline]
         if missing:
-            raise ValueError("Required Router filters are missing or out of order: " + ", ".join(missing))
+            raise ValueError("Required Router filters are missing or out of order: " + ", ".join(missing) + guidance)
         if pipeline != list(self.ROUTER_FILTERS):
             raise ValueError(
-                "Router filters ran in the wrong order; required: " + " -> ".join(self.ROUTER_FILTERS.values())
+                "Router filters ran in the wrong order; required: " + " -> ".join(self.ROUTER_FILTERS.values()) + guidance
             )
         if self.metadata.get("lite_router_request_key") != self.router_request_key():
-            raise ValueError("Lite Subagent Registry must run for the current request before Router dispatch")
+            raise ValueError("Lite Subagent Registry must run for the current request before Router dispatch" + guidance)
 
     @contextmanager
     def preparation(self) -> Iterator[RequestRuntime]:
@@ -417,6 +418,11 @@ TOOL_IMAGE_TEXT = "Here are the images from the tool results above. Please analy
 APPLIED_KEY = "history_cleanup_applied"
 
 
+# BEGIN GENERATED HISTORY CLEANUP
+# Edit shared/history_cleanup.py; run python3 tools/generate_skill_preparation.py
+"""History Cleanup stage shared by Router and standalone adapters."""
+
+
 is_tool_image_message = RequestRuntime.is_tool_image_message
 
 
@@ -431,6 +437,36 @@ def last_user_index(messages: list[dict]) -> int:
         -1,
     )
 
+
+def cleanup_history(body: dict, __request__=None, *, debug) -> dict:
+    metadata = body.setdefault("metadata", {})
+    if not isinstance(metadata, dict):
+        raise TypeError("History Cleanup metadata must be an object")
+    messages = body.get("messages")
+    if not isinstance(messages, list):
+        raise TypeError("History Cleanup messages must be a list")
+
+    RequestRuntime(__request__, metadata).before_filter("history_cleanup")
+
+    current_user = last_user_index(messages)
+    current_start = max(current_user, 0)
+    historical_text = [
+        {"role": message["role"], "content": message.get("content", "")}
+        for message in messages[:current_start]
+        if message.get("role") in {"system", "user", "assistant"}
+        and message.get("content")
+        and not is_tool_image_message(message)
+    ]
+    body["messages"] = [*historical_text, *messages[current_start:]]
+    RequestRuntime(__request__, metadata).finish_filter("history_cleanup")
+    debug(
+        "messages before=%s after=%s current_user=%s",
+        len(messages),
+        len(body["messages"]),
+        current_user,
+    )
+    return body
+# END GENERATED HISTORY CLEANUP
 
 class Filter:
     class Valves(BaseModel):
@@ -448,30 +484,6 @@ class Filter:
             log.warning("[HISTORY_CLEANUP] " + message, *args)
 
     async def inlet(self, body: dict, __request__=None) -> dict:
-        metadata = body.setdefault("metadata", {})
-        if not isinstance(metadata, dict):
-            raise TypeError("History Cleanup metadata must be an object")
-        messages = body.get("messages")
-        if not isinstance(messages, list):
-            raise TypeError("History Cleanup messages must be a list")
-
-        RequestRuntime(__request__, metadata).before_filter("history_cleanup")
-
-        current_user = last_user_index(messages)
-        current_start = max(current_user, 0)
-        historical_text = [
-            {"role": message["role"], "content": message.get("content", "")}
-            for message in messages[:current_start]
-            if message.get("role") in {"system", "user", "assistant"}
-            and message.get("content")
-            and not is_tool_image_message(message)
-        ]
-        body["messages"] = [*historical_text, *messages[current_start:]]
-        RequestRuntime(__request__, metadata).finish_filter("history_cleanup")
-        self._debug(
-            "messages before=%s after=%s current_user=%s",
-            len(messages),
-            len(body["messages"]),
-            current_user,
+        return cleanup_history(
+            body, __request__, debug=self._debug,
         )
-        return body

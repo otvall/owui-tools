@@ -184,7 +184,7 @@ class SkillBehavior:
             async def other_filter(body):
                 body["tools"].append(foreign_schema)
                 return body
-            self.filters.insert(2, types.SimpleNamespace(inlet=other_filter))
+            self.filters.insert(len(self.filters) - 1, types.SimpleNamespace(inlet=other_filter))
         else:
             self.body["tools"] = [foreign_schema]
         with self.assertRaisesRegex(ValueError, "conflicts with the builtin Skill loader"):
