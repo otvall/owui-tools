@@ -15,8 +15,8 @@ from test_previous_turn_context import unpack_record
 class ExecutorHistoryTests(PipeTestCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        self.context_filter.valves.history_turns = 2
-        self.context_filter.valves.history_tool_calls = 5
+        self.pipe.valves.history_turns = 2
+        self.pipe.valves.history_tool_calls = 5
 
     async def test_current_unknown_executor_exchanges_are_excluded_from_child_history(self):
         await self.invoke([
@@ -116,7 +116,7 @@ class ExecutorHistoryTests(PipeTestCase):
                                             ("agent-b", 5, ["b"]),
                                             ("agent-a", 1, ["a-late"])):
             with self.subTest(target=target, limit=limit):
-                self.context_filter.valves.history_tool_calls = limit
+                self.pipe.valves.history_tool_calls = limit
                 messages = await self.route_history([
                     *history, {"role": "user", "content": "current question"},
                     assistant(call("delegate", "lite_delegate")), result("delegate", marker(target)),
@@ -265,8 +265,8 @@ class ExecutorHistoryTests(PipeTestCase):
         for turns, calls, expected in ((1, 5, ["CURRENT_RESULT"]), (2, 1, ["A_RESULT", "CURRENT_RESULT"]),
                                        (0, 5, ["CURRENT_RESULT"]), (2, 0, ["CURRENT_RESULT"])):
             with self.subTest(turns=turns, calls=calls):
-                self.context_filter.valves.history_turns = turns
-                self.context_filter.valves.history_tool_calls = calls
+                self.pipe.valves.history_turns = turns
+                self.pipe.valves.history_tool_calls = calls
                 messages = await self.route_history(source)
 
                 self.assertEqual([m["content"] for m in messages if m["role"] == "tool"], expected)
@@ -275,7 +275,7 @@ class ExecutorHistoryTests(PipeTestCase):
                                  ["B question", "current question"] if turns == 1 else ["current question"])
 
     async def test_filtered_tool_narration_does_not_replace_a_completed_text_turn(self):
-        self.context_filter.valves.history_turns = 1
+        self.pipe.valves.history_turns = 1
         narration = assistant(call("unfinished-lookup", "lookup"))
         narration["content"] = "I will look this up"
         messages = await self.route_history([

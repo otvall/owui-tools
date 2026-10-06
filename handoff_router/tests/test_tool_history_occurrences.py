@@ -133,8 +133,8 @@ class HistoricalOccurrenceLimitTests(unittest.IsolatedAsyncioTestCase):
 class PipeOccurrenceHistoryTests(PipeTestCase):
     async def asyncSetUp(self):
         await super().asyncSetUp()
-        self.context_filter.valves.history_turns = 2
-        self.context_filter.valves.history_tool_calls = 5
+        self.pipe.valves.history_turns = 2
+        self.pipe.valves.history_tool_calls = 5
 
     async def test_grouped_current_calls_keep_source_order_when_results_arrive_in_another_order(self):
         messages = await self.route_history([
@@ -166,7 +166,7 @@ class PipeOccurrenceHistoryTests(PipeTestCase):
         ])
 
     async def test_limit_one_keeps_latest_history_and_all_current_continuations(self):
-        self.context_filter.valves.history_tool_calls = 1
+        self.pipe.valves.history_tool_calls = 1
         source = [
             {"role": "user", "content": "old question"},
             assistant(call("old-delegate", "lite_delegate")), result("old-delegate", marker()),
@@ -231,8 +231,8 @@ class PipeOccurrenceHistoryTests(PipeTestCase):
         ]}
         for turns, limit in ((0, 5), (2, 0)):
             with self.subTest(turns=turns, limit=limit):
-                self.context_filter.valves.history_turns = turns
-                self.context_filter.valves.history_tool_calls = limit
+                self.pipe.valves.history_turns = turns
+                self.pipe.valves.history_tool_calls = limit
                 source = [
                     {"role": "user", "content": "old question"},
                     assistant(call("lookup", "lookup")), result("lookup", "OLD_RESULT"),

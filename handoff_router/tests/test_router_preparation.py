@@ -27,8 +27,8 @@ class RouterPreparationTests(PipeTestCase):
             "agent-a": "route-a", "agent-b": "route-b",
         }, clear=True))
         self.preparation = preparation_module.Filter()
-        self.preparation.valves.base_tool_ids = []
-        self.preparation.valves.base_skill_ids = []
+        self.preparation.valves.base_tool_ids = registry.valves.base_tool_ids if registry is not None else []
+        self.preparation.valves.base_skill_ids = registry.valves.base_skill_ids if registry is not None else []
         return await self.preparation.inlet(body, __request__=self.request, __user__={"id": "user"})
 
     async def test_only_router_preparation_reaches_orchestrator_with_base_capabilities(self):
@@ -81,8 +81,8 @@ class RouterPreparationTests(PipeTestCase):
             result("handoff", marker("route-a")),
             assistant(call("current", "lookup")), result("current", "current result"),
         ]
-        self.context_filter.valves.history_turns = 1
-        self.context_filter.valves.history_tool_calls = 1
+        self.pipe.valves.history_turns = 1
+        self.pipe.valves.history_tool_calls = 1
         for enabled in (True, False):
             with self.subTest(enabled=enabled):
                 self.begin_request()
@@ -223,9 +223,12 @@ class RouterPreparationTests(PipeTestCase):
         request_metadata = {**self.metadata, "platform": "preserved"}
         self.request.state.metadata = request_metadata
         self.completion.reset_mock()
-        self.filters = [self.tool_filter, self.skill_filter]
+        async def fail(body):
+            raise RuntimeError("additional filter failed")
+
+        self.filters = [types.SimpleNamespace(inlet=fail)]
         body["messages"] += [assistant(call("lookup", "lookup")), result("lookup", "unpublished")]
-        with self.assertRaisesRegex(ValueError, "Subagent Context"):
+        with self.assertRaisesRegex(RuntimeError, "additional filter failed"):
             await self.invoke_body(body)
         self.completion.assert_not_awaited()
         self.assertIs(self.metadata["tools"], shared)

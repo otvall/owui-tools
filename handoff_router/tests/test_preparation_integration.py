@@ -1,4 +1,4 @@
-"""Both preparation Functions together through the public inlets and Pipe."""
+"""Router Preparation and automatic child preparation through public entrypoints."""
 
 import types
 from unittest.mock import AsyncMock
@@ -6,17 +6,104 @@ from unittest.mock import AsyncMock
 import test_router_preparation as router_preparation
 
 from test_capability_context import owui_callable, owui_refresh
-from test_handoff_history import assistant, call, marker, result, router
+from test_handoff_history import assistant, call, grouped_history, marker, result, router
 from test_previous_turn_context import unpack_record
-from test_subagent_preparation import preparation_module
 
 
-class CombinedPreparationTests(router_preparation.RouterPreparationTests):
-    async def asyncSetUp(self):
-        await super().asyncSetUp()
-        self.child_preparation = preparation_module.Filter()
-        self.context_filter = self.child_preparation
-        self.filters = [self.child_preparation]
+class AutomaticPreparationTests(router_preparation.RouterPreparationTests):
+
+    async def test_handoff_without_child_attachments_prepares_each_tool_continuation(self):
+        self.filters = []
+        self.models["agent-a"].meta["skillIds"] = ["specialist"]
+        self.begin_request()
+        body = {"model": "router", "metadata": self.metadata, "messages": [
+            {"role": "user", "content": "Find curves"},
+            assistant(call("handoff", "lite_delegate", agent_id="route-a")),
+            result("handoff", marker("route-a")),
+        ]}
+        await self.preparation.inlet(body, __request__=self.request, __user__={"id": "user"})
+        await self.invoke_body(body)
+        lookup = self.metadata["tools"]["lookup"]["callable"]
+        for index in range(3):
+            body["messages"] += [
+                assistant(call(f"lookup-{index}", "lookup")), result(f"lookup-{index}", f"Result {index}"),
+            ]
+            await self.invoke_body(body)
+            self.assertEqual(self.routed["model"], "agent-a")
+            self.assertEqual([m["content"] for m in self.routed["messages"] if m["role"] == "tool"],
+                             [f"Result {value}" for value in range(index + 1)])
+            self.assertIn("Skill instructions for specialist", self.routed["messages"][0]["content"])
+            self.assertEqual(await lookup(), self.routed["messages"])
+            self.assertIs(self.metadata["tools"]["lookup"]["callable"], lookup)
+        self.loader.assert_awaited_once()
+
+    async def test_additional_filters_keep_final_edits_and_native_file_cleanup_in_one_dispatch(self):
+        self.models["agent-a"].meta["skillIds"] = ["specialist"]
+        self.metadata.update(session_id="session", params={"function_calling": "native"})
+        self.builtins.return_value = {
+            "view_skill": {"spec": {"name": "view_skill"}, "callable": AsyncMock(return_value="Loaded")},
+        }
+        injected = [assistant(call("extra", "filter_tool")), result("extra", "Filter result")]
+        replacement = {"spec": {"name": "view_skill", "description": "Additional loader"},
+                       "callable": AsyncMock(return_value="Additional Skill")}
+
+        async def first(body):
+            self.assertIn("<available_skills>", body["messages"][0]["content"])
+            self.assertEqual([m for m in body["messages"] if m["role"] == "tool"],
+                             [result("lookup", "TOOL_RESULT_42")])
+            body["files"] = ["attachment"]
+            body["messages"][0]["content"] = "Edited Skill context"
+            body["messages"].extend(injected)
+            body["metadata"]["tools"]["view_skill"] = replacement
+            body["tools"].append({"type": "function", "function": replacement["spec"]})
+            return body
+
+        async def second(body):
+            self.assertEqual(body["messages"][0]["content"], "Edited Skill context")
+            self.assertEqual(body["messages"][-2:], injected)
+            self.assertEqual(body["files"], ["attachment"])
+            return body
+
+        async def native_dispatch(**kwargs):
+            body, flags = await self.process_filters(**kwargs)
+            # Stand-in for OWUI's single final file cleanup, after all inlets.
+            body.pop("files", None)
+            return body, flags
+
+        self.filters = [types.SimpleNamespace(inlet=first), types.SimpleNamespace(inlet=second)]
+        self.dispatch_filters.side_effect = native_dispatch
+        self.begin_request()
+        body = {"model": "router", "metadata": self.metadata,
+                "messages": grouped_history(), "files": ["attachment"]}
+        await self.preparation.inlet(body, __request__=self.request, __user__={"id": "user"})
+        await self.invoke_body(body)
+        self.assertEqual(self.routed["messages"][0]["content"], "Edited Skill context")
+        self.assertEqual(self.routed["messages"][-2:], injected)
+        self.assertNotIn("files", self.routed)
+        self.assertIs(self.metadata["tools"]["view_skill"], replacement)
+        self.assertEqual(await replacement["callable"](id="extra"), "Additional Skill")
+        self.assertEqual(await self.metadata["tools"]["lookup"]["callable"](), self.routed["messages"])
+        self.assertEqual([t["function"]["description"] for t in self.routed["tools"]
+                          if t["function"].get("description")], ["Additional loader"])
+        self.get_filters.assert_awaited_once()
+        self.dispatch_filters.assert_awaited_once()
+
+    async def test_additional_filter_can_add_loader_when_preparation_uses_full_skills(self):
+        self.models["agent-a"].meta["skillIds"] = ["specialist"]
+        added = {"spec": {"name": "view_skill"}, "callable": AsyncMock(return_value="Added Skill")}
+
+        async def add_loader(body):
+            self.assertIn("Skill instructions for specialist", body["messages"][0]["content"])
+            self.assertNotIn("view_skill", body["metadata"]["tools"])
+            body["metadata"]["tools"]["view_skill"] = added
+            body["tools"].append({"type": "function", "function": added["spec"]})
+            return body
+
+        self.filters = [types.SimpleNamespace(inlet=add_loader)]
+        await self.invoke(grouped_history())
+        self.assertIs(self.metadata["tools"]["view_skill"], added)
+        self.assertEqual(self.routed["tools"][-1]["function"], added["spec"])
+        self.assertEqual(await added["callable"](id="extra"), "Added Skill")
 
     async def load_nested_model_tool(self, request, ids, owner, extra_params):
         self.loaded_model_ids.append(extra_params["__metadata__"].get("model_id"))
@@ -220,8 +307,8 @@ class CombinedPreparationTests(router_preparation.RouterPreparationTests):
 
     async def test_both_roles_apply_common_history_limits_to_two_children_with_record_disabled(self):
         self.preparation.valves.enabled = False
-        self.child_preparation.valves.history_turns = 1
-        self.child_preparation.valves.history_tool_calls = 1
+        self.pipe.valves.history_turns = 1
+        self.pipe.valves.history_tool_calls = 1
         previous = [
             {"role": "user", "content": "Previous question"},
             assistant(call("delegate-a", "lite_delegate", agent_id="agent-a")),

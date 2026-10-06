@@ -1,7 +1,7 @@
 """Regression tests for OWUI's reconstructed tool history, without an OWUI server.
 
 Run from the repository root: python3 -m unittest discover -s handoff_router/tests -v
-OWUI boundary adapters are stubbed; Pipe.pipe and the context filters run unmodified.
+OWUI boundary adapters are stubbed; Pipe.pipe prepares children without attachments.
 The fixture was generated with v0.11.1's convert_output_to_messages(raw=True).
 """
 
@@ -63,7 +63,7 @@ router = load_router()
 
 def load_plain_module(filename, name, modules=None):
     directory = (
-        ROOT if filename in {"lite_handoff_router.py", "lite_delegate.py", "router_preparation.py", "subagent_preparation.py"}
+        ROOT if filename in {"lite_handoff_router.py", "lite_delegate.py", "router_preparation.py"}
         else ROOT.parent / "optional_filters"
     )
     spec = importlib.util.spec_from_file_location(name, directory / filename)
@@ -116,9 +116,8 @@ class PipeTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.tool_names = ["lookup"]
         self.tool_filter = tool_filter_module.Filter()
-        self.context_filter = context_filter_module.Filter()
         self.skill_filter = skill_filter_module.Filter()
-        self.filters = [self.tool_filter, self.context_filter, self.skill_filter]
+        self.filters = []
         self.users = self.enterContext(patch.object(
             router.Users, "get_user_by_id", AsyncMock(side_effect=lambda id: self.user if id == "user" else self.owner), create=True,
         ))
@@ -593,7 +592,7 @@ class CompletionTests(PipeTestCase):
         self.completion.assert_awaited_once()
         self.assertEqual(self.metadata["lite_active_model_id"], "agent-a")
         self.assertEqual(self.metadata["lite_target_model_id"], "agent-a")
-        self.assertTrue(self.metadata["skill_context_applied"])
+        self.assertEqual(self.routed["messages"], [grouped_history()[0]])
         self.assertEqual(await self.metadata["tools"]["lookup"]["callable"](), self.routed["messages"])
         self.assertEqual(self.metadata["lite_child_messages"], self.routed["messages"])
 
@@ -622,14 +621,13 @@ class CompletionTests(PipeTestCase):
 
 
 class ChildFilterPipelineTests(PipeTestCase):
-    async def test_additional_history_filters_do_not_change_required_child_trace(self):
+    async def test_additional_history_filters_do_not_change_router_preparation_evidence(self):
+        evidence = copy.deepcopy(self.metadata["lite_router_filter_pipeline"])
         previous = load_plain_module("previous_tool_context.py", "additional_previous_tests").Filter()
         cleanup = load_plain_module("history_cleanup.py", "additional_cleanup_tests").Filter()
         self.filters.extend([previous, cleanup])
         await self.invoke(grouped_history()[:4])
-        self.assertEqual(self.metadata["lite_subagent_filter_pipeline"], [
-            "tool_call_filter", "subagent_context", "skill_context",
-        ])
+        self.assertEqual(self.metadata["lite_router_filter_pipeline"], evidence)
 
     async def test_pipe_metadata_is_authoritative_and_managed_state_is_mirrored(self):
         foreign_body_metadata = {"lite_active_handoff": {"agent_id": "agent-b", "__lite_delegate__": "v2"}}
@@ -645,8 +643,7 @@ class ChildFilterPipelineTests(PipeTestCase):
         self.assertIs(self.routed["metadata"], self.metadata)
         self.assertIs(request_state["tools"], shared)
         for key in ("lite_active_model_id", "lite_active_handoff", "lite_target_skill_ids", "skill_ids",
-                    "tool_ids", "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
-                    "lite_subagent_filter_pipeline", "lite_view_skill_available"):
+                    "tool_ids", "lite_view_skill_available"):
             self.assertEqual(request_state[key], self.metadata[key])
         self.assertNotIn("lite_subagent_filter_run", request_state)
         self.assertNotIn("lite_active_skill_id", request_state)
@@ -659,7 +656,7 @@ class ChildFilterPipelineTests(PipeTestCase):
         async def fail(body):
             raise RuntimeError("failed continuation")
 
-        self.filters.insert(2, types.SimpleNamespace(inlet=fail))
+        self.filters.append(types.SimpleNamespace(inlet=fail))
         with self.assertRaisesRegex(RuntimeError, "failed continuation"):
             await self.invoke_body({"metadata": foreign_body_metadata, "messages": grouped_history()})
         self.completion.assert_not_awaited()
@@ -670,13 +667,12 @@ class ChildFilterPipelineTests(PipeTestCase):
         self.assertNotIn("lite_subagent_filter_run", request_state)
         self.assertIs(request_state["tools"], shared)
 
-    async def test_failed_switch_restores_live_history_tools_and_filter_trace(self):
+    async def test_failed_switch_restores_live_history_tools_and_capability_cache(self):
         await self.invoke(grouped_history()[:4])
         shared = self.metadata["tools"]
         lookup = shared["lookup"]["callable"]
         history = self.metadata["lite_child_messages"]
         previous_history = copy.deepcopy(history)
-        trace = self.metadata["lite_subagent_filter_pipeline"]
         cache = self.metadata["lite_active_tool_runtime"]
         self.metadata["lite_agents"]["agent-a"]["model_id"] = "agent-b"
         state = dict(self.metadata)
@@ -686,7 +682,7 @@ class ChildFilterPipelineTests(PipeTestCase):
             body["metadata"]["lite_child_messages"].append({"role": "user", "content": "partial"})
             raise RuntimeError("second filter failed")
 
-        self.filters.insert(2, types.SimpleNamespace(inlet=fail))
+        self.filters.append(types.SimpleNamespace(inlet=fail))
         with self.assertRaisesRegex(RuntimeError, "second filter failed"):
             await self.invoke(grouped_history())
         self.completion.assert_not_awaited()
@@ -695,11 +691,9 @@ class ChildFilterPipelineTests(PipeTestCase):
         self.assertIs(shared["lookup"]["callable"], lookup)
         self.assertIs(self.metadata["lite_child_messages"], history)
         self.assertEqual(await lookup(), previous_history)
-        self.assertIs(self.metadata["lite_subagent_filter_pipeline"], trace)
-        self.assertEqual(trace, ["tool_call_filter", "subagent_context", "skill_context"])
         self.assertIs(self.metadata["lite_active_tool_runtime"], cache)
         self.assertEqual(self.metadata["lite_active_model_id"], "agent-a")
-        self.filters.pop(2)
+        self.filters.pop()
         await self.invoke(grouped_history())
         self.assertEqual(self.routed["model"], "agent-b")
         self.assertIs(self.metadata["lite_child_messages"], history)
@@ -746,14 +740,14 @@ class ChildFilterPipelineTests(PipeTestCase):
         async def fail(body):
             raise RuntimeError("partial filter failure")
 
-        self.filters.insert(1, types.SimpleNamespace(inlet=fail))
+        self.filters.append(types.SimpleNamespace(inlet=fail))
         with self.assertRaisesRegex(RuntimeError, "partial filter failure"):
             await self.invoke(grouped_history()[:4])
         self.completion.assert_not_awaited()
         self.assertEqual(self.metadata, original)
         self.assertIs(self.metadata["tools"], shared)
         self.assertEqual(shared, {})
-        self.filters.pop(1)
+        self.filters.pop()
         await self.invoke(grouped_history()[:4])
         self.assertEqual(self.routed["model"], "agent-a")
 
@@ -767,22 +761,25 @@ class ChildFilterPipelineTests(PipeTestCase):
         self.assertEqual(self.dispatch_filters.call_args.kwargs["filter_type"], "inlet")
         self.assertNotIn("lite_subagent_filter_run", self.metadata)
 
-    async def test_reports_missing_required_destination_filters(self):
-        original = dict(self.metadata)
+    async def test_handoff_dispatches_without_destination_filters(self):
         self.filters = []
-        with self.assertRaisesRegex(ValueError, "Required subagent filters"):
-            await self.invoke(grouped_history()[:4])
-        self.completion.assert_not_awaited()
-        self.assertEqual(self.metadata, original)
+        await self.invoke(grouped_history()[:4])
+        self.assertEqual(self.routed["model"], "agent-a")
+        self.assertEqual(self.routed["messages"], [grouped_history()[0]])
 
-    async def test_reports_misordered_destination_filters_before_completion(self):
-        original = dict(self.metadata)
-        self.filters = [self.skill_filter, self.tool_filter, self.context_filter]
-        with self.assertRaisesRegex(ValueError, "must run before Skill Context"):
-            await self.invoke(grouped_history()[:4])
-        self.completion.assert_not_awaited()
+    async def test_additional_filters_keep_platform_order(self):
+        async def first(body):
+            return {**body, "messages": [*body["messages"], {"role": "assistant", "content": "First filter"}]}
+
+        async def second(body):
+            self.assertEqual(body["messages"][-1]["content"], "First filter")
+            return {**body, "messages": [*body["messages"], {"role": "assistant", "content": "Second filter"}]}
+
+        self.filters = [types.SimpleNamespace(inlet=first), types.SimpleNamespace(inlet=second)]
+        await self.invoke(grouped_history()[:4])
+        self.assertEqual([m["content"] for m in self.routed["messages"][-2:]], ["First filter", "Second filter"])
+        self.dispatch_filters.assert_awaited_once()
         self.assertNotIn("lite_subagent_filter_run", self.metadata)
-        self.assertEqual(self.metadata, original)
 
 
 if __name__ == "__main__":

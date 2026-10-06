@@ -180,13 +180,17 @@ class SkillBehavior:
         if self.path == "child":
             self.assertFalse(any(m["role"] == "system" for m in self.body["messages"]))
 
-    async def test_foreign_loader_schema_is_rejected(self):
+    async def test_foreign_loader_schema_follows_preparation_boundary(self):
         foreign_schema = {"type": "function", "function": {"name": "view_skill", "description": "foreign"}}
         if self.path == "child":
             async def other_filter(body):
                 body["tools"].append(foreign_schema)
                 return body
-            self.filters.insert(len(self.filters) - 1, types.SimpleNamespace(inlet=other_filter))
+            self.filters.append(types.SimpleNamespace(inlet=other_filter))
+            await self.prepare()
+            self.assertEqual(self.body["tools"][-1], foreign_schema)
+            self.assertEqual(await self.metadata["tools"]["lookup"]["callable"](), self.body["messages"])
+            return
         else:
             self.body["tools"] = [foreign_schema]
         with self.assertRaisesRegex(ValueError, "conflicts with the builtin Skill loader"):
@@ -403,7 +407,7 @@ class OrchestratorSkillTests(SkillBehavior, PipeTestCase):
         for key in (*legacy_keys, "lite_active_handoff", "lite_active_model_id", "lite_active_tool_runtime",
                     "lite_base_tool_runtime", "lite_unfiltered_messages", "lite_child_messages", "lite_skill_loader",
                     "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
-                    "lite_subagent_filter_run", "lite_subagent_filter_pipeline", "lite_target_model_id"):
+                    "lite_subagent_filter_run", "lite_target_model_id"):
             self.assertNotIn(key, self.metadata)
             self.assertNotIn(key, request_state)
         self.assertIs(self.metadata["tools"], shared)

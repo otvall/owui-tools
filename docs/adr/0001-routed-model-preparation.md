@@ -1,5 +1,5 @@
 ---
-status: accepted
+status: superseded by ADR-0002 for child preparation
 ---
 
 # Объединённая подготовка моделей для Handoff

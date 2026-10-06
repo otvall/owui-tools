@@ -16,9 +16,9 @@ OPTIONAL_FUNCTIONS = {
 FUNCTIONS = (
     "lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py",
     "previous_tool_context.py", "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
-    "router_preparation.py", "subagent_preparation.py",
+    "router_preparation.py",
 )
-SKILL_ID_CONSUMERS = {"lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py", "router_preparation.py", "subagent_preparation.py"}
+SKILL_ID_CONSUMERS = {"lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py", "router_preparation.py"}
 
 
 class SkillGenerationTests(unittest.TestCase):
@@ -87,7 +87,6 @@ class SkillGenerationTests(unittest.TestCase):
         self.assertEqual(checked.returncode, 1, checked.stderr)
         self.assertIn("lite_handoff_router.py", checked.stderr)
         self.assertIn("skill_context.py", checked.stderr)
-        self.assertIn("subagent_preparation.py", checked.stderr)
         self.assertEqual(self.outputs(), before)
         generated = self.run_generator()
         self.assertEqual(generated.returncode, 0, generated.stderr)
@@ -122,7 +121,7 @@ class SkillGenerationTests(unittest.TestCase):
         source = self.root / "shared/tool_history.py"
         source.write_text(source.read_text() + "\n# Updated Tool history source\n")
         before = self.outputs()
-        consumers = {"lite_handoff_router.py", "tool_call_filter.py", "subagent_context.py", "previous_tool_context.py", "router_preparation.py", "subagent_preparation.py"}
+        consumers = {"lite_handoff_router.py", "tool_call_filter.py", "subagent_context.py", "previous_tool_context.py", "router_preparation.py"}
         checked = self.run_generator("--check")
         self.assertEqual(checked.returncode, 1, checked.stderr)
         for name in consumers:
@@ -140,7 +139,7 @@ class SkillGenerationTests(unittest.TestCase):
         source = self.root / "shared/tool_context.py"
         source.write_text(source.read_text() + "\n# Updated Tool context source\n")
         before = self.outputs()
-        consumers = {"tool_call_filter.py", "subagent_context.py", "subagent_preparation.py"}
+        consumers = {"tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py"}
         checked = self.run_generator("--check")
         self.assertEqual(checked.returncode, 1, checked.stderr)
         for name in consumers:
@@ -156,9 +155,9 @@ class SkillGenerationTests(unittest.TestCase):
 
     def test_check_detects_a_stale_deployment_copy_and_generation_repairs_it(self):
         before = self.outputs()
-        for name in ("lite_handoff_router.py", "subagent_preparation.py"):
+        for name in ("lite_handoff_router.py", "skill_context.py"):
             with self.subTest(filename=name):
-                path = self.root / name
+                path = self.function_path(name)
                 path.write_text(path.read_text().replace(
                     "Skill is not available in the current model context", "Stale Skill error",
                 ))
@@ -229,7 +228,7 @@ getattr(module, sys.argv[2])()
             ("lite_handoff_router.py", "Pipe"), ("skill_context.py", "Filter"), ("lite_subagent_registry.py", "Filter"),
             ("previous_tool_context.py", "Filter"), ("history_cleanup.py", "Filter"),
             ("tool_call_filter.py", "Filter"), ("subagent_context.py", "Filter"),
-            ("router_preparation.py", "Filter"), ("subagent_preparation.py", "Filter"),
+            ("router_preparation.py", "Filter"),
         ):
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
                 target = Path(directory) / filename

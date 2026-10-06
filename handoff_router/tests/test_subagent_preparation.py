@@ -1,4 +1,4 @@
-"""One destination attachment through the real Router, Pipe and Filter inlets."""
+"""Automatic child preparation through Router Preparation and public Pipe.pipe."""
 
 import copy
 import types
@@ -10,47 +10,27 @@ import test_handoff_history as handoff_history
 import test_router_chain as router_chain
 import test_skill_preparation as skill_preparation
 import test_tool_history_occurrences as tool_occurrences
+import test_router_preparation as router_preparation
 
 from test_handoff_history import (
-    PipeTestCase, assistant, call, grouped_history, load_plain_module, marker, result, router,
+    PipeTestCase, assistant, call, grouped_history, marker, result,
 )
 
-preparation_module = load_plain_module("subagent_preparation.py", "subagent_preparation_tests")
-
-
 class PreparationOnly:
-    async def asyncSetUp(self):
-        await super().asyncSetUp()
-        self.preparation = preparation_module.Filter()
-        self.preparation.valves.history_turns = self.context_filter.valves.history_turns
-        self.preparation.valves.history_tool_calls = self.context_filter.valves.history_tool_calls
-        self.context_filter = self.preparation
-        self.filters = [self.preparation]
+    async def router_inlets(self, body, *, registry=None):
+        return await router_preparation.RouterPreparationTests.router_inlets(self, body, registry=registry)
 
 
 class SubagentPreparationTests(PreparationOnly, PipeTestCase):
-    async def test_filter_inlet_installs_prepared_context_after_history_with_original_prompt_preserved(self):
-        self.metadata.update(lite_subagent_filter_run=True, lite_target_agent_id="agent-a")
-        original = "Administrator instructions\n\nLite orchestrator Skill context:\nDetached instructions"
-        body = {
-            "model": "agent-a", "metadata": self.metadata,
-            "messages": [{"role": "system", "content": original}, *grouped_history()],
-            "tools": [{"type": "function", "function": {"name": "lookup"}}],
-        }
-        prepared = router.PreparedSkills(["specialist"], "Fresh instructions", None)
-        filtered = await self.preparation.inlet(
-            body, __request__=self.request, __model__=self.request.app.state.MODELS["agent-a"],
-            __prepared_skills__=prepared,
-        )
-        self.assertEqual(filtered["messages"], [
-            {"role": "system", "content": "Administrator instructions\n\nSkill context:\nFresh instructions"},
-            grouped_history()[0], assistant(call("lookup", "lookup")),
-            result("lookup", "TOOL_RESULT_42"),
-        ])
+    async def test_pipe_history_limits_reject_negative_values(self):
+        from pydantic import ValidationError
 
-    async def test_single_attachment_completes_handoff_and_trimmed_continuation_with_skills(self):
+        for field in ("history_turns", "history_tool_calls"):
+            with self.subTest(field=field), self.assertRaises(ValidationError):
+                self.pipe.Valves(**{field: -1})
+
+    async def test_no_attachments_complete_handoff_and_trimmed_continuation_with_skills(self):
         self.models["agent-a"].meta["skillIds"] = ["specialist"]
-        self.preparation.valves.priority = 17
         initial = {"model": "router", "metadata": self.metadata, "messages": grouped_history()[:4]}
         self.begin_request()
         await self.router_inlets(initial)
@@ -72,8 +52,9 @@ class SubagentPreparationTests(PreparationOnly, PipeTestCase):
         self.loader.assert_awaited_once()
 
     async def test_same_function_applies_common_limits_to_two_destination_models(self):
-        self.assertEqual(self.preparation.valves.model_dump(), {
-            "priority": -30, "history_turns": 0, "history_tool_calls": 0, "debug": False,
+        self.assertEqual(self.pipe.valves.model_dump(), {
+            "orchestrator_model_id": "base-model", "emit_handoff_status": True,
+            "history_turns": 0, "history_tool_calls": 0, "debug": False,
         })
         # Deliberately contrary runtime settings cannot override Function Valves.
         for model_id in ("agent-a", "agent-b"):
@@ -94,8 +75,8 @@ class SubagentPreparationTests(PreparationOnly, PipeTestCase):
             {"role": "assistant", "content": "Retained answer"},
         ]
         for turns, tools in ((0, 0), (1, 1), (1, 0), (0, 1)):
-            self.preparation.valves.history_turns = turns
-            self.preparation.valves.history_tool_calls = tools
+            self.pipe.valves.history_turns = turns
+            self.pipe.valves.history_tool_calls = tools
             for target, latest in (("agent-a", "A_LATEST"), ("agent-b", "B_LATEST")):
                 with self.subTest(turns=turns, tools=tools, target=target):
                     messages = await self.route_history([
@@ -110,32 +91,35 @@ class SubagentPreparationTests(PreparationOnly, PipeTestCase):
                                       if m["role"] in ("user", "assistant") and not m.get("tool_calls")],
                                      (["Retained question", "Retained answer"] if turns else []) + ["Current question"])
 
-    async def test_tools_see_skills_and_additional_filters_after_one_preparation_attachment(self):
+    async def test_tools_see_skills_and_additional_filters_after_automatic_preparation(self):
         self.models["agent-a"].meta["skillIds"] = ["specialist"]
         self.metadata.update(session_id="session", params={"function_calling": "native"})
         self.builtins.return_value = {
             "view_skill": {"spec": {"name": "view_skill"}, "callable": AsyncMock(return_value="Loaded")},
         }
 
-        async def before(body):
+        async def first(body):
+            self.assertIn("<available_skills>", body["messages"][0]["content"])
+            self.assertEqual([m for m in body["messages"] if m["role"] == "tool"],
+                             [result("lookup", "TOOL_RESULT_42")])
             return {**body, "messages": [{"role": "system", "content": "Additional instructions"}, *body["messages"]]}
 
         async def after(body):
             return {**body, "messages": [*body["messages"], {"role": "system", "content": "Final context"}]}
 
-        self.filters = [types.SimpleNamespace(inlet=before), self.preparation, types.SimpleNamespace(inlet=after)]
+        self.filters = [types.SimpleNamespace(inlet=first), types.SimpleNamespace(inlet=after)]
         await self.invoke(grouped_history())
         final = self.routed["messages"]
         self.assertIn("Additional instructions", final[0]["content"])
-        self.assertIn("<available_skills>", final[0]["content"])
+        self.assertIn("<available_skills>", final[1]["content"])
         self.assertEqual(final[-1], {"role": "system", "content": "Final context"})
         self.assertEqual(await self.metadata["tools"]["lookup"]["callable"](), final)
         self.assertEqual(await self.metadata["tools"]["view_skill"]["callable"](id="specialist"), "Loaded")
         self.assertIn("error", await self.metadata["tools"]["view_skill"]["callable"](id="route-a"))
 
 
-# Reuse behavior contracts without substituting project stages. Each destination
-# dispatch runs only the new real Filter; OWUI/provider adapters stay external.
+# Reuse behavior contracts with Router Preparation and no child attachments.
+# OWUI/provider adapters stay external; project preparation runs unmodified.
 class PreparationExecutorHistoryTests(PreparationOnly, executor_history.ExecutorHistoryTests):
     pass
 

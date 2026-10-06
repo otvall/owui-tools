@@ -107,7 +107,7 @@ class RequestRuntime:
         "lite_router_filter_pipeline", "lite_router_request_key", "lite_context_filter_request_key",
         "previous_tool_context_applied", "history_cleanup_applied",
         "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
-        "lite_subagent_filter_pipeline", "lite_subagent_filter_run",
+        "lite_subagent_filter_run",
         "lite_target_agent_id", "lite_target_model_id", "lite_target_skill_ids",
         "lite_view_skill_available", "lite_view_skill_model_id", "lite_skill_loader",
     )
@@ -124,11 +124,6 @@ class RequestRuntime:
         "lite_registry": "Lite Subagent Registry",
         "previous_tool_context": "Previous Tool Context",
         "history_cleanup": "History Cleanup",
-    }
-    CHILD_FILTERS = {
-        "tool_call_filter": "Tool Call Filter",
-        "subagent_context": "Subagent Context",
-        "skill_context": "Skill Context",
     }
 
     def __init__(self, request, metadata: dict):
@@ -315,22 +310,12 @@ class RequestRuntime:
 
     @contextmanager
     def child_filters(self) -> Iterator[None]:
-        self.discard(*(name + "_applied" for name in self.CHILD_FILTERS))
-        self.sync(lite_subagent_filter_pipeline=[], lite_subagent_filter_run=True)
+        """Keep destination inlets from changing the Router's preparation evidence."""
+        self.sync(lite_subagent_filter_run=True)
         try:
             yield
         finally:
             self.discard("lite_subagent_filter_run")
-        missing = [label for name, label in self.CHILD_FILTERS.items() if not self.metadata.get(name + "_applied")]
-        if missing:
-            raise ValueError(
-                "Required subagent filters are not attached to the destination model: " + ", ".join(missing)
-            )
-        actual_order = self.metadata.get("lite_subagent_filter_pipeline")
-        if actual_order != list(self.CHILD_FILTERS):
-            raise ValueError(
-                "Subagent filters ran in the wrong order: " + " -> ".join(str(item) for item in actual_order or [])
-            )
 
     def before_filter(self, name: str) -> None:
         if name in self.ROUTER_FILTERS:
@@ -356,20 +341,10 @@ class RequestRuntime:
                 required = " and ".join(self.ROUTER_FILTERS[item] for item in prior)
                 raise ValueError(f"{required} must run before {self.ROUTER_FILTERS[name]} in the Router inlet chain")
             return
-        if not self.metadata.get("lite_subagent_filter_run"):
-            return
-        sequence = list(self.CHILD_FILTERS)
-        prior = sequence[:sequence.index(name)]
-        pipeline = self.metadata.get("lite_subagent_filter_pipeline") or []
-        if prior and pipeline[-len(prior):] != prior:
-            required = " and ".join(self.CHILD_FILTERS[item] for item in prior)
-            raise ValueError(f"{required} must run before {self.CHILD_FILTERS[name]}")
 
     def finish_filter(self, name: str, **values) -> None:
         self.metadata.update(values)
         self.metadata[name + "_applied"] = True
-        if name in self.CHILD_FILTERS and self.metadata.get("lite_subagent_filter_run"):
-            self.metadata.setdefault("lite_subagent_filter_pipeline", []).append(name)
         if (
             name in self.ROUTER_FILTERS and self.metadata.get("lite_registry_applied")
             and not self.metadata.get("lite_subagent_filter_run")
@@ -863,7 +838,6 @@ log = logging.getLogger(__name__)
 
 TOOL_IMAGE_TEXT = "Here are the images from the tool results above. Please analyze them."
 APPLIED_KEY = "tool_call_filter_applied"
-PIPELINE_KEY = "lite_subagent_filter_pipeline"
 
 
 class Filter:

@@ -18,7 +18,6 @@ log = logging.getLogger(__name__)
 PROMPT_PREFIX = "Skill context:\n"
 LEGACY_PROMPT_PREFIX = "Lite orchestrator Skill context:\n"
 APPLIED_KEY = "skill_context_applied"
-PIPELINE_KEY = "lite_subagent_filter_pipeline"
 
 
 # BEGIN GENERATED REQUEST RUNTIME
@@ -117,7 +116,7 @@ class RequestRuntime:
         "lite_router_filter_pipeline", "lite_router_request_key", "lite_context_filter_request_key",
         "previous_tool_context_applied", "history_cleanup_applied",
         "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
-        "lite_subagent_filter_pipeline", "lite_subagent_filter_run",
+        "lite_subagent_filter_run",
         "lite_target_agent_id", "lite_target_model_id", "lite_target_skill_ids",
         "lite_view_skill_available", "lite_view_skill_model_id", "lite_skill_loader",
     )
@@ -134,11 +133,6 @@ class RequestRuntime:
         "lite_registry": "Lite Subagent Registry",
         "previous_tool_context": "Previous Tool Context",
         "history_cleanup": "History Cleanup",
-    }
-    CHILD_FILTERS = {
-        "tool_call_filter": "Tool Call Filter",
-        "subagent_context": "Subagent Context",
-        "skill_context": "Skill Context",
     }
 
     def __init__(self, request, metadata: dict):
@@ -325,22 +319,12 @@ class RequestRuntime:
 
     @contextmanager
     def child_filters(self) -> Iterator[None]:
-        self.discard(*(name + "_applied" for name in self.CHILD_FILTERS))
-        self.sync(lite_subagent_filter_pipeline=[], lite_subagent_filter_run=True)
+        """Keep destination inlets from changing the Router's preparation evidence."""
+        self.sync(lite_subagent_filter_run=True)
         try:
             yield
         finally:
             self.discard("lite_subagent_filter_run")
-        missing = [label for name, label in self.CHILD_FILTERS.items() if not self.metadata.get(name + "_applied")]
-        if missing:
-            raise ValueError(
-                "Required subagent filters are not attached to the destination model: " + ", ".join(missing)
-            )
-        actual_order = self.metadata.get("lite_subagent_filter_pipeline")
-        if actual_order != list(self.CHILD_FILTERS):
-            raise ValueError(
-                "Subagent filters ran in the wrong order: " + " -> ".join(str(item) for item in actual_order or [])
-            )
 
     def before_filter(self, name: str) -> None:
         if name in self.ROUTER_FILTERS:
@@ -366,20 +350,10 @@ class RequestRuntime:
                 required = " and ".join(self.ROUTER_FILTERS[item] for item in prior)
                 raise ValueError(f"{required} must run before {self.ROUTER_FILTERS[name]} in the Router inlet chain")
             return
-        if not self.metadata.get("lite_subagent_filter_run"):
-            return
-        sequence = list(self.CHILD_FILTERS)
-        prior = sequence[:sequence.index(name)]
-        pipeline = self.metadata.get("lite_subagent_filter_pipeline") or []
-        if prior and pipeline[-len(prior):] != prior:
-            required = " and ".join(self.CHILD_FILTERS[item] for item in prior)
-            raise ValueError(f"{required} must run before {self.CHILD_FILTERS[name]}")
 
     def finish_filter(self, name: str, **values) -> None:
         self.metadata.update(values)
         self.metadata[name + "_applied"] = True
-        if name in self.CHILD_FILTERS and self.metadata.get("lite_subagent_filter_run"):
-            self.metadata.setdefault("lite_subagent_filter_pipeline", []).append(name)
         if (
             name in self.ROUTER_FILTERS and self.metadata.get("lite_registry_applied")
             and not self.metadata.get("lite_subagent_filter_run")
@@ -733,7 +707,6 @@ class Filter:
         __event_emitter__=None,
         __event_call__=None,
         __oauth_token__=None,
-        __prepared_skills__=None,
     ) -> dict:
         if __request__ is None:
             raise ValueError("Skill Context requires __request__")
@@ -752,36 +725,28 @@ class Filter:
             if isinstance(__model__, dict)
             else __request__.app.state.MODELS.get(model_id) or {"id": model_id}
         )
-        if metadata.get("lite_subagent_filter_run"):
-            # Router has already read the child's current database attachments.
-            # An empty selection is authoritative even when runtime metadata is stale.
-            skill_ids = metadata.get("lite_target_skill_ids") or []
-        else:
-            model_meta = (runtime_model.get("info") or {}).get("meta") or {}
-            skill_ids = [
-                *(body.get("skill_ids") or []),
-                *(model_meta.get("skillIds") or []),
-                *(metadata.get("lite_orchestrator_skill_ids") or []),
-            ]
+        model_meta = (runtime_model.get("info") or {}).get("meta") or {}
+        skill_ids = [
+            *(body.get("skill_ids") or []),
+            *(model_meta.get("skillIds") or []),
+            *(metadata.get("lite_orchestrator_skill_ids") or []),
+        ]
 
-        if metadata.get("lite_subagent_filter_run") and __prepared_skills__ is not None:
-            prepared = __prepared_skills__
-        else:
-            async def resolve_skill_user():
-                return __user__ if isinstance(__user__, dict) else {}
+        async def resolve_skill_user():
+            return __user__ if isinstance(__user__, dict) else {}
 
-            skill_loader = BuiltinSkillLoader(
-                invocation=SkillBuiltinInvocation(
-                    profile="standalone", request=__request__, runtime_model=runtime_model,
-                    metadata=metadata, event_emitter=__event_emitter__, event_call=__event_call__,
-                    oauth_token=__oauth_token__,
-                ),
-                get_builtin_tools=get_builtin_tools, resolve_user=resolve_skill_user,
-            )
-            prepared = await SkillPreparation.prepare(
-                skill_ids=skill_ids, runtime_model=runtime_model, metadata=metadata,
-                lookup_skill=Skills.get_skill_by_id, load_builtin=skill_loader.load,
-            )
+        skill_loader = BuiltinSkillLoader(
+            invocation=SkillBuiltinInvocation(
+                profile="standalone", request=__request__, runtime_model=runtime_model,
+                metadata=metadata, event_emitter=__event_emitter__, event_call=__event_call__,
+                oauth_token=__oauth_token__,
+            ),
+            get_builtin_tools=get_builtin_tools, resolve_user=resolve_skill_user,
+        )
+        prepared = await SkillPreparation.prepare(
+            skill_ids=skill_ids, runtime_model=runtime_model, metadata=metadata,
+            lookup_skill=Skills.get_skill_by_id, load_builtin=skill_loader.load,
+        )
         SkillPreparation.install_context(prepared, body, runtime_model)
         RequestRuntime(__request__, metadata).finish_filter("skill_context")
         self._debug("model=%s Skill count=%s", model_id, len(prepared.ids))
