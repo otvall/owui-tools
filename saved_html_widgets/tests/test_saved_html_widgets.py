@@ -2,6 +2,7 @@
 
 import copy
 import importlib.util
+import json
 import sys
 import types
 import unittest
@@ -103,8 +104,9 @@ class SavedHtmlWidgetTests(unittest.IsolatedAsyncioTestCase):
         self.tool = module.Tools()
         self.module = module
 
-    async def listing(self, metadata=None, user=None, messages=None):
+    async def listing(self, metadata=None, user=None, messages=None, continuation=None):
         return await self.tool.list_saved_html_widgets(
+            continuation=continuation,
             __metadata__=self.metadata if metadata is None else metadata,
             __user__={"id": self.user.id} if user is None else user,
             __messages__=[] if messages is None else messages,
@@ -139,6 +141,188 @@ class SavedHtmlWidgetTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(await self.reading(widget["widget_id"]))["html"] for widget in widgets], [
             SOURCE_HTML, "<table><tr><td>7</td></tr></table>", SOURCE_HTML,
         ])
+
+    async def test_catalog_preserves_branch_order_and_each_mixed_source_location(self):
+        self.messages["chart"]["timestamp"] = 9000
+        self.messages["chart"]["embeds"] = ["<div>older message</div>"]
+        self.messages["middle"] = {"id": "middle", "parentId": "chart", "role": "user"}
+        self.messages["recent"] = {
+            "id": "recent", "parentId": "middle", "role": "assistant", "done": True,
+            "timestamp": 1, "embeds": [SOURCE_HTML, "<svg>diagram</svg>"],
+            "output": [
+                {"type": "function_call_output", "embeds": [SOURCE_HTML, "<table>42</table>"]},
+                {"type": "function_call_output", "embeds": ["<section>another output</section>"]},
+            ],
+        }
+        self.messages["request"]["parentId"] = "recent"
+        widgets = (await self.listing())["widgets"]
+        self.assertEqual([widget["message_id"] for widget in widgets], ["recent"] * 5 + ["chart"] * 2)
+        self.assertEqual(len({widget["widget_id"] for widget in widgets}), 7)
+        self.assertEqual([(await self.reading(widget["widget_id"]))["html"] for widget in widgets], [
+            SOURCE_HTML, "<svg>diagram</svg>", SOURCE_HTML, "<table>42</table>",
+            "<section>another output</section>", "<div>older message</div>", SOURCE_HTML,
+        ])
+
+    async def test_optional_metadata_uses_html_titles_and_unambiguous_saved_calls(self):
+        titled = '<!doctype html><title>Продажи &amp; прибыль</title><div>42</div>'
+        self.messages["chart"]["embeds"] = [titled, '<section><h1>Not a saved title</h1></section>']
+        self.messages["chart"]["output"] = [
+            {"type": "function_call", "call_id": "known", "name": "plot_sql_chart"},
+            {"type": "function_call_output", "call_id": "known", "embeds": [titled]},
+            {"type": "function_call_output", "call_id": "missing", "name": "guessed", "embeds": [SOURCE_HTML]},
+            {"type": "function_call", "call_id": "ambiguous", "name": "first"},
+            {"type": "function_call", "call_id": "ambiguous", "name": "second"},
+            {"type": "function_call_output", "call_id": "ambiguous", "embeds": [titled]},
+            {"type": "function_call", "call_id": "unnamed", "name": ""},
+            {"type": "function_call_output", "call_id": "unnamed", "embeds": [SOURCE_HTML]},
+            {"type": "function_call", "name": "no_relationship"},
+            {"type": "function_call_output", "embeds": [SOURCE_HTML]},
+        ]
+        widgets = (await self.listing())["widgets"]
+        self.assertEqual([widget.get("title") for widget in widgets], [
+            "Продажи & прибыль", None, "Продажи & прибыль", None, "Продажи & прибыль", None, None,
+        ])
+        self.assertEqual([widget.get("producer_operation") for widget in widgets], [
+            None, None, "plot_sql_chart", None, None, None, None,
+        ])
+        self.assertNotIn("producer_operation", widgets[0])
+        self.assertNotIn("title", widgets[1])
+        self.assertEqual((await self.reading(widgets[0]["widget_id"]))["html"], titled)
+
+    async def test_bounded_catalog_continues_to_every_widget_and_rejects_invalid_pages(self):
+        htmls = ["<div>one</div>", "<table>two</table>", "<svg>three</svg>", "<p>four</p>", SOURCE_HTML]
+        self.messages["chart"]["embeds"] = htmls[:-1]
+        self.tool.valves.LIST_PAGE_SIZE = 2
+        first = await self.listing()
+        self.assertTrue(first["has_more"])
+        self.assertEqual(len(first["widgets"]), 2)
+        continuation = first["next_continuation"]
+        widgets = list(first["widgets"])
+        page = await self.listing(continuation=continuation)
+        widgets.extend(page["widgets"])
+        self.assertTrue(page["has_more"])
+        last = await self.listing(continuation=page["next_continuation"])
+        widgets.extend(last["widgets"])
+        self.assertFalse(last["has_more"])
+        self.assertIsNone(last["next_continuation"])
+        self.assertEqual([(await self.reading(widget["widget_id"]))["html"] for widget in widgets], htmls)
+        for invalid in ["", "arbitrary", continuation + "x", 1, True,
+                        continuation.replace("page_2_", "page_1_"),
+                        continuation.replace("page_2_", "page_99_")]:
+            with self.subTest(continuation=invalid):
+                result = await self.listing(continuation=invalid)
+                self.assertEqual(result["code"], "INVALID_CONTINUATION")
+                self.assertNotIn("widgets", result)
+        other_request = {"id": "other-request", "parentId": "chart", "role": "user"}
+        self.messages["other-request"] = other_request
+        self.assertEqual((await self.listing(
+            metadata={**self.metadata, "user_message_id": "other-request"}, continuation=continuation,
+        ))["code"], "INVALID_CONTINUATION")
+        self.messages["chart"]["embeds"].pop()
+        self.assertEqual((await self.listing(continuation=continuation))["code"], "INVALID_CONTINUATION")
+
+    async def test_read_byte_limit_returns_all_html_or_a_clear_error(self):
+        widget_id = (await self.listing())["widgets"][0]["widget_id"]
+        self.tool.valves.MAX_HTML_BYTES = 199
+        rejected = await self.reading(widget_id)
+        self.assertEqual(rejected["code"], "WIDGET_TOO_LARGE")
+        self.assertIn("200", rejected["message"])
+        self.assertIn("199", rejected["message"])
+        self.assertNotIn("html", rejected)
+        self.tool.valves.MAX_HTML_BYTES = 200
+        self.assertEqual((await self.reading(widget_id))["html"], SOURCE_HTML)
+        self.tool.valves.MAX_HTML_BYTES = 0
+        self.assertEqual((await self.reading(widget_id))["html"], SOURCE_HTML)
+
+    async def test_title_parsing_never_hides_unusual_saved_html_fragments(self):
+        htmls = [
+            '<![bogus]><div>literal saved markup</div>',
+            '<script>const text = "<title>not document metadata</title>";</script><div>42</div>',
+        ]
+        self.messages["chart"]["embeds"] = htmls
+        self.messages["chart"]["output"] = []
+        listing = await self.listing()
+        self.assertEqual(listing["status"], "success")
+        self.assertEqual(len(listing["widgets"]), 2)
+        self.assertTrue(all("title" not in widget for widget in listing["widgets"]))
+        self.assertEqual([(await self.reading(widget["widget_id"]))["html"] for widget in listing["widgets"]], htmls)
+
+    async def test_presentation_agent_reads_real_saved_chart_among_unrelated_widgets(self):
+        fixture_path = Path(__file__).resolve().parents[2] / "deployment" / "sql-demo-chat-result.json"
+        fixture = json.loads(fixture_path.read_text())
+        history = fixture["chat"]["history"]
+        chart_id = history["currentId"]
+        self.messages = copy.deepcopy(history["messages"])
+        original_html = self.messages[chart_id]["output"][3]["embeds"][0]
+        self.messages[chart_id]["embeds"] = ["<title>Unrelated table</title><table>9</table>"]
+        self.messages["another-question"] = {"id": "another-question", "parentId": chart_id, "role": "user"}
+        self.messages["another-answer"] = {
+            "id": "another-answer", "parentId": "another-question", "role": "assistant", "done": True,
+            "embeds": ["<svg>unrelated recent diagram</svg>"],
+            "output": [{"type": "function_call_output", "call_id": "other", "embeds": ["<p>unrelated fragment</p>"]}],
+        }
+        self.messages["request"] = {"id": "request", "parentId": "another-answer", "role": "user"}
+        self.metadata["user_message"] = copy.deepcopy(self.messages["request"])
+        self.chat.chat = copy.deepcopy(fixture["chat"])
+        self.chat.chat["history"]["messages"] = copy.deepcopy(self.messages)
+        self.database.commit()
+        original_chat = copy.deepcopy(self.chat.chat)
+        for native_storage in [True, False]:
+            self.native_messages.get_messages_map_by_chat_id.side_effect = None
+            self.native_messages.get_messages_map_by_chat_id.return_value = copy.deepcopy(self.messages) if native_storage else None
+            for tool_context in [[], [{"role": "user", "content": "Use my earlier saved chart in HTML slides"}]]:
+                with self.subTest(native_storage=native_storage, tool_context=tool_context):
+                    listing = await self.listing(messages=tool_context)
+                    self.assertEqual([widget["message_id"] for widget in listing["widgets"]], [
+                        "another-answer", "another-answer", chart_id, chart_id,
+                    ])
+                    selected = [widget for widget in listing["widgets"] if widget.get("producer_operation") == "plot_sql_chart"]
+                    self.assertEqual(len(selected), 1)
+                    self.assertEqual(selected[0]["title"], "SQL → интерактивный график")
+                    self.assertEqual(selected[0]["html_bytes"], 7068)
+                    self.assertEqual((await self.reading(selected[0]["widget_id"]))["html"], original_html)
+        self.database.expire_all()
+        saved = self.database.get(PlatformChat, "chat-a")
+        assert saved is not None
+        self.assertEqual(saved.chat, original_chat)
+
+    async def test_message_embed_reads_revalidate_access_branch_completion_and_saved_location(self):
+        self.messages["chart"]["embeds"] = ["<div>message-level original</div>"]
+        widget_id = (await self.listing())["widgets"][0]["widget_id"]
+        original_messages = copy.deepcopy(self.messages)
+        cases = ["access", "branch", "unfinished", "removed", "replacement", "url"]
+        for case in cases:
+            with self.subTest(change=case):
+                self.messages = copy.deepcopy(original_messages)
+                self.allowed = case != "access"
+                if case == "branch":
+                    self.messages["alternative"] = {
+                        "id": "alternative", "parentId": "question", "role": "assistant", "done": True,
+                        "embeds": ["<div>alternative result must not be revealed</div>"],
+                    }
+                    self.messages["request"]["parentId"] = "alternative"
+                elif case == "unfinished":
+                    self.messages["chart"]["done"] = False
+                elif case == "removed":
+                    del self.messages["chart"]["embeds"]
+                elif case == "replacement":
+                    self.messages["chart"]["embeds"][0] = "<div>replacement must not be revealed</div>"
+                elif case == "url":
+                    self.messages["chart"]["embeds"][0] = "https://example.com/replacement"
+                result = await self.reading(widget_id)
+                self.assertEqual(result["code"], "ACCESS_DENIED" if case == "access" else "WIDGET_UNAVAILABLE")
+                self.assertNotIn("html", result)
+
+    async def test_message_embeds_exclude_urls_and_keep_saved_resource_references_unchanged(self):
+        original_html = '<title>Table</title>\r\n<link href="https://example.com/table.css"><table><td>42</td></table>'
+        self.messages["chart"]["embeds"] = [
+            "https://example.com/chart", "//example.com/chart", "data:text/html,<p>remote</p>", original_html,
+        ]
+        self.messages["chart"]["output"] = []
+        with patch("urllib.request.urlopen", side_effect=AssertionError("URL fetching is forbidden")):
+            listing = await self.listing()
+            self.assertEqual(len(listing["widgets"]), 1)
+            self.assertEqual((await self.reading(listing["widgets"][0]["widget_id"]))["html"], original_html)
 
     async def test_url_only_embeds_are_not_downloadable_widgets(self):
         self.messages["chart"]["output"][1]["embeds"] = [
@@ -251,7 +435,9 @@ class SavedHtmlWidgetTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_saved_chat_context_is_distinct_from_empty_discovery(self):
         self.messages["chart"]["output"] = []
-        self.assertEqual(await self.listing(), {"status": "success", "widgets": []})
+        self.assertEqual(await self.listing(), {
+            "status": "success", "widgets": [], "has_more": False, "next_continuation": None,
+        })
         self.assertEqual((await self.listing(metadata={}))["code"], "CHAT_CONTEXT_MISSING")
         self.assertEqual((await self.listing(metadata={**self.metadata, "chat_id": "absent"}))["code"], "ACCESS_DENIED")
 
