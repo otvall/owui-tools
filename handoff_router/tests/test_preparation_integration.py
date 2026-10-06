@@ -272,7 +272,9 @@ class CombinedPreparationTests(router_preparation.RouterPreparationTests):
         self.assertEqual(self.routed["model"], "agent-a")
         loader = self.metadata["tools"]["view_skill"]["callable"]
         self.assertEqual(await loader(id="specialist"), "Loaded")
-        self.assertIn("error", await loader(id="route-a"))
+        self.assertNotIn("<id>route-a</id>", self.routed["messages"][0]["content"])
+        self.assertEqual(await loader(id="route-a"), "Loaded")
+        self.builtins.return_value["view_skill"]["callable"].assert_any_await(id="route-a")
         lookup = self.metadata["tools"]["lookup"]["callable"]
         self.assertEqual(self.loader.await_count, 2)
 

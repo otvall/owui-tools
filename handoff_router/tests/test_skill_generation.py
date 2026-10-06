@@ -160,7 +160,7 @@ class SkillGenerationTests(unittest.TestCase):
             with self.subTest(filename=name):
                 path = self.root / name
                 path.write_text(path.read_text().replace(
-                    "Skill is not available in the current model context", "Stale Skill error",
+                    "Attached model Skills are unavailable", "Stale Skill error",
                 ))
                 stale = self.outputs()
                 self.assertNotEqual(stale, before)

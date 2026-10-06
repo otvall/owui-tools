@@ -3,8 +3,9 @@
 import types
 import itertools
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, call as mock_call, patch
 
+from test_capability_context import owui_callable, owui_refresh
 from test_handoff_history import PipeTestCase, assistant, call, grouped_history, load_plain_module, result, router
 
 
@@ -70,6 +71,86 @@ class SkillBehavior:
         self.assertNotIn("view_skill", self.metadata["tools"])
         self.builtins.assert_not_awaited()
 
+    async def test_skill_outside_manifest_loads_through_native_access_checks(self):
+        await self.prepare()
+        self.assertIn("<id>alpha</id>", self.prompt())
+        self.assertNotIn("<id>beta</id>", self.prompt())
+        self.assertNotIn("Full beta instructions", self.prompt())
+        self.view_skill.return_value = '{"name":"Beta","content":"Full beta instructions"}'
+        loader = self.metadata["tools"]["view_skill"]["callable"]
+        self.assertEqual(json.loads(await loader(id="beta")), {
+            "name": "Beta", "content": "Full beta instructions",
+        })
+        self.view_skill.assert_awaited_once_with(id="beta")
+
+    async def test_unselected_denied_missing_and_inactive_skills_keep_native_results(self):
+        await self.prepare()
+        loader = self.metadata["tools"]["view_skill"]["callable"]
+        for skill_id, native_error in (
+            ("denied", "Access denied"),
+            ("missing", "Skill 'missing' not found"),
+            ("inactive", "Skill 'inactive' not found"),
+        ):
+            with self.subTest(skill_id=skill_id):
+                native_result = json.dumps({"error": native_error})
+                self.view_skill.reset_mock()
+                self.view_skill.return_value = native_result
+                self.assertEqual(await loader(id=skill_id), native_result)
+                self.view_skill.assert_awaited_once_with(id=skill_id)
+
+    async def test_native_execution_and_refresh_keep_conversion_identity_and_fresh_context(self):
+        spec = {
+            "name": "view_skill", "description": "Native loader",
+            "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+        }
+
+        async def view_skill(
+            id: str, __user__: dict = None, __request__=None,
+            __messages__: list = None, __files__: list = None,
+        ):
+            return id, __user__, __request__, __messages__, __files__
+
+        async def get_builtin_tools(request, extra_params, **options):
+            return {"view_skill": {
+                "spec": spec,
+                "callable": owui_callable(view_skill, {**extra_params, "__request__": request}),
+            }}
+
+        self.builtins.side_effect = get_builtin_tools
+        self.metadata["files"] = ["initial file"]
+        outer = [{"role": "user", "content": "Native loop outer history"}]
+        for description in ("First Skill description", "Edited Skill description"):
+            with self.subTest(description=description):
+                self.records["alpha"].description = description
+                await self.prepare()
+                self.assertIn(description, self.prompt())
+                loader = self.metadata["tools"]["view_skill"]
+                self.assertIs(loader["spec"], spec)
+                self.assertEqual([
+                    schema["function"] for schema in self.body["tools"]
+                    if schema["function"]["name"] == "view_skill"
+                ], [spec])
+                expected_user = {"id": "owner" if self.path == "orchestrator" else "user"}
+                for raw_id, native_id in (
+                    (" BETA ", " BETA "), ("", ""), (" \t ", " \t "), (42, "42"), (3.5, "3.5"),
+                ):
+                    with self.subTest(id=raw_id):
+                        direct = await loader["callable"](id=raw_id)
+                        self.assertEqual(direct[:2], (native_id, expected_user))
+                        self.assertIs(direct[2], self.request)
+                        if self.path != "standalone":
+                            self.assertEqual(direct[3:], (self.body["messages"], ["initial file"]))
+                        refreshed = owui_refresh(loader["callable"], {
+                            "__messages__": outer, "__files__": ["current file"],
+                        })
+                        executed = await refreshed(id=raw_id)
+                        self.assertEqual(executed[:2], (native_id, expected_user))
+                        self.assertIs(executed[2], self.request)
+                        self.assertEqual(executed[3:], (
+                            outer if self.path == "standalone" else self.body["messages"], ["current file"],
+                        ))
+                self.body["messages"] += [assistant(call("continued", "lookup")), result("continued", "new result")]
+
     async def test_foreign_replacement_of_earlier_loader_is_rejected(self):
         await self.prepare()
         foreign = {"spec": {"name": "view_skill"}, "callable": AsyncMock()}
@@ -104,7 +185,7 @@ class SkillBehavior:
                     for schema in self.body.get("tools", [])
                 ), int(lazy))
 
-    async def test_canonical_selection_lookup_order_rendering_and_allowlist(self):
+    async def test_canonical_selection_lookup_and_rendering_preserve_raw_loader_arguments(self):
         self.select([" BETA ", "Alpha", " beta ", "", None, "ALPHA"])
         await self.prepare()
         self.assertEqual([call.args[0] for call in self.skills.call_args_list], ["beta", "alpha"])
@@ -115,8 +196,7 @@ class SkillBehavior:
         self.assertNotIn("Full alpha instructions", prompt)
         tool = self.metadata["tools"]["view_skill"]["callable"]
         self.assertEqual(await tool(id=" ALPHA "), "builtin checked permissions")
-        self.assertIn("error", json.loads(await tool(id="not-selected")))
-        self.view_skill.assert_awaited_once_with(id="alpha")
+        self.view_skill.assert_awaited_once_with(id=" ALPHA ")
         self.metadata["params"]["function_calling"] = "legacy"
         await self.prepare()
         self.assertLess(self.prompt().index('id="beta"'), self.prompt().index('id="alpha"'))
@@ -208,8 +288,18 @@ class SkillBehavior:
     async def test_repeated_preparation_replaces_owned_loader_and_preserves_prompt(self):
         await self.prepare()
         earlier = self.metadata["tools"]["view_skill"]["callable"]
+        current = AsyncMock(return_value="fresh native loader")
+        self.builtins.return_value = {
+            "view_skill": {"spec": {"name": "view_skill", "description": "Fresh loader"}, "callable": current},
+        }
         await self.prepare()
-        self.assertIsNot(self.metadata["tools"]["view_skill"]["callable"], earlier)
+        loader = self.metadata["tools"]["view_skill"]
+        self.assertIs(loader["callable"], current)
+        self.assertIsNot(loader["callable"], earlier)
+        self.assertEqual([
+            schema["function"] for schema in self.body["tools"]
+            if schema["function"]["name"] == "view_skill"
+        ], [loader["spec"]])
         self.assertEqual(self.prompt().count("<available_skills>"), 1)
         if self.path != "child":
             self.assertIn("Administrator prompt", self.prompt())
@@ -239,7 +329,8 @@ class SkillBehavior:
         self.assertNotIn("<id>alpha</id>", self.prompt())
         self.assertIn("<id>beta</id>", self.prompt())
         tool = self.metadata["tools"]["view_skill"]["callable"]
-        self.assertIn("error", json.loads(await tool(id="alpha")))
+        self.assertEqual(await tool(id="alpha"), "builtin checked permissions")
+        self.view_skill.assert_awaited_once_with(id="alpha")
         self.select([])
         await self.prepare()
         self.assertNotIn("<available_skills>", self.prompt())
@@ -297,11 +388,12 @@ class SkillBehavior:
         with self.assertRaisesRegex(ValueError, "Attached model Skills are unavailable: alpha"):
             await self.prepare()
 
-    async def test_allowed_loader_calls_keep_builtin_permission_errors(self):
+    async def test_unselected_loader_calls_keep_builtin_permission_errors(self):
         await self.prepare()
         self.view_skill.side_effect = PermissionError("Skill permission denied")
         with self.assertRaisesRegex(PermissionError, "Skill permission denied"):
-            await self.metadata["tools"]["view_skill"]["callable"](id="alpha")
+            await self.metadata["tools"]["view_skill"]["callable"](id="beta")
+        self.view_skill.assert_awaited_once_with(id="beta")
 
     async def test_full_fallback_preserves_foreign_tool_after_owned_loader_replacement(self):
         await self.prepare()
@@ -663,7 +755,7 @@ class ChildSkillTests(SkillBehavior, PipeTestCase):
                 self.skills.assert_not_awaited()
                 self.assertTrue(all(args.args[1]["__skill_ids__"] == [] for args in self.builtins.call_args_list))
 
-    async def test_database_replacement_updates_context_schema_and_loader_allowlist(self):
+    async def test_database_replacement_updates_context_and_native_loader_schema(self):
         self.runtime_model["info"]["meta"]["skillIds"] = ["alpha"]
 
         async def dispatch_with_stale_body_selection(**kwargs):
@@ -681,8 +773,9 @@ class ChildSkillTests(SkillBehavior, PipeTestCase):
                 self.select([" BETA ", "beta", ""])
                 self.skills.reset_mock()
                 self.view_skill.reset_mock()
-                self.builtins.return_value["view_skill"]["spec"] = {
-                    "name": "view_skill", "description": "Current Skill loader",
+                self.builtins.return_value["view_skill"] = {
+                    "spec": {"name": "view_skill", "description": "Current Skill loader"},
+                    "callable": self.view_skill,
                 }
 
                 await self.prepare()
@@ -695,14 +788,11 @@ class ChildSkillTests(SkillBehavior, PipeTestCase):
                 schemas = [s["function"] for s in self.body["tools"] if s["function"]["name"] == "view_skill"]
                 if mode == "native":
                     loader = self.metadata["tools"]["view_skill"]
-                    self.assertIsNot(loader, previous_loader)
+                    self.assertNotEqual(loader["spec"], previous_loader["spec"])
                     self.assertEqual(schemas, [{"name": "view_skill", "description": "Current Skill loader"}])
-                    self.assertEqual(json.loads(await loader["callable"](id=" ALPHA ")), {
-                        "error": "Skill is not available in the current model context",
-                    })
-                    self.view_skill.assert_not_awaited()
+                    self.assertEqual(await loader["callable"](id=" ALPHA "), "builtin checked permissions")
                     self.assertEqual(await loader["callable"](id=" BETA "), "builtin checked permissions")
-                    self.view_skill.assert_awaited_once_with(id="beta")
+                    self.assertEqual(self.view_skill.await_args_list, [mock_call(id=" ALPHA "), mock_call(id=" BETA ")])
                     params = self.builtins.call_args.args[1]
                     self.assertEqual(params["__skill_ids__"], ["beta"])
                     self.assertEqual(params["__user__"], {"id": "user"})
@@ -779,7 +869,7 @@ class ChildSkillTests(SkillBehavior, PipeTestCase):
         self.connector.assert_awaited_once()
         self.assertIs(self.metadata["mcp_clients"]["documents"], client)
         self.assertNotIn("beta", "\n".join(m["content"] for m in history if m["role"] == "system"))
-        self.assertIn("error", json.loads(await old_tools["view_skill"]["callable"](id="beta")))
+        self.assertEqual(await old_tools["view_skill"]["callable"](id="beta"), "builtin checked permissions")
 
     async def test_child_skill_failure_restores_owned_loader_and_attachment_identifiers(self):
         await self.prepare()

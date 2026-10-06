@@ -548,7 +548,7 @@ class WorkspaceCapabilityTests(PipeTestCase):
         self.assertIn('<knowledge type="file" id="file-1"', prompt)
         self.assertIn('name="Guide &quot;A&quot;"', prompt)
 
-    async def test_child_skill_manifest_and_loader_use_only_attached_skills(self):
+    async def test_child_manifest_selects_attached_skills_and_loader_delegates_other_ids(self):
         self.models["agent-a"].meta["skillIds"] = ["specialist-skill"]
         view_skill = AsyncMock(return_value="Loaded specialist Skill")
         self.builtins.return_value["view_skill"] = {
@@ -558,11 +558,14 @@ class WorkspaceCapabilityTests(PipeTestCase):
         prompt = self.routed["messages"][0]["content"]
         self.assertIn("<available_skills>", prompt)
         self.assertIn("specialist-skill", prompt)
+        self.assertNotIn("<id>routing-skill</id>", prompt)
         self.assertNotIn("Skill instructions for specialist-skill", prompt)
         tool = self.metadata["tools"]["view_skill"]["callable"]
         self.assertEqual(await tool(id="specialist-skill"), "Loaded specialist Skill")
-        self.assertIn("error", json.loads(await tool(id="routing-skill")))
-        view_skill.assert_awaited_once_with(id="specialist-skill")
+        self.assertEqual(await tool(id="routing-skill"), "Loaded specialist Skill")
+        self.assertEqual(view_skill.await_count, 2)
+        view_skill.assert_any_await(id="specialist-skill")
+        view_skill.assert_any_await(id="routing-skill")
         self.assertEqual(self.builtins.call_args.args[1]["__user__"], {"id": "user"})
 
     async def test_disabled_builtins_deliver_full_attached_skills(self):

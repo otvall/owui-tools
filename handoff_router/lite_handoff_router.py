@@ -1,7 +1,7 @@
 """
 title: Lite Handoff Router
 description: Stateless same-response subagent handoff router.
-version: 0.21.1
+version: 0.21.2
 required_open_webui_version: 0.11.1
 """
 
@@ -883,19 +883,7 @@ class SkillPreparation:
             and (metadata.get("params") or {}).get("function_calling") != "legacy"
             and (meta.get("capabilities") or {}).get("builtin_tools", True) is not False
         )
-        builtin = (await load_builtin(ids)).get("view_skill") if ids and eligible else None
-        loader = None
-        if builtin is not None:
-            allowed = frozenset(ids)
-            builtin_callable = builtin["callable"]
-
-            async def allowlisted_view_skill(id: str):
-                requested_id = next(iter(normalize_skill_ids([id])), "")
-                if requested_id not in allowed:
-                    return '{"error":"Skill is not available in the current model context"}'
-                return await builtin_callable(id=requested_id)
-
-            loader = {**builtin, "callable": allowlisted_view_skill}
+        loader = (await load_builtin(ids)).get("view_skill") if ids and eligible else None
 
         entries = []
         for skill_id, skill in skills:

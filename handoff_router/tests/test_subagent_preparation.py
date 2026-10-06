@@ -131,7 +131,9 @@ class SubagentPreparationTests(PreparationOnly, PipeTestCase):
         self.assertEqual(final[-1], {"role": "system", "content": "Final context"})
         self.assertEqual(await self.metadata["tools"]["lookup"]["callable"](), final)
         self.assertEqual(await self.metadata["tools"]["view_skill"]["callable"](id="specialist"), "Loaded")
-        self.assertIn("error", await self.metadata["tools"]["view_skill"]["callable"](id="route-a"))
+        self.assertNotIn("<id>route-a</id>", final[0]["content"])
+        self.assertEqual(await self.metadata["tools"]["view_skill"]["callable"](id="route-a"), "Loaded")
+        self.builtins.return_value["view_skill"]["callable"].assert_any_await(id="route-a")
 
 
 # Reuse behavior contracts without substituting project stages. Each destination
