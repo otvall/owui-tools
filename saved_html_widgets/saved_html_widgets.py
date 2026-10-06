@@ -1,7 +1,7 @@
 """
 title: Saved HTML Widgets
 description: List and read original HTML from completed earlier responses in the current request branch.
-version: 1.0.0
+version: 1.1.0
 required_open_webui_version: 0.11.1
 """
 
@@ -9,7 +9,10 @@ import hashlib
 import json
 import logging
 import re
+from html.parser import HTMLParser
 from typing import Any, NoReturn
+
+from pydantic import BaseModel, Field
 
 from open_webui.env import ENABLE_ADMIN_CHAT_ACCESS
 from open_webui.internal.db import get_async_db_context
@@ -119,18 +122,51 @@ async def saved_branch(metadata: dict | None, execution_user: dict | None) -> tu
     return chat_id, branch
 
 
+class SavedTitleParser(HTMLParser):
+    """Extract optional document metadata without changing its source HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.in_title = False
+        self.parts: list[str] = []
+        self.title: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag == "title" and self.title is None:
+            self.in_title = True
+            self.parts = []
+
+    def handle_data(self, data: str) -> None:
+        if self.in_title:
+            self.parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "title" and self.in_title:
+            self.title = "".join(self.parts).strip() or None
+            self.in_title = False
+
+
 def saved_widgets(chat_id: str, branch: list[dict]) -> list[dict]:
     widgets = []
     for message in branch:
         if message.get("role") != "assistant" or message.get("done") is not True:
             continue
+        sources: list[tuple[str, int | None, Any, str | None]] = [("message", None, message.get("embeds"), None)]
         outputs = message.get("output")
-        if not isinstance(outputs, list):
-            continue
-        for output_index, output in enumerate(outputs):
-            if not isinstance(output, dict) or output.get("type") != "function_call_output":
-                continue
-            embeds = output.get("embeds")
+        if isinstance(outputs, list):
+            for output_index, output in enumerate(outputs):
+                if not isinstance(output, dict) or output.get("type") != "function_call_output":
+                    continue
+                call_id = output.get("call_id")
+                calls = [
+                    item for item in outputs if isinstance(item, dict)
+                    and item.get("type") == "function_call" and item.get("call_id") == call_id
+                ] if isinstance(call_id, str) and call_id else []
+                producer = calls[0].get("name") if len(calls) == 1 else None
+                if not isinstance(producer, str) or not producer.strip():
+                    producer = None
+                sources.append(("output", output_index, output.get("embeds"), producer))
+        for source_kind, source_index, embeds, producer in sources:
             if not isinstance(embeds, list):
                 continue
             for embed_index, html in enumerate(embeds):
@@ -141,23 +177,62 @@ def saved_widgets(chat_id: str, branch: list[dict]) -> list[dict]:
                     r"|^[a-z][a-z0-9+.-]*:[^\s<>]*$", html.strip(), re.IGNORECASE,
                 ):
                     continue
-                location = [chat_id, message["id"], "output", output_index, embed_index, html]
+                location = [chat_id, message["id"], source_kind, source_index, embed_index, html]
                 widget_id = "html_" + hashlib.sha256(json.dumps(location, ensure_ascii=False).encode("utf-8")).hexdigest()
-                widgets.append({"widget_id": widget_id, "message_id": message["id"],
-                                "html_bytes": len(html.encode("utf-8")), "html": html})
+                widget = {"widget_id": widget_id, "message_id": message["id"],
+                          "html_bytes": len(html.encode("utf-8")), "html": html}
+                title_parser = SavedTitleParser()
+                try:
+                    title_parser.feed(html)
+                except Exception:
+                    # Parser behavior varies by Python version for malformed
+                    # declarations. Optional metadata must not hide saved HTML.
+                    pass
+                else:
+                    if title_parser.title is not None:
+                        widget["title"] = title_parser.title
+                if producer is not None:
+                    widget["producer_operation"] = producer
+                widgets.append(widget)
     return widgets
 
 
 class Tools:
-    async def list_saved_html_widgets(self, __metadata__: dict | None = None, __user__: dict | None = None,
+    class Valves(BaseModel):
+        LIST_PAGE_SIZE: int = Field(default=50, ge=1, description="Maximum widgets returned per discovery page.")
+        MAX_HTML_BYTES: int = Field(default=0, ge=0, description="Maximum full HTML size in UTF-8 bytes; 0 means unlimited.")
+
+    def __init__(self) -> None:
+        self.valves = self.Valves()
+
+    async def list_saved_html_widgets(self, continuation: str | None = None,
+                                      __metadata__: dict | None = None, __user__: dict | None = None,
                                       __messages__: list | None = None) -> dict:
-        """List saved HTML in completed earlier responses in this request's branch, without HTML bodies."""
+        """List saved HTML metadata newest first. Continue while has_more is true.
+
+        :param continuation: Copy next_continuation from the preceding page; omit for the first page.
+        """
         try:
             chat_id, branch = await saved_branch(__metadata__, __user__)
-            return {"status": "success", "widgets": [
+            widgets = [
                 {key: value for key, value in widget.items() if key != "html"}
                 for widget in saved_widgets(chat_id, branch)
-            ]}
+            ]
+            page_size = self.valves.LIST_PAGE_SIZE
+            scope = [chat_id, (__metadata__ or {}).get("user_message_id"), page_size, widgets]
+            snapshot = hashlib.sha256(json.dumps(scope, ensure_ascii=False).encode("utf-8")).hexdigest()
+            offset = 0
+            if continuation is not None:
+                match = re.fullmatch(r"page_([1-9][0-9]{0,19})_([0-9a-f]{64})", continuation) if isinstance(continuation, str) else None
+                if match is None:
+                    fail("INVALID_CONTINUATION", "Use next_continuation from this request's preceding page, or restart discovery.")
+                offset = int(match[1])
+                if match[2] != snapshot or offset >= len(widgets) or offset % page_size:
+                    fail("INVALID_CONTINUATION", "The catalog or request changed, or the page is invalid. Restart discovery.")
+            end = offset + page_size
+            has_more = end < len(widgets)
+            return {"status": "success", "widgets": widgets[offset:end], "has_more": has_more,
+                    "next_continuation": f"page_{end}_{snapshot}" if has_more else None}
         except WidgetError as exc:
             return exc.result
         except Exception:
@@ -175,6 +250,9 @@ class Tools:
             chat_id, branch = await saved_branch(__metadata__, __user__)
             for widget in saved_widgets(chat_id, branch):
                 if widget["widget_id"] == widget_id:
+                    limit = self.valves.MAX_HTML_BYTES
+                    if limit and widget["html_bytes"] > limit:
+                        fail("WIDGET_TOO_LARGE", f"The saved HTML is {widget['html_bytes']} UTF-8 bytes, exceeding the configured {limit}-byte limit. Ask the administrator to raise MAX_HTML_BYTES; no HTML was returned.")
                     return {"status": "success", "widget_id": widget_id, "html": widget["html"]}
             fail("WIDGET_UNAVAILABLE", "The selected widget is absent from the accessible completed ancestor responses.")
         except WidgetError as exc:
