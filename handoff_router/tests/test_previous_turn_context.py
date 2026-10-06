@@ -633,9 +633,6 @@ class SplitFilterPipelineTests(PipeTestCase):
         self.registry = self.registry_filter()
         self.previous = previous_filter.Filter()
         self.cleanup = cleanup_filter.Filter()
-        self.child_tool_filter = self.tool_filter
-        self.child_context_filter = self.context_filter
-        self.child_skill_filter = self.skill_filter
 
     async def apply_filters(self, messages):
         self.begin_request()
@@ -660,21 +657,13 @@ class SplitFilterPipelineTests(PipeTestCase):
         self.assertEqual({key: value for key, value in body.items() if key != "metadata"}, filtered)
         return self.routed
 
-    async def test_standalone_filter_priorities(self):
+    async def test_standalone_router_history_priorities_define_required_order(self):
         self.assertEqual(
             [
                 self.previous.valves.priority,
                 self.cleanup.valves.priority,
             ],
             [-90, -80],
-        )
-        self.assertEqual(
-            [
-                self.child_tool_filter.valves.priority,
-                self.child_context_filter.valves.priority,
-                self.child_skill_filter.valves.priority,
-            ],
-            [-30, -20, -10],
         )
 
     async def test_router_builds_skill_prompt_without_skill_filter(self):

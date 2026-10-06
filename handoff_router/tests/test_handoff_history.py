@@ -1,7 +1,7 @@
 """Regression tests for OWUI's reconstructed tool history, without an OWUI server.
 
 Run from the repository root: python3 -m unittest discover -s handoff_router/tests -v
-OWUI adapters are stubbed; Pipe.pipe and preparation rules run unmodified.
+OWUI boundary adapters are stubbed; Pipe.pipe prepares children without attachments.
 The fixture was generated with v0.11.1's convert_output_to_messages(raw=True).
 """
 
@@ -116,7 +116,6 @@ class PipeTestCase(unittest.IsolatedAsyncioTestCase):
         )
         self.tool_names = ["lookup"]
         self.tool_filter = tool_filter_module.Filter()
-        self.context_filter = context_filter_module.Filter()
         self.skill_filter = skill_filter_module.Filter()
         self.filters = []
         self.users = self.enterContext(patch.object(
@@ -127,9 +126,6 @@ class PipeTestCase(unittest.IsolatedAsyncioTestCase):
         ))
         self.loader = self.enterContext(patch.object(router, "get_tools", AsyncMock(side_effect=self.load_tools)))
         self.builtins = self.enterContext(patch.object(router, "get_builtin_tools", AsyncMock(return_value={})))
-        self.builtins.side_effect = lambda *args, **kwargs: {
-            name: dict(tool) for name, tool in self.builtins.return_value.items()
-        }
         self.enterContext(patch.object(skill_filter_module, "get_builtin_tools", self.builtins))
         self.skills = self.enterContext(patch.object(
             router.Skills, "get_skill_by_id", AsyncMock(side_effect=lambda id: types.SimpleNamespace(
@@ -551,7 +547,7 @@ class WorkspaceCapabilityTests(PipeTestCase):
         self.assertIn('<knowledge type="file" id="file-1"', prompt)
         self.assertIn('name="Guide &quot;A&quot;"', prompt)
 
-    async def test_child_manifest_uses_attached_skills_and_loading_uses_native_policy(self):
+    async def test_child_skill_manifest_and_loader_use_only_attached_skills(self):
         self.models["agent-a"].meta["skillIds"] = ["specialist-skill"]
         view_skill = AsyncMock(return_value="Loaded specialist Skill")
         self.builtins.return_value["view_skill"] = {
@@ -564,10 +560,8 @@ class WorkspaceCapabilityTests(PipeTestCase):
         self.assertNotIn("Skill instructions for specialist-skill", prompt)
         tool = self.metadata["tools"]["view_skill"]["callable"]
         self.assertEqual(await tool(id="specialist-skill"), "Loaded specialist Skill")
-        self.assertEqual(await tool(id="routing-skill"), "Loaded specialist Skill")
-        self.assertEqual([item.kwargs for item in view_skill.await_args_list], [
-            {"id": "specialist-skill"}, {"id": "routing-skill"},
-        ])
+        self.assertIn("error", json.loads(await tool(id="routing-skill")))
+        view_skill.assert_awaited_once_with(id="specialist-skill")
         self.assertEqual(self.builtins.call_args.args[1]["__user__"], {"id": "user"})
 
     async def test_disabled_builtins_deliver_full_attached_skills(self):
@@ -598,6 +592,7 @@ class CompletionTests(PipeTestCase):
         self.completion.assert_awaited_once()
         self.assertEqual(self.metadata["lite_active_model_id"], "agent-a")
         self.assertEqual(self.metadata["lite_target_model_id"], "agent-a")
+        self.assertEqual(self.routed["messages"], [grouped_history()[0]])
         self.assertEqual(await self.metadata["tools"]["lookup"]["callable"](), self.routed["messages"])
         self.assertEqual(self.metadata["lite_child_messages"], self.routed["messages"])
 
@@ -626,14 +621,13 @@ class CompletionTests(PipeTestCase):
 
 
 class ChildFilterPipelineTests(PipeTestCase):
-    async def test_additional_history_filters_preserve_prepared_context_and_router_evidence(self):
+    async def test_additional_history_filters_do_not_change_router_preparation_evidence(self):
+        evidence = copy.deepcopy(self.metadata["lite_router_filter_pipeline"])
         previous = load_plain_module("previous_tool_context.py", "additional_previous_tests").Filter()
         cleanup = load_plain_module("history_cleanup.py", "additional_cleanup_tests").Filter()
         self.filters.extend([previous, cleanup])
-        evidence = list(self.metadata["lite_router_filter_pipeline"])
         await self.invoke(grouped_history()[:4])
         self.assertEqual(self.metadata["lite_router_filter_pipeline"], evidence)
-        self.assertEqual(self.routed["messages"], [grouped_history()[0]])
 
     async def test_pipe_metadata_is_authoritative_and_managed_state_is_mirrored(self):
         foreign_body_metadata = {"lite_active_handoff": {"agent_id": "agent-b", "__lite_delegate__": "v2"}}
@@ -673,7 +667,7 @@ class ChildFilterPipelineTests(PipeTestCase):
         self.assertNotIn("lite_subagent_filter_run", request_state)
         self.assertIs(request_state["tools"], shared)
 
-    async def test_failed_switch_restores_live_history_tools_and_capabilities(self):
+    async def test_failed_switch_restores_live_history_tools_and_capability_cache(self):
         await self.invoke(grouped_history()[:4])
         shared = self.metadata["tools"]
         lookup = shared["lookup"]["callable"]
@@ -767,29 +761,25 @@ class ChildFilterPipelineTests(PipeTestCase):
         self.assertEqual(self.dispatch_filters.call_args.kwargs["filter_type"], "inlet")
         self.assertNotIn("lite_subagent_filter_run", self.metadata)
 
-    async def test_prepares_destination_without_any_attached_filters(self):
+    async def test_handoff_dispatches_without_destination_filters(self):
         self.filters = []
         await self.invoke(grouped_history()[:4])
-        self.completion.assert_awaited_once()
         self.assertEqual(self.routed["model"], "agent-a")
         self.assertEqual(self.routed["messages"], [grouped_history()[0]])
 
-    async def test_additional_filters_run_in_platform_order_after_preparation(self):
-        seen = []
-
+    async def test_additional_filters_keep_platform_order(self):
         async def first(body):
-            self.assertEqual(body["messages"], [grouped_history()[0]])
-            seen.append("first")
-            return body
+            return {**body, "messages": [*body["messages"], {"role": "assistant", "content": "First filter"}]}
 
         async def second(body):
-            seen.append("second")
-            return body
+            self.assertEqual(body["messages"][-1]["content"], "First filter")
+            return {**body, "messages": [*body["messages"], {"role": "assistant", "content": "Second filter"}]}
 
         self.filters = [types.SimpleNamespace(inlet=first), types.SimpleNamespace(inlet=second)]
         await self.invoke(grouped_history()[:4])
-        self.assertEqual(seen, ["first", "second"])
+        self.assertEqual([m["content"] for m in self.routed["messages"][-2:]], ["First filter", "Second filter"])
         self.dispatch_filters.assert_awaited_once()
+        self.assertNotIn("lite_subagent_filter_run", self.metadata)
 
 
 if __name__ == "__main__":

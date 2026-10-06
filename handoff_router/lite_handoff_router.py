@@ -327,7 +327,7 @@ class RequestRuntime:
 
     @contextmanager
     def child_filters(self) -> Iterator[None]:
-        """Scope destination inlets without changing the Router's inlet evidence."""
+        """Keep destination inlets from changing the Router's preparation evidence."""
         self.sync(lite_subagent_filter_run=True)
         try:
             yield
@@ -1659,14 +1659,13 @@ class ChildFilterPipeline:
 class ChildRequestBuilder:
     """Prepare a destination request, including capabilities, reuse and filters."""
 
-    def __init__(self, debug: Callable[..., None]):
+    def __init__(self):
         self._capabilities = ModelCapabilityResolver(McpRuntime())
         self._workspace_models = WorkspaceModelPreparation(
             lookup_model=lambda model_id: Models.get_model_by_id(model_id),
             capability_resolver=self._capabilities,
         )
         self._filters = ChildFilterPipeline()
-        self._debug = debug
 
     @staticmethod
     def agent_registry(metadata: dict) -> dict[str, AgentSpec]:
@@ -1697,6 +1696,7 @@ class ChildRequestBuilder:
         context: InvocationContext,
         history_turns: int,
         history_tool_calls: int,
+        debug: bool,
     ) -> tuple[dict, AgentSpec]:
         agent_id = resolve_agent_id(marker.agent_id, runtime.metadata.get("lite_agents") or {})
         agent = registry.get(agent_id) if agent_id is not None else None
@@ -1768,18 +1768,19 @@ class ChildRequestBuilder:
             lite_view_skill_available=prepared_skills.loader is not None,
             lite_view_skill_model_id=agent.model_id if prepared_skills.loader is not None else None,
         )
-        before_count = len(routed_body["messages"])
         projection = ToolContextProjection.available_tools(routed_body)
         routed_body["messages"] = ToolContextProjection.completed_history(
             projection.messages, history_turns=history_turns,
             history_tool_calls=history_tool_calls,
         )
         SkillPreparation.install_context(prepared_skills, routed_body, runtime_model)
-        self._debug(
-            "child preparation model=%s allowed=%s turns=%s tools=%s messages before=%s after=%s",
-            agent.model_id, sorted(projection.allowed_tool_names), history_turns,
-            history_tool_calls, before_count, len(routed_body["messages"]),
-        )
+        runtime.publish()
+        if debug:
+            log.warning(
+                "[LITE_ROUTER] child preparation model=%s allowed=%s turns=%s tools=%s messages before=%s after=%s",
+                agent.model_id, sorted(projection.allowed_tool_names), history_turns,
+                history_tool_calls, len(child_messages), len(routed_body["messages"]),
+            )
         routed_body = await self._filters.run(
             body=routed_body,
             runtime_model=runtime_model,
@@ -1870,7 +1871,7 @@ class Pipe:
         self.valves = self.Valves()
         self._protocol = HandoffProtocol()
         self._capabilities = ModelCapabilityResolver(McpRuntime())
-        self._child_builder = ChildRequestBuilder(self._debug)
+        self._child_builder = ChildRequestBuilder()
         self._gateway = CompletionGateway()
 
     def _debug(self, message: str, *args) -> None:
@@ -2013,6 +2014,7 @@ class Pipe:
                 context=context,
                 history_turns=self.valves.history_turns,
                 history_tool_calls=self.valves.history_tool_calls,
+                debug=self.valves.debug,
             )
         if self.valves.emit_handoff_status and context.event_emitter:
             try:

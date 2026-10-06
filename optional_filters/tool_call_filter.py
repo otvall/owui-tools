@@ -1,7 +1,7 @@
 """
 title: Tool Call Filter
 description: Keeps unambiguous completed Tool call occurrences permitted for the destination model.
-version: 0.22.0
+version: 0.21.0
 required_open_webui_version: 0.11.1
 """
 
@@ -310,7 +310,7 @@ class RequestRuntime:
 
     @contextmanager
     def child_filters(self) -> Iterator[None]:
-        """Scope destination inlets without changing the Router's inlet evidence."""
+        """Keep destination inlets from changing the Router's preparation evidence."""
         self.sync(lite_subagent_filter_run=True)
         try:
             yield

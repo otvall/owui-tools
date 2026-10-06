@@ -25,3 +25,5 @@ status: accepted
 При обновлении пользователь вручную снимает прежний Subagent Preparation и переносит его настройки. Специальная проверка оставшихся attachments, автоматический пропуск прежнего фильтра и совместимость со старой конфигурацией не входят в новую реализацию. Настройка нового сабагента сразу использует встроенную подготовку Pipe.
 
 Спецификация опубликована в [GitHub Issue #17](https://github.com/otvall/owui-tools/issues/17).
+Автоматическая подготовка реализована в [#18](https://github.com/otvall/owui-tools/issues/18),
+native Skill loading — в [#19](https://github.com/otvall/owui-tools/issues/19).

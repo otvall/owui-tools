@@ -296,7 +296,7 @@ class RequestRuntime:
 
     @contextmanager
     def child_filters(self) -> Iterator[None]:
-        """Scope destination inlets without changing the Router's inlet evidence."""
+        """Keep destination inlets from changing the Router's preparation evidence."""
         self.sync(lite_subagent_filter_run=True)
         try:
             yield

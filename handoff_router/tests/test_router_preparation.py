@@ -27,8 +27,8 @@ class RouterPreparationTests(PipeTestCase):
             "agent-a": "route-a", "agent-b": "route-b",
         }, clear=True))
         self.preparation = preparation_module.Filter()
-        self.preparation.valves.base_tool_ids = []
-        self.preparation.valves.base_skill_ids = []
+        self.preparation.valves.base_tool_ids = registry.valves.base_tool_ids if registry is not None else []
+        self.preparation.valves.base_skill_ids = registry.valves.base_skill_ids if registry is not None else []
         return await self.preparation.inlet(body, __request__=self.request, __user__={"id": "user"})
 
     async def test_only_router_preparation_reaches_orchestrator_with_base_capabilities(self):
@@ -224,11 +224,11 @@ class RouterPreparationTests(PipeTestCase):
         self.request.state.metadata = request_metadata
         self.completion.reset_mock()
         async def fail(body):
-            raise RuntimeError("destination filter failed")
+            raise RuntimeError("additional filter failed")
 
         self.filters = [types.SimpleNamespace(inlet=fail)]
         body["messages"] += [assistant(call("lookup", "lookup")), result("lookup", "unpublished")]
-        with self.assertRaisesRegex(RuntimeError, "destination filter failed"):
+        with self.assertRaisesRegex(RuntimeError, "additional filter failed"):
             await self.invoke_body(body)
         self.completion.assert_not_awaited()
         self.assertIs(self.metadata["tools"], shared)

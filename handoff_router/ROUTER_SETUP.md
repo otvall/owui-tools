@@ -33,9 +33,9 @@ Open WebUI 0.11.1. Пользователь выбирает одну Workspace 
 |---|---|
 | `orchestrator_model_id` | Точный ID подключённой модели, поддерживающей native Tool calls |
 | `emit_handoff_status` | `true` — показывать статус передачи сабагенту |
-| `history_turns` | `0` — прошлые диалоговые туры сабагента отключены |
-| `history_tool_calls` | `0` — прошлые Tool exchanges отключены |
-| `debug` | `false` для обычной работы; включает логи маршрутизации и подготовки |
+| `history_turns` | `0` — число прошлых завершённых пар «вопрос — ответ» для всех сабагентов |
+| `history_tool_calls` | `0` — число прошлых завершённых Tool exchanges внутри сохранённых пар |
+| `debug` | `false` для обычной работы; включает диагностику маршрутизации и подготовки сабагентов |
 
 `orchestrator_model_id` — модель, которая принимает решение о маршрутизации.
 Это отдельный ID реальной модели, а не ID Pipe `lite_handoff_router` и не ID
@@ -74,11 +74,8 @@ Open WebUI 0.11.1. Пользователь выбирает одну Workspace 
 
 - выберите его реальную Base Model;
 - задайте его собственный системный промпт и рабочие Tools, Skills, MCP, Knowledge;
+- Pipe автоматически готовит историю и Skill context перед каждым вызовом;
 - настройте доступ для пользователей Router.
-
-Подготовку сабагента автоматически выполняет Pipe. Прикреплять preparation
-фильтр к сабагенту не требуется. Дополнительные фильтры модели выполняются после
-подготовки, в их штатном порядке.
 
 В [Workspace → Skills](https://docs.openwebui.com/features/workspace/skills/)
 создайте активный routing Skill для каждого сабагента.
@@ -117,7 +114,7 @@ Model ID сабагента**, справа — **Routing Skill ID**. Добав
 Routing Skills Router получает из `SUBAGENTS` автоматически. Рабочие Skills
 сабагента выбираются отдельно в его карточке модели.
 
-## 5. Настройте Router Preparation
+## 5. Настройте Router Preparation и общие лимиты Pipe
 
 Для минимального запуска задайте Valves **Router Preparation**:
 
@@ -150,7 +147,7 @@ Routing Skills Router получает из `SUBAGENTS` автоматическ
 не создаются автоматически; оставлять их в Valves можно только при наличии
 соответствующих активных Skills.
 
-Лимиты истории находятся в Valves **Lite Handoff Router**; начальные значения:
+У **Lite Handoff Router Pipe** общие лимиты истории по умолчанию равны:
 
 ```json
 {
@@ -166,14 +163,17 @@ Routing Skills Router получает из `SUBAGENTS` автоматическ
 
 Если обновляете прежнюю установку, снимите с Router фильтры **Lite Subagent
 Registry**, **Previous Tool Context**, **History Cleanup**, а с сабагентов —
-**Subagent Preparation**, **Tool Call Filter**, **Subagent Context**, **Skill Context**.
-Перенесите прежние `history_turns` и `history_tool_calls` в Valves Pipe. Снимите также
-их Global attachments. Таблица attachments актуального комплекта:
+**Subagent Preparation** либо прежние **Tool Call Filter**, **Subagent Context**,
+**Skill Context**. Снимите также их Global attachments. Перенесите прежние лимиты
+истории в Valves Pipe и выберите его общий `debug`. Дополнительные inlet-фильтры
+получают подготовленную историю и Skills и выполняются после подготовки один раз
+в штатном относительном порядке. Pipe не обрабатывает старые attachments особым
+образом; переход требует их ручного удаления. Таблица актуальных attachments:
 
 | Workspace Model | Preparation-фильтр |
 |---|---|
 | Router | Router Preparation |
-| Каждый сабагент | Подготовка автоматически внутри Pipe |
+| Каждый сабагент | Подготовка внутри Pipe; attachment не требуется |
 
 ## Готовый системный промпт
 

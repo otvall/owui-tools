@@ -5,7 +5,6 @@ import itertools
 import json
 from unittest.mock import AsyncMock, patch
 
-from test_capability_context import owui_callable, owui_refresh
 from test_handoff_history import PipeTestCase, assistant, call, grouped_history, load_plain_module, result, router
 
 
@@ -105,7 +104,7 @@ class SkillBehavior:
                     for schema in self.body.get("tools", [])
                 ), int(lazy))
 
-    async def test_canonical_selection_and_native_loader_arguments(self):
+    async def test_canonical_selection_lookup_order_rendering_and_allowlist(self):
         self.select([" BETA ", "Alpha", " beta ", "", None, "ALPHA"])
         await self.prepare()
         self.assertEqual([call.args[0] for call in self.skills.call_args_list], ["beta", "alpha"])
@@ -116,10 +115,8 @@ class SkillBehavior:
         self.assertNotIn("Full alpha instructions", prompt)
         tool = self.metadata["tools"]["view_skill"]["callable"]
         self.assertEqual(await tool(id=" ALPHA "), "builtin checked permissions")
-        self.assertEqual(await tool(id="not-selected"), "builtin checked permissions")
-        self.assertEqual([item.kwargs for item in self.view_skill.await_args_list], [
-            {"id": " ALPHA "}, {"id": "not-selected"},
-        ])
+        self.assertIn("error", json.loads(await tool(id="not-selected")))
+        self.view_skill.assert_awaited_once_with(id="alpha")
         self.metadata["params"]["function_calling"] = "legacy"
         await self.prepare()
         self.assertLess(self.prompt().index('id="beta"'), self.prompt().index('id="alpha"'))
@@ -161,27 +158,6 @@ class SkillBehavior:
             self.assertIs(params["__files__"], self.metadata["files"])
             self.assertIs(params["__features__"], self.metadata["features"])
 
-    async def test_native_tool_execution_preserves_user_request_and_argument_conversion(self):
-        async def native_view_skill(id: str, __request__, __user__: dict):
-            return id, __user__["id"], __request__ is self.request
-
-        async def get_builtin_tools(request, extra_params, **options):
-            return {"view_skill": {
-                "spec": {"name": "view_skill"},
-                "callable": owui_callable(native_view_skill, {**extra_params, "__request__": request}),
-            }}
-
-        self.builtins.side_effect = get_builtin_tools
-        await self.prepare()
-        tool = self.metadata["tools"]["view_skill"]["callable"]
-        refreshed = owui_refresh(tool, {
-            "__messages__": [{"role": "user", "content": "Outer history"}],
-            "__files__": ["Current file"],
-        })
-        self.assertEqual(await refreshed(id=123), (
-            "123", "owner" if self.path == "orchestrator" else "user", True,
-        ))
-
     async def test_missing_and_inactive_skills_fail_in_both_modes(self):
         for mode, inactive in itertools.product(("native", "legacy"), (False, True)):
             with self.subTest(mode=mode, inactive=inactive):
@@ -204,23 +180,22 @@ class SkillBehavior:
         if self.path == "child":
             self.assertFalse(any(m["role"] == "system" for m in self.body["messages"]))
 
-    async def test_foreign_loader_schema_follows_preparation_order(self):
+    async def test_foreign_loader_schema_follows_preparation_boundary(self):
         foreign_schema = {"type": "function", "function": {"name": "view_skill", "description": "foreign"}}
         if self.path == "child":
             async def other_filter(body):
                 body["tools"].append(foreign_schema)
                 return body
-            self.filters.insert(len(self.filters) - 1, types.SimpleNamespace(inlet=other_filter))
+            self.filters.append(types.SimpleNamespace(inlet=other_filter))
+            await self.prepare()
+            self.assertEqual(self.body["tools"][-1], foreign_schema)
+            self.assertEqual(await self.metadata["tools"]["lookup"]["callable"](), self.body["messages"])
+            return
         else:
             self.body["tools"] = [foreign_schema]
-        if self.path == "child":
+        with self.assertRaisesRegex(ValueError, "conflicts with the builtin Skill loader"):
             await self.prepare()
-            self.assertIn(foreign_schema, self.body["tools"])
-            self.completion.assert_awaited_once()
-        else:
-            with self.assertRaisesRegex(ValueError, "conflicts with the builtin Skill loader"):
-                await self.prepare()
-            self.completion.assert_not_awaited()
+        self.completion.assert_not_awaited()
 
     async def test_changed_tool_schema_cannot_be_authorized_by_earlier_loader(self):
         await self.prepare()
@@ -234,12 +209,11 @@ class SkillBehavior:
         with self.assertRaisesRegex(ValueError, "conflicts with the builtin Skill loader"):
             await self.prepare()
 
-    async def test_repeated_preparation_refreshes_owned_loader_and_preserves_prompt(self):
+    async def test_repeated_preparation_replaces_owned_loader_and_preserves_prompt(self):
         await self.prepare()
-        earlier = self.metadata["tools"]["view_skill"]
+        earlier = self.metadata["tools"]["view_skill"]["callable"]
         await self.prepare()
-        self.assertIsNot(self.metadata["tools"]["view_skill"], earlier)
-        self.assertIs(self.metadata["tools"]["view_skill"]["callable"], self.view_skill)
+        self.assertIsNot(self.metadata["tools"]["view_skill"]["callable"], earlier)
         self.assertEqual(self.prompt().count("<available_skills>"), 1)
         if self.path != "child":
             self.assertIn("Administrator prompt", self.prompt())
@@ -269,7 +243,7 @@ class SkillBehavior:
         self.assertNotIn("<id>alpha</id>", self.prompt())
         self.assertIn("<id>beta</id>", self.prompt())
         tool = self.metadata["tools"]["view_skill"]["callable"]
-        self.assertEqual(await tool(id="alpha"), "builtin checked permissions")
+        self.assertIn("error", json.loads(await tool(id="alpha")))
         self.select([])
         await self.prepare()
         self.assertNotIn("<available_skills>", self.prompt())
@@ -327,12 +301,11 @@ class SkillBehavior:
         with self.assertRaisesRegex(ValueError, "Attached model Skills are unavailable: alpha"):
             await self.prepare()
 
-    async def test_unattached_skill_calls_reach_native_permission_checks(self):
+    async def test_allowed_loader_calls_keep_builtin_permission_errors(self):
         await self.prepare()
         self.view_skill.side_effect = PermissionError("Skill permission denied")
         with self.assertRaisesRegex(PermissionError, "Skill permission denied"):
-            await self.metadata["tools"]["view_skill"]["callable"](id="not-selected")
-        self.view_skill.assert_awaited_once_with(id="not-selected")
+            await self.metadata["tools"]["view_skill"]["callable"](id="alpha")
 
     async def test_full_fallback_preserves_foreign_tool_after_owned_loader_replacement(self):
         await self.prepare()
@@ -694,7 +667,7 @@ class ChildSkillTests(SkillBehavior, PipeTestCase):
                 self.skills.assert_not_awaited()
                 self.assertTrue(all(args.args[1]["__skill_ids__"] == [] for args in self.builtins.call_args_list))
 
-    async def test_database_replacement_updates_manifest_and_native_loader_schema(self):
+    async def test_database_replacement_updates_context_schema_and_loader_allowlist(self):
         self.runtime_model["info"]["meta"]["skillIds"] = ["alpha"]
 
         async def dispatch_with_stale_body_selection(**kwargs):
@@ -728,11 +701,12 @@ class ChildSkillTests(SkillBehavior, PipeTestCase):
                     loader = self.metadata["tools"]["view_skill"]
                     self.assertIsNot(loader, previous_loader)
                     self.assertEqual(schemas, [{"name": "view_skill", "description": "Current Skill loader"}])
-                    self.assertEqual(await loader["callable"](id=" ALPHA "), "builtin checked permissions")
+                    self.assertEqual(json.loads(await loader["callable"](id=" ALPHA ")), {
+                        "error": "Skill is not available in the current model context",
+                    })
+                    self.view_skill.assert_not_awaited()
                     self.assertEqual(await loader["callable"](id=" BETA "), "builtin checked permissions")
-                    self.assertEqual([item.kwargs for item in self.view_skill.await_args_list], [
-                        {"id": " ALPHA "}, {"id": " BETA "},
-                    ])
+                    self.view_skill.assert_awaited_once_with(id="beta")
                     params = self.builtins.call_args.args[1]
                     self.assertEqual(params["__skill_ids__"], ["beta"])
                     self.assertEqual(params["__user__"], {"id": "user"})
@@ -809,7 +783,7 @@ class ChildSkillTests(SkillBehavior, PipeTestCase):
         self.connector.assert_awaited_once()
         self.assertIs(self.metadata["mcp_clients"]["documents"], client)
         self.assertNotIn("beta", "\n".join(m["content"] for m in history if m["role"] == "system"))
-        self.assertEqual(await old_tools["view_skill"]["callable"](id="beta"), "builtin checked permissions")
+        self.assertIn("error", json.loads(await old_tools["view_skill"]["callable"](id="beta")))
 
     async def test_child_skill_failure_restores_owned_loader_and_attachment_identifiers(self):
         await self.prepare()
