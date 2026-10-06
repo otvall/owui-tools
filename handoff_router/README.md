@@ -35,14 +35,17 @@ Pipe отвечает за runtime-маршрутизацию, capabilities, Too
 
 ## Установка обновления
 
-1. Загрузите Router Preparation из `router_preparation.py` и Pipe из
-   `lite_handoff_router.py`.
-   Установите Tool из `lite_delegate.py` или сохраните уже установленный
-   `lite_delegate`.
-2. Прикрепите к публичной Router Workspace Model **Router Preparation** вместо
-   **Lite Subagent Registry, Previous Tool Context и History Cleanup**. Снимите
-   все три прежних attachment-а на Router, включая global attachments.
-3. Перенесите настройки и каталог из прежних Functions в Router Preparation:
+1. До замены кода сохраните каталог `SUBAGENTS` и Valves установленного Router
+   Preparation. Также сохраните `orchestrator_model_id` и остальные Valves Pipe,
+   `history_turns` и `history_tool_calls` прежнего Subagent Preparation
+   (или Subagent Context, если используются отдельные стадии).
+2. Обновите существующие Functions кодом `router_preparation.py` и
+   `lite_handoff_router.py`, восстановите свой каталог и настройки. Установите
+   Tool из `lite_delegate.py` или сохраните уже установленный `lite_delegate`.
+   Router Preparation остаётся на публичной Router Workspace Model с
+   `priority=-100`, своим `debug` и **Global выключенным**.
+3. Если переходите с отдельных Router-фильтров, перенесите их настройки и каталог
+   в Router Preparation:
 
    | Источник | Настройка Router Preparation |
    |---|---|
@@ -55,15 +58,24 @@ Pipe отвечает за runtime-маршрутизацию, capabilities, Too
    Зарегистрируйте агентов в этом каталоге, создайте активные routing Skills и
    выберите Tools, Skills, MCP, Knowledge и inference settings на каждой
    Workspace Model. Сам attachment Router Preparation агентов не регистрирует.
-4. Снимите **Subagent Preparation** либо прежние **Tool Call Filter, Subagent
-   Context и Skill Context** с Workspace Models сабагентов, включая их global
-   attachments. Подготовку выполняет Pipe; новых child attachments не требуется.
-5. Перенесите `history_turns` и `history_tool_calls` из прежнего фильтра в общие
+   Прикрепите Router Preparation вместо **Lite Subagent Registry, Previous Tool
+   Context и History Cleanup**. Снимите прежние attachments на Router, включая
+   global attachments.
+4. Скопируйте сохранённые `history_turns` и `history_tool_calls` в общие
    Valves Pipe. По умолчанию оба значения равны `0`, отрицательные значения
    отклоняются. Все сабагенты этого Pipe получают одинаковые лимиты. Выберите
    общий Pipe `debug` для диагностики маршрутизации и подготовки сабагентов.
-6. В Valves Pipe укажите `orchestrator_model_id`, как и раньше. Router Preparation
-   сохраняет `priority=-100` и свой `debug` для Router inlet.
+5. Вручную снимите **Subagent Preparation** либо прежние **Tool Call Filter,
+   Subagent Context и Skill Context** с Workspace Models сабагентов, включая
+   их global attachments. Подготовку выполняет Pipe; новых child attachments
+   не требуется. Для самостоятельно установленного Skill Context обычных моделей
+   отдельно обновите код из `optional_filters/skill_context.py`.
+
+`subagent_preparation.py` удалён из репозитория и целей генератора. Это не удаляет
+установленную Function из Open WebUI: сначала администратор снимает её
+attachments, а саму Function при желании удаляет отдельно. Pipe не обнаруживает,
+не мигрирует, не пропускает и не удаляет устаревшие attachments автоматически;
+совместимость с ними не предусмотрена.
 
 Router Preparation нужно прикрепить именно к Router Workspace Model.
 Не отмечайте его как global. Подготовка сабагента всегда предшествует его
@@ -537,8 +549,11 @@ binding и refresh: устаревшая внешняя история не за
 eligibility, fallback, canonical attachment IDs, ownership, native loading вне
 manifest, передачу штатных ошибок, сырых аргументов, conversion и identities при
 callable refresh, конфликты и freshness.
-Тесты генератора проверяют read-only freshness check, воспроизводимость,
-сохранение независимого кода и импорт каждого Function без соседних модулей.
+Тесты генератора проверяют read-only freshness check, воспроизводимость и
+восстановление устаревшей копии каждого из восьми генерируемых файлов. Проверка
+независимого импорта охватывает все десять поставляемых артефактов: Pipe,
+Router Preparation, `lite_delegate` и семь самостоятельных фильтров, включая
+неизменённый Tool Call Tombstone Context.
 `test_subagent_preparation.py` запускает Router Preparation и `Pipe.pipe`
 без child attachments: общие лимиты двух моделей,
 Tool/executor isolation, Skills freshness, loader eligibility, callable-visible
@@ -548,5 +563,30 @@ Tool/executor isolation, Skills freshness, loader eligibility, callable-visible
 Проверяются переход оркестратор → Handoff, справочная запись и сохранение
 источника при её отключении, общие лимиты двух моделей, свежий выбор Skills,
 продолжения, сброс нового запроса и восстановление при ошибках.
+Единый сценарий трёх артефактов использует настоящий `lite_delegate`, проходит
+от оркестратора через Handoff и два продолжения Tools к новому запросу. Он
+проверяет общие лимиты, свежие Skills, дополнительный inlet без preparation
+attachment, итоговый callable-visible контекст и native loader после refresh
+с Workspace Model owner у оркестратора и Execution user у сабагента. Сценарий
+проходит с включённой и выключенной справочной записью. Это офлайн-проверка;
+работающий Open WebUI, провайдер и MCP в ней не используются.
 Регрессии повторных Tool Call ID проверяют разрешение каждого вызова,
 однозначность пары и исторические лимиты через `Pipe.pipe` и `Filter.inlet`.
+
+Для [#20](https://github.com/otvall/owui-tools/issues/20) 6 октября 2026 года
+проверен отдельный снимок будущего коммита поверх `cbbff70` с изменениями
+этого тикета. Посторонние незакоммиченные правки исключены из снимка:
+
+- основной Router suite: **372 теста прошли**;
+- deployment suite: **9 тестов прошли**;
+- генератор `--check`: актуальные outputs; регрессии проверили воспроизводимость,
+  read-only check, восстановление восьми generated copies и независимый импорт
+  всех десяти артефактов;
+- Mypy с `--check-untyped-defs`, `--ignore-missing-imports` и
+  `--follow-imports=skip`: без ошибок в генераторе, `lite_delegate.py`,
+  `test_preparation_integration.py` и `test_skill_generation.py`;
+- `git diff --check` и проверка staged diff: без ошибок;
+- code-review по стандартам и спецификации: без замечаний.
+
+Это офлайн-результаты указанного снимка. Live Open WebUI/provider/MCP проверка,
+обновление работающей установки и публикация кода не выполнялись.

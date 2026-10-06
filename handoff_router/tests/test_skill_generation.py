@@ -11,7 +11,7 @@ import unittest
 ROOT = Path(__file__).resolve().parents[1]
 OPTIONAL_FUNCTIONS = {
     "skill_context.py", "lite_subagent_registry.py", "previous_tool_context.py",
-    "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
+    "history_cleanup.py", "tool_call_filter.py", "subagent_context.py", "tool_call_tombstone_context.py",
 }
 FUNCTIONS = (
     "lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py",
@@ -28,7 +28,7 @@ class SkillGenerationTests(unittest.TestCase):
             "shared/skill_preparation.py", "shared/request_runtime.py", "shared/tool_history.py", "shared/tool_context.py",
             "shared/registry_preparation.py", "shared/previous_tool_context.py", "shared/history_cleanup.py",
             "tools/generate_skill_preparation.py",
-            *FUNCTIONS,
+            *FUNCTIONS, "lite_delegate.py", "tool_call_tombstone_context.py",
         ):
             target = self.function_path(name)
             target.parent.mkdir(parents=True, exist_ok=True)
@@ -155,11 +155,12 @@ class SkillGenerationTests(unittest.TestCase):
 
     def test_check_detects_a_stale_deployment_copy_and_generation_repairs_it(self):
         before = self.outputs()
-        for name in ("lite_handoff_router.py", "skill_context.py"):
+        for name in FUNCTIONS:
             with self.subTest(filename=name):
                 path = self.function_path(name)
                 path.write_text(path.read_text().replace(
-                    "Attached model Skills are unavailable: ", "Stale Skill error: ",
+                    "Authoritative local request lifecycle for independently uploaded Functions.",
+                    "Stale request lifecycle.",
                 ))
                 stale = self.outputs()
                 self.assertNotEqual(stale, before)
@@ -193,7 +194,7 @@ class SkillGenerationTests(unittest.TestCase):
                         self.assertEqual(output, before[name])
                 self.assertEqual(self.run_generator("--check").returncode, 0)
 
-    def test_each_generated_function_imports_without_neighbouring_runtime_modules(self):
+    def test_each_supported_artifact_imports_without_neighbouring_runtime_modules(self):
         script = '''
 import importlib.util
 import sys
@@ -228,7 +229,8 @@ getattr(module, sys.argv[2])()
             ("lite_handoff_router.py", "Pipe"), ("skill_context.py", "Filter"), ("lite_subagent_registry.py", "Filter"),
             ("previous_tool_context.py", "Filter"), ("history_cleanup.py", "Filter"),
             ("tool_call_filter.py", "Filter"), ("subagent_context.py", "Filter"),
-            ("router_preparation.py", "Filter"),
+            ("router_preparation.py", "Filter"), ("lite_delegate.py", "Tools"),
+            ("tool_call_tombstone_context.py", "Filter"),
         ):
             with self.subTest(filename=filename), tempfile.TemporaryDirectory() as directory:
                 target = Path(directory) / filename

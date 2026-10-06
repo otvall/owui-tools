@@ -22,7 +22,18 @@ status: accepted
 
 Актуальный обязательный комплект содержит Router Pipe, Router Preparation и `lite_delegate`. Отдельный `subagent_preparation.py` исключается из комплекта и генерации. Самостоятельные фильтры для обычных моделей остаются доступны. Версия с отдельным Subagent Preparation сохранена тегом `subagent-preparation-filter` в GitHub.
 
-При обновлении пользователь вручную снимает прежний Subagent Preparation и переносит его настройки. Специальная проверка оставшихся attachments, автоматический пропуск прежнего фильтра и совместимость со старой конфигурацией не входят в новую реализацию. Настройка нового сабагента сразу использует встроенную подготовку Pipe.
+При обновлении пользователь сохраняет каталог и настройки Router Preparation
+до замены кода, копирует `history_turns` и `history_tool_calls` прежнего
+Subagent Preparation (либо Subagent Context) в общие Valves Pipe и выбирает
+общий Pipe `debug`. Затем вручную снимает Subagent Preparation или заменяемые
+им Tool Call Filter, Subagent Context и Skill Context, включая их global
+attachments. Router Preparation остаётся на публичном Router с прежними
+Valves и Global выключенным. Удаление `subagent_preparation.py` из репозитория
+не удаляет установленную Function; её администратор может удалить отдельно
+после снятия attachments. Специальное обнаружение, миграция, пропуск, удаление
+оставшихся attachments и совместимость со старой конфигурацией не входят в
+новую реализацию. Настройка нового сабагента сразу использует встроенную
+подготовку Pipe.
 
 Спецификация опубликована в [GitHub Issue #17](https://github.com/otvall/owui-tools/issues/17).
 Автоматическая подготовка реализована в [#18](https://github.com/otvall/owui-tools/issues/18),

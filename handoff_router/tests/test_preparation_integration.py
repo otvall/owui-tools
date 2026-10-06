@@ -1,22 +1,142 @@
 """Router Preparation and automatic child preparation through public entrypoints."""
 
+import copy
 import types
+from typing import Any
 from unittest.mock import AsyncMock
 
 import test_router_preparation as router_preparation
 
 from test_capability_context import owui_callable, owui_refresh
-from test_handoff_history import assistant, call, grouped_history, marker, result, router
+from test_handoff_history import assistant, call, grouped_history, load_plain_module, marker, result, router
 from test_previous_turn_context import unpack_record
 
 
 class AutomaticPreparationTests(router_preparation.RouterPreparationTests):
+    metadata: dict[str, Any]
+    loaded_model_ids: list[str | None]
+
+    async def test_three_artifact_journey_combines_history_fresh_skills_filters_and_native_loading(self):
+        delegate = load_plain_module("lite_delegate.py", "installation_delegate_tests").Tools()
+        self.metadata.update(session_id="session", params={"function_calling": "native"})
+        self.preparation.valves.base_tool_ids = ["base-tool"]
+        self.pipe.valves.history_turns = 1
+        self.pipe.valves.history_tool_calls = 1
+        self.models["agent-a"].meta["skillIds"] = ["specialist"]
+        specialist = types.SimpleNamespace(
+            is_active=True, name="Specialist", description="Initial specialist description", content="Instructions",
+        )
+        skill_lookup = self.skills.side_effect
+        self.skills.side_effect = lambda skill_id: specialist if skill_id == "specialist" else skill_lookup(skill_id)
+
+        async def view_skill(id: str, __user__: dict, __request__, __messages__: list, __files__: list):
+            return id, __user__, __request__, copy.deepcopy(__messages__), __files__
+
+        async def get_builtin_tools(request, extra_params, **options):
+            return {"view_skill": {
+                "spec": {"name": "view_skill"},
+                "callable": owui_callable(view_skill, {**extra_params, "__request__": request}),
+            }}
+
+        self.builtins.side_effect = get_builtin_tools
+        expected_results: list[str] = []
+
+        async def additional_filter(body):
+            self.assertIn(specialist.description, body["messages"][0]["content"])
+            self.assertEqual([m["content"] for m in body["messages"] if m["role"] == "tool"], expected_results)
+            body["messages"][0]["content"] += "\nAdditional filter instructions"
+            return body
+
+        # The destination has only an unrelated inlet, with no preparation attachment.
+        self.filters = [types.SimpleNamespace(inlet=additional_filter)]
+
+        async def dispatch(body, model_id):
+            before = self.dispatch_filters.await_count
+            await self.invoke_body(body)
+            self.assertEqual(self.routed["model"], model_id)
+            self.assertEqual(self.dispatch_filters.await_count - before, int(model_id == "agent-a"))
+            self.assertEqual(await self.metadata["tools"]["lookup"]["callable"](), self.routed["messages"])
+            prompt = self.routed["messages"][0]["content"]
+            self.assertNotIn("<id> OUTSIDE </id>", prompt)
+            if model_id == "agent-a":
+                self.assertEqual(prompt.count("Additional filter instructions"), 1)
+            native = owui_refresh(self.metadata["tools"]["view_skill"]["callable"], {
+                "__messages__": [{"role": "user", "content": "Stale outer history"}],
+                "__files__": ["current file"],
+            })
+            loaded = await native(id=" OUTSIDE ")
+            self.assertEqual(loaded[:2], (" OUTSIDE ", {"id": "user" if model_id == "agent-a" else "owner"}))
+            self.assertIs(loaded[2], self.request)
+            self.assertEqual(loaded[3:], (self.routed["messages"], ["current file"]))
+
+        for record_enabled in (True, False):
+            with self.subTest(record_enabled=record_enabled):
+                self.preparation.valves.enabled = record_enabled
+                specialist.description = "Initial specialist description"
+                self.begin_request()
+                conversation = [
+                    {"role": "user", "content": "Previous question"},
+                    assistant(call("previous-handoff", "lite_delegate", agent_id="route-a")),
+                    result("previous-handoff", delegate.lite_delegate("route-a")),
+                    assistant(call("previous-lookup", "lookup")), result("previous-lookup", "Previous result"),
+                    {"role": "assistant", "content": "Previous answer"},
+                    {"role": "user", "content": "Current task"},
+                ]
+                body: dict[str, Any] = {
+                    "model": "router", "metadata": self.metadata, "messages": copy.deepcopy(conversation),
+                }
+                await self.preparation.inlet(body, __request__=self.request, __user__={"id": "user"})
+                await dispatch(body, "base-model")
+                self.assertEqual(unpack_record(self.routed["messages"]) is not None, record_enabled)
+
+                handoff = [
+                    assistant(call("handoff", "lite_delegate", agent_id="route-a")),
+                    result("handoff", delegate.lite_delegate("route-a")),
+                ]
+                conversation.extend(handoff)
+                body["messages"].extend(handoff)
+                expected_results = ["Previous result"]
+                await dispatch(body, "agent-a")
+                lookup = self.metadata["tools"]["lookup"]["callable"]
+                for index in range(2):
+                    specialist.description = f"Fresh specialist description {index}"
+                    continuation = [
+                        assistant(call(f"current-{index}", "lookup")), result(f"current-{index}", f"Result {index}"),
+                    ]
+                    conversation.extend(continuation)
+                    body["messages"].extend(continuation)
+                    expected_results.append(f"Result {index}")
+                    await dispatch(body, "agent-a")
+                    self.assertIs(self.metadata["tools"]["lookup"]["callable"], lookup)
+                    self.assertNotIn("Initial specialist description", self.routed["messages"][0]["content"])
+
+                # A new user request goes through Router Preparation and the orchestrator again.
+                conversation.extend([
+                    {"role": "assistant", "content": "Current answer"},
+                    {"role": "user", "content": "Follow up"},
+                ])
+                self.begin_request()
+                body = {"model": "router", "metadata": self.metadata, "messages": copy.deepcopy(conversation)}
+                await self.preparation.inlet(body, __request__=self.request, __user__={"id": "user"})
+                await dispatch(body, "base-model")
+                self.assertEqual(unpack_record(self.routed["messages"]) is not None, record_enabled)
+                body["messages"].extend([
+                    assistant(call("next-handoff", "lite_delegate", agent_id="route-a")),
+                    result("next-handoff", delegate.lite_delegate("route-a")),
+                ])
+                expected_results = ["Result 1"]
+                await dispatch(body, "agent-a")
+                self.assertEqual([m["content"] for m in self.routed["messages"] if m["role"] == "user"], [
+                    "Current task", "Follow up",
+                ])
+                self.assertIn({"role": "assistant", "content": "Current answer"}, self.routed["messages"])
+                self.assertIsNone(unpack_record(self.routed["messages"]))
 
     async def test_handoff_without_child_attachments_prepares_each_tool_continuation(self):
         self.filters = []
         self.models["agent-a"].meta["skillIds"] = ["specialist"]
         self.begin_request()
-        body = {"model": "router", "metadata": self.metadata, "messages": [
+        body: dict[str, Any] = {"model": "router", "metadata": self.metadata, "messages": [
             {"role": "user", "content": "Find curves"},
             assistant(call("handoff", "lite_delegate", agent_id="route-a")),
             result("handoff", marker("route-a")),
@@ -44,7 +164,7 @@ class AutomaticPreparationTests(router_preparation.RouterPreparationTests):
             "view_skill": {"spec": {"name": "view_skill"}, "callable": AsyncMock(return_value="Loaded")},
         }
         injected = [assistant(call("extra", "filter_tool")), result("extra", "Filter result")]
-        replacement = {"spec": {"name": "view_skill", "description": "Additional loader"},
+        replacement: dict[str, Any] = {"spec": {"name": "view_skill", "description": "Additional loader"},
                        "callable": AsyncMock(return_value="Additional Skill")}
 
         async def first(body):
@@ -90,7 +210,7 @@ class AutomaticPreparationTests(router_preparation.RouterPreparationTests):
 
     async def test_additional_filter_can_add_loader_when_preparation_uses_full_skills(self):
         self.models["agent-a"].meta["skillIds"] = ["specialist"]
-        added = {"spec": {"name": "view_skill"}, "callable": AsyncMock(return_value="Added Skill")}
+        added: dict[str, Any] = {"spec": {"name": "view_skill"}, "callable": AsyncMock(return_value="Added Skill")}
 
         async def add_loader(body):
             self.assertIn("Skill instructions for specialist", body["messages"][0]["content"])
@@ -147,7 +267,7 @@ class AutomaticPreparationTests(router_preparation.RouterPreparationTests):
                     if separate_metadata else self.metadata
                 )
                 self.begin_request(metadata=request_metadata)
-                body = {"model": "router", "metadata": self.metadata, "messages": [
+                body: dict[str, Any] = {"model": "router", "metadata": self.metadata, "messages": [
                     {"role": "user", "content": "Find curves"},
                     assistant(call("handoff", "lite_delegate", agent_id="route-a")),
                     result("handoff", marker("route-a")),
@@ -188,7 +308,7 @@ class AutomaticPreparationTests(router_preparation.RouterPreparationTests):
                         assistant(call("handoff", "lite_delegate", agent_id=target)),
                         result("handoff", marker(target)),
                     ]
-                body = {"model": "router", "metadata": self.metadata, "messages": messages}
+                body: dict[str, Any] = {"model": "router", "metadata": self.metadata, "messages": messages}
                 await self.preparation.inlet(body, __request__=self.request, __user__={"id": "user"})
                 await self.invoke_body(body)
                 expected = target or "base-model"
@@ -248,7 +368,7 @@ class AutomaticPreparationTests(router_preparation.RouterPreparationTests):
         self.preparation.valves.base_tool_ids = ["base-tool"]
         self.metadata["model_id"] = "lite_handoff_router"
         self.begin_request(metadata={"model_id": "lite_handoff_router"})
-        body = {"model": "router", "metadata": self.metadata, "messages": [
+        body: dict[str, Any] = {"model": "router", "metadata": self.metadata, "messages": [
             {"role": "user", "content": "Find curves"},
         ]}
         await self.preparation.inlet(body, __request__=self.request, __user__={"id": "user"})
@@ -272,7 +392,7 @@ class AutomaticPreparationTests(router_preparation.RouterPreparationTests):
         self.loader.side_effect = self.load_nested_model_tool
         self.metadata["model_id"] = "lite_handoff_router"
         self.begin_request(metadata={"model_id": "lite_handoff_router"})
-        body = {"model": "router", "metadata": self.metadata, "messages": [
+        body: dict[str, Any] = {"model": "router", "metadata": self.metadata, "messages": [
             {"role": "user", "content": "Find curves"},
             assistant(call("handoff", "lite_delegate", agent_id="agent-a")),
             result("handoff", marker()),
@@ -341,7 +461,7 @@ class AutomaticPreparationTests(router_preparation.RouterPreparationTests):
             "view_skill": {"spec": {"name": "view_skill"}, "callable": AsyncMock(return_value="Loaded")},
         }
         self.begin_request()
-        body = {"model": "router", "metadata": self.metadata, "messages": [
+        body: dict[str, Any] = {"model": "router", "metadata": self.metadata, "messages": [
             {"role": "user", "content": "Previous question"},
             assistant(call("previous", "lookup")), result("previous", "Previous result"),
             {"role": "assistant", "content": "Previous answer"},

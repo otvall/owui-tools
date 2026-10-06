@@ -74,7 +74,8 @@ Open WebUI 0.11.1. Пользователь выбирает одну Workspace 
 
 - выберите его реальную Base Model;
 - задайте его собственный системный промпт и рабочие Tools, Skills, MCP, Knowledge;
-- Pipe автоматически готовит историю и Skill context перед каждым вызовом;
+- preparation-фильтр прикреплять не требуется: Pipe автоматически готовит
+  историю и Skill context перед каждым вызовом, включая продолжения Tools;
 - настройте доступ для пользователей Router.
 
 В [Workspace → Skills](https://docs.openwebui.com/features/workspace/skills/)
@@ -161,14 +162,34 @@ Routing Skills Router получает из `SUBAGENTS` автоматическ
 диалоговых туров. Увеличьте этот лимит, если ему нужна предыдущая переписка;
 `history_tool_calls` отдельно ограничивает прошлые вызовы Tools в этих турах.
 
+При обновлении до замены кода сохраните каталог `SUBAGENTS` и Valves
+Router Preparation, затем восстановите их в обновлённой Function. Сохраните
+`orchestrator_model_id` и остальные настройки Pipe. Скопируйте существующие
+`history_turns` и `history_tool_calls` из Subagent Preparation (либо прежнего
+Subagent Context) в общие Valves Pipe и выберите общий Pipe `debug`.
+Router Preparation остаётся на публичном Router с `priority=-100`, своим
+`debug` и Global выключенным.
+
 Если обновляете прежнюю установку, снимите с Router фильтры **Lite Subagent
 Registry**, **Previous Tool Context**, **History Cleanup**, а с сабагентов —
 **Subagent Preparation** либо прежние **Tool Call Filter**, **Subagent Context**,
-**Skill Context**. Снимите также их Global attachments. Перенесите прежние лимиты
-истории в Valves Pipe и выберите его общий `debug`. Дополнительные inlet-фильтры
-получают подготовленную историю и Skills и выполняются после подготовки один раз
-в штатном относительном порядке. Pipe не обрабатывает старые attachments особым
-образом; переход требует их ручного удаления. Таблица актуальных attachments:
+**Skill Context**. Снимите также их Global attachments. Удаление файла
+`subagent_preparation.py` из репозитория не удаляет установленную Function:
+attachments снимаются вручную, саму Function администратор может удалить отдельно.
+Автоматическое обнаружение, миграция, пропуск, удаление или совместимость с
+оставшимися устаревшими attachments не предусмотрены.
+
+Подготовка сабагента всегда первая и не имеет priority. Затем Pipe запускает
+дополнительные inlet-фильтры одним штатным dispatch, сохраняя их относительный
+порядок. Их итоговые изменения попадают в запрос и callable-visible Tool context
+без повторной подготовки или финальной проверки `view_skill`.
+
+Во всех трёх путях используется native `view_skill`: у оркестратора с
+Workspace Model owner, у сабагента с Execution user, у самостоятельного
+Skill Context с его прежним пользователем `__user__`. Manifest содержит выбранные
+Skills; ID вне него поступает в штатную проверку активности и доступа Open WebUI.
+Самостоятельно установленный Skill Context обновляется отдельно файлом
+`optional_filters/skill_context.py`. Таблица актуальных attachments:
 
 | Workspace Model | Preparation-фильтр |
 |---|---|
