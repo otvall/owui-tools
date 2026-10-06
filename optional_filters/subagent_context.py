@@ -1,7 +1,7 @@
 """
 title: Subagent Context
 description: Limits completed previous text turns and concrete Tool call occurrences for a model.
-version: 0.21.0
+version: 0.22.0
 required_open_webui_version: 0.11.1
 """
 

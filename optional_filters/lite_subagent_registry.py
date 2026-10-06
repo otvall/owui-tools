@@ -1,7 +1,7 @@
 """
 title: Lite Subagent Registry
 description: Dynamically exposes accessible subagents to Lite Handoff Router.
-version: 0.21.0
+version: 0.22.0
 required_open_webui_version: 0.11.1
 """
 

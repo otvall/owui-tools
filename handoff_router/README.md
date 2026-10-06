@@ -249,13 +249,13 @@ Router и подготовка сабагента: неоднозначные п
 3. Установка Skill context использует уже подготовленные Pipe Skills из свежих
    `skillIds` дочерней модели, прочитанных из базы перед проекцией истории.
    При доступных builtin Tools она устанавливает manifest и добавляет
-   разрешённый только для этих Skills `view_skill`, если
+   штатный `view_skill` Open WebUI, если
    есть session и builtin loader. Иначе полное содержимое Skills добавляется в
    системный промпт. Эти же правила действуют для оркестратора и обычных моделей.
 
 В дочернем pipeline этот выбор — единственный источник прикреплённых Skills,
 включая пустой список. Удаление или замена Skills в базе обновляет контекст,
-собственный loader, его схему и allowlist уже при следующей подготовке в lazy
+собственный loader и его схему уже при следующей подготовке в lazy
 и full режимах. Устаревшие `skillIds` из runtime-кэша Open WebUI, внешнего body,
 настроек Router или прежнего loader не восстанавливают отсоединённые Skills.
 Вне дочернего pipeline источники выбора Skills оркестратора и обычной модели
@@ -266,16 +266,32 @@ Router и подготовка сабагента: неоднозначные п
 исключаются уже при следующей подготовке, включая продолжение текущего запроса.
 При доступном loader завершённые вызовы сохраняются по обычным правилам истории.
 
-Идентификаторы Skills приводятся к lowercase, пробелы по краям и повторы
-удаляются с сохранением порядка. Отсутствующий или неактивный Skill вызывает
-ошибку. На каждом запуске подготовки Skills перечитываются, поэтому изменения
-инструкций и доступности отражаются в следующем запросе. Обычные Tools и MCP
+Идентификаторы прикреплённых Skills приводятся к lowercase, пробелы
+по краям и повторы удаляются с сохранением порядка. Отсутствующий или неактивный
+выбранный Skill вызывает ошибку подготовки. На каждом запуске подготовки Skills
+перечитываются, поэтому изменения инструкций и доступности отражаются в следующем
+запросе. Обычные Tools и MCP
 продолжают использовать request-scoped cache с прежними критериями модели и
 прикреплённых Tool/Skill IDs.
 
 Оркестратор передаёт builtin loader контекст Workspace Model owner. Для
-сабагента и обычной модели используется Execution user. Allowlist ограничивает
-выбор Skills, а штатный builtin сохраняет собственные проверки доступа.
+сабагента используется Execution user; самостоятельный Skill Context сохраняет
+пользователя, переданного Open WebUI в `Filter.inlet` через `__user__`.
+Skill manifest описывает только выбранные Skills и помогает модели выбрать
+инструкции. Он не ограничивает разрешение на загрузку и не перечисляет все
+Skills учётной записи. Вызов `view_skill` с ID вне manifest передаётся штатному
+builtin: Open WebUI проверяет существование, активность и доступ пользователя,
+переданного этому loader. Успешный результат и штатные ошибки отсутствия или
+отказа в доступе возвращаются без дополнительного ограничения проекта.
+Это соответствует [native `view_skill` в Open WebUI 0.11.1](https://github.com/open-webui/open-webui/blob/v0.11.1/backend/open_webui/tools/builtin.py).
+
+Аргументы вызова `view_skill` поступают в native processing без дополнительного
+trimming, lowercase или проверки принадлежности manifest. Нормализация выбранных
+attachments при подготовке остаётся отдельным правилом. Используются штатные
+callable и schema с прежним context binding: сохраняются supplied user/request,
+native argument conversion, Tool history для Router и обновление files при
+native callable refresh.
+
 Module `BuiltinSkillLoader` в `handoff_router/shared/skill_preparation.py` предоставляет
 interface `load(skill_ids)`, используемый как существующий `load_builtin`
 в `SkillPreparation.prepare`. На каждую подготовку создаётся loader с
@@ -287,7 +303,7 @@ Lookup Workspace Model owner выполняется после проверки 
 вызывает переданный `get_builtin_tools` и применяет history adapter для Router.
 Standalone сохраняет сокращённый набор injections без Router history binding.
 Профили child и standalone передают `features` из metadata; orchestrator
-сохраняет вызов без аргумента `features`. Eligibility, allowlist, rendering,
+сохраняет вызов без аргумента `features`. Eligibility, rendering,
 fallback и установка loader остаются в `SkillPreparation`; нового кеша нет.
 Генератор встраивает общий module в Router и самостоятельный Skill Context,
 поэтому готовые Functions по-прежнему загружаются независимо.
@@ -470,6 +486,12 @@ IDs, с прежней политикой кеша и совместимость
 обновите Pipe, Router Preparation и используемые самостоятельные фильтры;
 перенесите лимиты истории в Pipe и вручную снимите прежние child attachments,
 как описано в разделе установки. `lite_delegate` сохраняется.
+В **0.22.0** снято дополнительное ограничение загрузки Skills по manifest во
+всех путях Router; отдельный Subagent Preparation больше не устанавливается.
+Если самостоятельно установлен Skill Context для обычных моделей, отдельно
+обновите Function из `optional_filters/skill_context.py` до **0.22.0**:
+обновление Router не заменяет её встроенную копию общего кода. Выбор manifest,
+lazy/full eligibility и пользователи loader сохраняются.
 
 В `optional_filters/lite_subagent_registry.py` и `router_preparation.py`
 генератор встраивает только функцию
@@ -512,7 +534,9 @@ Skills и фильтров, публикацию до status, rollback и native
 binding и refresh: устаревшая внешняя история не заменяет подготовленный контекст,
 а `__files__` продолжает обновляться для синхронных и асинхронных Tools.
 Одна матрица Skill-политики проверяет `Pipe.pipe` и `Filter.inlet`: lazy/full
-eligibility, fallback, canonical IDs, ownership, allowlist, конфликты и freshness.
+eligibility, fallback, canonical attachment IDs, ownership, native loading вне
+manifest, передачу штатных ошибок, сырых аргументов, conversion и identities при
+callable refresh, конфликты и freshness.
 Тесты генератора проверяют read-only freshness check, воспроизводимость,
 сохранение независимого кода и импорт каждого Function без соседних модулей.
 `test_subagent_preparation.py` запускает Router Preparation и `Pipe.pipe`

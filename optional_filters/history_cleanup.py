@@ -1,7 +1,7 @@
 """
 title: History Cleanup
 description: Keeps conversation text and removes historical native Tool messages from model context.
-version: 0.21.0
+version: 0.22.0
 required_open_webui_version: 0.11.1
 """
 

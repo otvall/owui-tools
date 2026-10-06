@@ -1,7 +1,7 @@
 """
 title: Previous Tool Context
 description: Adds the previous request's completed Tool calls to any model context as reference data.
-version: 0.21.0
+version: 0.22.0
 required_open_webui_version: 0.11.1
 """
 

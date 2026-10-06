@@ -1,7 +1,7 @@
 """
 title: Skill Context
-description: Builds Skill context and adds the allowlisted view_skill builtin when available.
-version: 0.21.0
+description: Builds selected Skill context and adds native view_skill with Open WebUI access checks when available.
+version: 0.22.0
 required_open_webui_version: 0.11.1
 """
 

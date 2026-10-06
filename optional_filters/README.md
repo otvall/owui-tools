@@ -14,13 +14,27 @@
 | [history_cleanup.py](history_cleanup.py) | Очистка прошлых нативных Tool Calls |
 | [tool_call_filter.py](tool_call_filter.py) | Проекция истории на доступные модели Tools |
 | [subagent_context.py](subagent_context.py) | Лимиты прошлых текстовых ходов и Tool exchanges |
-| [skill_context.py](skill_context.py) | Skill context и builtin `view_skill` для прикреплённых Skills |
+| [skill_context.py](skill_context.py) | Контекст выбранных Skills и native `view_skill` с проверками доступа Open WebUI |
 | [tool_call_tombstone_context.py](tool_call_tombstone_context.py) | Обрезка истории с сохранением минимальных пар использованных Tool Call ID |
 
 Skill Context можно прикреплять к обычным моделям без Router Pipe.
 Tool Call Filter, Subagent Context и Skill Context сохраняют свои самостоятельные
 Valves. В актуальном Router их обязанности выполняет Pipe автоматически перед
 каждым вызовом сабагента; прикреплять их к сабагентам не требуется.
+
+Skill Context показывает в manifest только выбранные Skills. Manifest служит
+подсказкой для модели; ID вне списка тоже поступает в native `view_skill`,
+который проверяет существование, активность и права пользователя из `__user__`
+самостоятельного `Filter.inlet`. Результат и ошибки builtin передаются без
+дополнительной проверки принадлежности manifest или нормализации аргумента `id`.
+Нормализация attachment IDs, fresh context и условия manifest/full instructions
+сохраняются. В Router оркестратор по-прежнему использует Workspace Model owner,
+а сабагент — Execution user.
+
+Чтобы получить это поведение при обновлении до **0.22.0**, загрузите актуальный
+`skill_context.py` в самостоятельно установленную Function Skill Context.
+Обновление Router не обновляет её автоматически: каждый файл содержит свою
+встроенную копию общего кода и остаётся независимо устанавливаемым.
 
 ## Прежний адаптер Registry
 
