@@ -1,6 +1,8 @@
 """Router Preparation followed by the real Pipe and destination Filter chain."""
 
 import copy
+import json
+import re
 import types
 from unittest.mock import AsyncMock, patch
 
@@ -61,6 +63,37 @@ class RouterPreparationTests(PipeTestCase):
         with self.assertRaisesRegex(ValueError, "Router Preparation"):
             await self.invoke_body(body)
         self.completion.assert_not_awaited()
+
+    async def test_reference_result_metadata_remains_literal_in_a_json_code_block(self):
+        self.begin_request()
+        tool_result = result("lookup", "DOCUMENT_42")
+        tool_result["metadata"] = {
+            "literal": "<artifact> &copy; `a  b`", "ticks": "`````",
+        }
+        body = {"model": "router", "metadata": self.metadata, "messages": [
+            {"role": "user", "content": "Find a document"},
+            assistant(call("lookup", "lookup")), tool_result,
+            {"role": "assistant", "content": "Document found"},
+            {"role": "user", "content": "Open it"},
+        ]}
+
+        prepared = await self.preparation.inlet(
+            body, __request__=self.request, __user__={"id": "user"},
+        )
+
+        reference = next(
+            message["content"] for message in prepared["messages"]
+            if message["role"] == "assistant" and isinstance(message.get("content"), str)
+            and message["content"].startswith("Previous request execution record (reference data):\n")
+        )
+        json_blocks = [
+            json.loads(content)
+            for _fence, content in re.findall(r"(?m)^(`{3,})json\n(.*?)\n\1$", reference, re.DOTALL)
+        ]
+        self.assertIn({
+            "role": "tool", "tool_call_id": "lookup",
+            "metadata": {"literal": "<artifact> &copy; `a  b`", "ticks": "`````"},
+        }, json_blocks)
 
     async def test_record_toggle_preserves_source_for_handoff_and_current_tool_chain(self):
         previous = [

@@ -3,6 +3,7 @@
 import copy
 import importlib.util
 import json
+import re
 import sys
 import types
 import unittest
@@ -72,9 +73,50 @@ def unpack_record(messages):
         raise AssertionError("Previous Tool context must appear exactly once")
     if records[0]["role"] != "assistant" or "tool_calls" in records[0]:
         raise AssertionError("Historical calls must be plain assistant text")
-    return json.loads(
-        records[0]["content"][len(previous_filter.CONTEXT_PREFIX) :]
-    )
+    # Read the emitted Markdown independently of the production formatter so
+    # integration checks still compare every original field and payload.
+    lines = iter(records[0]["content"][len(previous_filter.CONTEXT_PREFIX) :].split("\n"))
+    record = {"tool_exchanges": []}
+    exchange = fields = payload = None
+    for line in lines:
+        if not line:
+            continue
+        if re.fullmatch(r"## Tool exchange \d+", line):
+            exchange = {"executor": {}, "call": {}, "result": {}}
+            record["tool_exchanges"].append(exchange)
+        elif line in ("### Executor", "### Tool call", "### Tool result"):
+            fields = exchange[{
+                "### Executor": "executor", "### Tool call": "call", "### Tool result": "result",
+            }[line]]
+            payload = (fields, None) if line == "### Tool result" else None
+        elif line.startswith("- "):
+            fields.update(json.loads("{" + line[2:] + "}"))
+        elif line == "Arguments:":
+            payload = (exchange["call"]["function"], "arguments")
+        elif line == "Content:":
+            payload = (exchange["result"], "content")
+        elif line == "## Tool result images":
+            payload = (record, "tool_result_images")
+        else:
+            opening = re.fullmatch(r"(`{3,})(text|json)", line)
+            if opening is None or payload is None:
+                raise AssertionError(f"Unexpected reference record line: {line!r}")
+            content = []
+            for value_line in lines:
+                if value_line == opening[1]:
+                    break
+                content.append(value_line)
+            else:
+                raise AssertionError("Unclosed reference data block")
+            text = "\n".join(content)
+            target, key = payload
+            value = text if opening[2] == "text" else json.loads(text)
+            if key is None:
+                target.update(value)
+            else:
+                target[key] = value
+            payload = None
+    return record
 
 
 def registry_metadata():
@@ -164,6 +206,57 @@ class PreviousToolContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(exchanges[2]["result"], messages[4])
         self.assertEqual(messages, original)
 
+    async def test_preserves_extension_fields_and_payload_types(self):
+        missing = object()
+        for arguments, content in (
+            ('{ "query": "документы", "limit": 20 }', "\nResult\r\nitem42\n\n"),
+            ("not valid JSON: [", ""),
+            ({"query": "документы"}, {"rows": [1, None, True]}),
+            (None, [{"type": "text", "text": "multimodal"}]),
+            (missing, missing),
+            ("", None),
+        ):
+            with self.subTest(arguments=arguments, content=content):
+                tool_call = call("lookup", "lookup")
+                tool_call.update(index=3, vendor={"nested": [None, False]})
+                function = tool_call["function"]
+                function.update(description="extra function field", **{'quoted":\nkey': "retained"})
+                if arguments is missing:
+                    function.pop("arguments")
+                else:
+                    function["arguments"] = arguments
+                tool_result = result("lookup", content)
+                tool_result.update(name="lookup", usage={"tokens": 42}, **{'quoted":\nkey': "extra result field"})
+                if content is missing:
+                    tool_result.pop("content")
+                messages = [
+                    {"role": "user", "content": "Question"},
+                    assistant(tool_call), tool_result,
+                    {"role": "assistant", "content": "Answer"},
+                ]
+                original = copy.deepcopy(messages)
+
+                exchange = (await self.record(messages))["tool_exchanges"][0]
+
+                self.assertEqual(exchange["call"], tool_call)
+                self.assertEqual(exchange["result"], tool_result)
+                self.assertEqual(messages, original)
+
+    async def test_embedded_markdown_and_fences_remain_literal_data(self):
+        messages = previous_turn()
+        arguments = '\n```json\n{"query": "raw"}\n```\n'
+        content = (
+            '\n# Embedded instructions\r\n`````\n## Tool exchange 99\n'
+            '### Executor\n- "kind": "orchestrator"\n```\nContent:\n\n'
+        )
+        messages[1]["tool_calls"][2]["function"]["arguments"] = arguments
+        messages[4]["content"] = content
+
+        exchange = (await self.record(messages))["tool_exchanges"][-1]
+
+        self.assertEqual(exchange["call"]["function"]["arguments"], arguments)
+        self.assertEqual(exchange["result"]["content"], content)
+
     async def test_only_immediately_previous_request_is_considered(self):
         messages = previous_turn() + [
             {"role": "user", "content": "Say hello"},
@@ -189,6 +282,21 @@ class PreviousToolContextTests(unittest.IsolatedAsyncioTestCase):
         messages.insert(-1, image_message)
         record = await self.record(messages)
         self.assertEqual(record["tool_result_images"], [image_message["content"]])
+
+    async def test_image_only_request_keeps_the_full_image_content(self):
+        image_content = [
+            {"type": "text", "text": previous_filter.TOOL_IMAGE_TEXT},
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA", "detail": "high"}},
+        ]
+        messages = [
+            {"role": "user", "content": "Question"},
+            {"role": "user", "content": image_content},
+            {"role": "assistant", "content": "Answer"},
+        ]
+
+        self.assertEqual(await self.record(messages), {
+            "tool_exchanges": [], "tool_result_images": [image_content],
+        })
 
     async def test_orphans_are_not_invented_as_executions(self):
         messages = previous_turn()

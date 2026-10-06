@@ -2,6 +2,7 @@
 
 import copy
 import json
+import re
 
 from handoff_router.shared.request_runtime import RequestRuntime
 from handoff_router.shared.tool_history import ToolHistory, analyze_history
@@ -16,7 +17,7 @@ RAW_MESSAGES_KEY = "lite_unfiltered_messages"
 is_tool_image_message = RequestRuntime.is_tool_image_message
 
 
-def context_message(messages: list[dict], history: ToolHistory) -> dict | None:
+def previous_tool_record(messages: list[dict], history: ToolHistory) -> dict | None:
     if len(history.user_indices) < 2:
         return None
     previous_user, user_index = history.user_indices[-2:]
@@ -46,10 +47,49 @@ def context_message(messages: list[dict], history: ToolHistory) -> dict | None:
     record = {"tool_exchanges": exchanges}
     if tool_images:
         record["tool_result_images"] = tool_images
-    return {
-        "role": "assistant",
-        "content": CONTEXT_PREFIX + json.dumps(record, ensure_ascii=False, indent=2),
-    }
+    return record
+
+
+def _reference_fields(fields: dict) -> str:
+    return "\n".join(
+        "- " + json.dumps(key, ensure_ascii=False) + ": "
+        + json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+        for key, value in fields.items()
+    )
+
+
+def _reference_block(value) -> str:
+    """Keep strings verbatim and fence off any Markdown contained in them."""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+    language = "text" if isinstance(value, str) else "json"
+    longest_run = max((len(run) for run in re.findall(r"`+", text)), default=0)
+    fence = "`" * max(3, longest_run + 1)
+    return f"{fence}{language}\n{text}\n{fence}"
+
+
+def format_tool_record(record: dict) -> str:
+    """Render the full record as Markdown without a JSON envelope."""
+    sections = []
+    for index, exchange in enumerate(record["tool_exchanges"], 1):
+        call_fields = dict(exchange["call"])
+        function = call_fields.get("function")
+        if isinstance(function, dict):
+            call_fields["function"] = {key: value for key, value in function.items() if key != "arguments"}
+        result_fields = {key: value for key, value in exchange["result"].items() if key != "content"}
+        parts = [
+            f"## Tool exchange {index}",
+            "### Executor\n" + _reference_fields(exchange["executor"]),
+            "### Tool call\n" + _reference_fields(call_fields),
+        ]
+        if isinstance(function, dict) and "arguments" in function:
+            parts.append("Arguments:\n" + _reference_block(function["arguments"]))
+        parts.append("### Tool result\n" + _reference_block(result_fields))
+        if "content" in exchange["result"]:
+            parts.append("Content:\n" + _reference_block(exchange["result"]["content"]))
+        sections.append("\n\n".join(parts))
+    if "tool_result_images" in record:
+        sections.append("## Tool result images\n\n" + _reference_block(record["tool_result_images"]))
+    return "\n\n".join(sections) + "\n"
 
 
 def prepare_previous_tool_context(body: dict, __request__=None, *, enabled: bool, debug) -> dict:
@@ -85,9 +125,14 @@ def prepare_previous_tool_context(body: dict, __request__=None, *, enabled: bool
     registry = registry if isinstance(registry, dict) else {}
     history = analyze_history(messages, registry=registry if is_router_request else None)
     current_user = history.current_user_index
-    context = (
-        context_message(messages, history)
+    record = (
+        previous_tool_record(messages, history)
         if enabled
+        else None
+    )
+    context = (
+        {"role": "assistant", "content": CONTEXT_PREFIX + format_tool_record(record)}
+        if record is not None
         else None
     )
     if context is not None:
@@ -115,6 +160,6 @@ def prepare_previous_tool_context(body: dict, __request__=None, *, enabled: bool
     RequestRuntime(__request__, metadata).finish_filter("previous_tool_context")
     debug(
         "previous Tool exchanges=%s",
-        len((json.loads(context["content"][len(CONTEXT_PREFIX):]) if context else {}).get("tool_exchanges", [])),
+        len(record["tool_exchanges"]) if record is not None else 0,
     )
     return body
