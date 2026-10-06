@@ -37,6 +37,11 @@ def fail(code: str, message: str) -> NoReturn:
     raise WidgetError(code, message)
 
 
+def storage_unavailable() -> dict[str, str]:
+    return {"status": "error", "code": "STORAGE_UNAVAILABLE",
+            "message": "Saved HTML could not be read from Open WebUI storage. Retry after checking the server."}
+
+
 async def accessible_saved_chat(chat_id: str, user: Any) -> Any:
     """Read-only counterpart of v0.11.1 Chats.get_chat_by_id_for_user.
 
@@ -173,8 +178,9 @@ def saved_widgets(chat_id: str, branch: list[dict]) -> list[dict]:
                 if not isinstance(html, str) or not html:
                     continue
                 if re.match(
-                    r"^(?:[a-z][a-z0-9+.-]*://|//|(?:data|mailto|javascript|blob|tel|file|about|urn):)"
-                    r"|^[a-z][a-z0-9+.-]*:[^\s<>]*$", html.strip(), re.IGNORECASE,
+                    r"^(?:data|javascript):"
+                    r"|^(?:[a-z][a-z0-9+.-]*://|//|[a-z][a-z0-9+.-]*:)[^\s<>]*$",
+                    html.strip(), re.IGNORECASE,
                 ):
                     continue
                 location = [chat_id, message["id"], source_kind, source_index, embed_index, html]
@@ -237,8 +243,7 @@ class Tools:
             return exc.result
         except Exception:
             log.exception("Saved HTML discovery failed")
-            return {"status": "error", "code": "STORAGE_UNAVAILABLE",
-                    "message": "Saved HTML could not be read from Open WebUI storage. Retry after checking the server."}
+            return storage_unavailable()
 
     async def read_saved_html_widget(self, widget_id: str, __metadata__: dict | None = None,
                                      __user__: dict | None = None, __messages__: list | None = None) -> dict:
@@ -259,5 +264,4 @@ class Tools:
             return exc.result
         except Exception:
             log.exception("Saved HTML reading failed")
-            return {"status": "error", "code": "STORAGE_UNAVAILABLE",
-                    "message": "Saved HTML could not be read from Open WebUI storage. Retry after checking the server."}
+            return storage_unavailable()

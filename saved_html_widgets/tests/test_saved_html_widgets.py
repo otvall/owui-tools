@@ -324,6 +324,17 @@ class SavedHtmlWidgetTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(listing["widgets"]), 1)
             self.assertEqual((await self.reading(listing["widgets"][0]["widget_id"]))["html"], original_html)
 
+    async def test_url_prefix_followed_by_markup_remains_readable_as_saved_html(self):
+        htmls = [
+            "https://example.org <b>Sales 42</b>",
+            "Sales link https://example.org <b>Sales 42</b>",
+        ]
+        self.messages["chart"]["embeds"] = ["https://example.org", htmls[0]]
+        self.messages["chart"]["output"][1]["embeds"] = ["https://example.org", *htmls]
+        listing = await self.listing()
+        self.assertEqual(len(listing["widgets"]), 3)
+        self.assertEqual([(await self.reading(widget["widget_id"]))["html"] for widget in listing["widgets"]], [htmls[0], *htmls])
+
     async def test_url_only_embeds_are_not_downloadable_widgets(self):
         self.messages["chart"]["output"][1]["embeds"] = [
             "https://example.com/chart?x=42", "//example.com/chart", "ftp://example.com/chart.html",
