@@ -1,9 +1,9 @@
 # Lite Handoff Router для Open WebUI v0.11.1
 
-Версия комплекта: **0.21.1**.
+Версия комплекта: **0.22.0**.
 
-Актуальный комплект состоит из **одного Pipe, двух фильтров и одного Tool**.
-Все четыре готовых Function-файла находятся в корне `handoff_router/`.
+Актуальный комплект состоит из **одного Pipe, одного фильтра и одного Tool**.
+Все три готовых файла находятся в корне `handoff_router/`.
 Подкаталоги нужны для разработки:
 
 - `shared/` — общие исходники, встроенные генератором в готовые Functions.
@@ -12,22 +12,20 @@
 
 Имена файлов в инструкции ниже указаны относительно `handoff_router/`.
 
-Pipe отвечает за runtime-маршрутизацию и capabilities выбранной модели. Перед
-каждым вызовом сабагента он вручную запускает inlet pipeline Workspace Model
-адресата с одним фильтром Subagent Preparation.
+Pipe выбирает модель и готовит контекст сабагента перед каждым её вызовом.
+Подготовка выполняется автоматически; затем одним штатным вызовом Open WebUI
+запускаются дополнительные inlet-фильтры Workspace Model адресата.
 
 ## Компоненты
 
-| Файл | Тип Function | Назначение |
+| Файл | Тип | Назначение |
 |---|---|---|
-| [lite_handoff_router.py](lite_handoff_router.py) | Pipe | Выбирает модель, запускает её фильтры и ведёт текущий Handoff |
+| [lite_handoff_router.py](lite_handoff_router.py) | Pipe | Выбирает модель, готовит её Tool history и Skills, запускает дополнительные фильтры и ведёт Handoff |
 | [router_preparation.py](router_preparation.py) | Filter | Готовит реестр, исходную Tool history, справочную запись и очистку Router |
-| [subagent_preparation.py](subagent_preparation.py) | Filter | Подготавливает Tool history, общие лимиты истории и Skill context всех сабагентов |
 | [lite_delegate.py](lite_delegate.py) | Tool | Возвращает маркер выбора сабагента |
 
 Все файлы самостоятельны: при установке в Open WebUI они не импортируют друг
-друга как Python-модули. Фильтры обмениваются только request-scoped значениями
-в `metadata`.
+друга как Python-модули. Подготовка использует request-scoped значения в `metadata`.
 
 Для первой установки используйте [настройку Router-модели и готовый системный
 промпт](ROUTER_SETUP.md). Текст для вставки в System Prompt вынесен в
@@ -35,63 +33,41 @@ Pipe отвечает за runtime-маршрутизацию и capabilities в
 
 ## Установка обновления
 
-1. Загрузите Router Preparation из `router_preparation.py`, Subagent Preparation
-   из `subagent_preparation.py` и Pipe из `lite_handoff_router.py`.
-   Установите Tool из `lite_delegate.py` или сохраните уже установленный
-   `lite_delegate`.
-2. Прикрепите к публичной Router Workspace Model **Router Preparation** вместо
-   **Lite Subagent Registry, Previous Tool Context и History Cleanup**. Снимите
-   все три прежних attachment-а на Router, включая global attachments.
-3. Перенесите настройки и каталог из прежних Functions в Router Preparation:
+1. Обновите Pipe из `lite_handoff_router.py` и Router Preparation из
+   `router_preparation.py`. При обновлении Router Preparation сохраните свой
+   каталог `SUBAGENTS` и перенесите его в обновлённый код. Установленный Tool
+   `lite_delegate` менять не требуется.
+2. Перенесите `history_turns` и `history_tool_calls` из Subagent Preparation
+   в Valves **Lite Handoff Router**. Оба значения по умолчанию равны `0`;
+   лимиты общие для всех сабагентов этого Pipe. Общий `debug` Pipe включает
+   диагностику маршрутизации и подготовки. `orchestrator_model_id` сохраняется.
+3. Вручную снимите **Subagent Preparation** с каждой модели сабагента.
+   При переходе с более ранней конфигурации снимите также **Tool Call Filter,
+   Subagent Context и Skill Context**, включая их global attachments.
+   Специальная обработка оставшихся старых attachments не предусмотрена.
+4. На публичной Router Workspace Model оставьте **Router Preparation** с
+   `priority=-100` и выключенным Global. При переходе с отдельных Router-фильтров
+   замените **Lite Subagent Registry, Previous Tool Context и History Cleanup**
+   этим фильтром и перенесите `base_tool_ids`, `base_skill_ids`, `enabled` и
+   каталог агентов. Tools, Skills, MCP, Knowledge и inference settings
+   сабагентов по-прежнему выбираются на их Workspace Models.
 
-   | Источник | Настройка Router Preparation |
-   |---|---|
-   | Registry `base_tool_ids` | `base_tool_ids` (по умолчанию `["lite_delegate"]`) |
-   | Registry `base_skill_ids` | `base_skill_ids` (по умолчанию `orchestrator-capability-guide`, `describe-available-agents`) |
-   | Previous Tool Context `enabled` | `enabled` (по умолчанию `True`) |
-   | Каталог `SUBAGENTS` в коде Registry | `SUBAGENTS` в коде Router Preparation |
+Новый сабагент требует Workspace Model и записи в `SUBAGENTS`, без обязательного
+preparation attachment. Подготовка всегда первая; дополнительные фильтры
+выполняются после неё в штатном порядке Open WebUI. У подготовки собственного
+`priority` нет. Повторная подготовка и дополнительная финальная проверка
+`view_skill` после сторонних фильтров не выполняются.
 
-   `SUBAGENTS` по-прежнему сопоставляет Workspace Model ID и Routing Skill ID.
-   Зарегистрируйте агентов в этом каталоге, создайте активные routing Skills и
-   выберите Tools, Skills, MCP, Knowledge и inference settings на каждой
-   Workspace Model. Сам attachment Router Preparation агентов не регистрирует.
-4. Прикрепите один экземпляр **Subagent Preparation** к каждой Workspace Model
-   сабагента вместо **Tool Call Filter, Subagent Context и Skill Context**.
-   Снимите три прежних attachment-а у адресатов и их global attachments.
-   Настройки `history_turns` и `history_tool_calls` из Subagent Context перенесите
-   в общие Valves Subagent Preparation; по умолчанию оба значения равны `0`.
-   Все модели с одним экземпляром Function получают одинаковые лимиты.
-5. Оставьте значения `priority`, указанные по умолчанию:
-
-   | Filter | Priority |
-   |---|---:|
-   | Router Preparation | `-100` |
-   | Subagent Preparation | `-30` |
-
-6. В Valves Lite Handoff Router укажите `orchestrator_model_id`, как и раньше.
-
-Router Preparation нужно прикрепить именно к Router Workspace Model.
-Subagent Preparation должен быть прикреплён к каждой модели адресата: внутренний вызов из
-Pipe не запускает обычный inlet pipeline, поэтому Router получает их через
-`get_filter_functions()` и последовательно вызывает `process_filter_functions()`.
-Не отмечайте эти два фильтра как global: иначе Router- и subagent-цепочки
-смешаются до того, как Pipe выберет модель адресата.
-
-Обязательная Router inlet-цепочка: **Router Preparation → Pipe**. Внутри Function
+Обязательная Router inlet-цепочка: **Router Preparation → Pipe**. Внутри фильтра
 фиксирован порядок **Registry → Previous Tool Context → History Cleanup**.
-Отдельных priorities внутренних стадий нет; `priority` определяет положение
-всей Function относительно дополнительных фильтров, а `debug` включает её общий
-лог. Pipe проверяет полное свидетельство подготовки текущего запроса перед
-отправкой оркестратору или сабагенту. Ошибка неполной либо устаревшей подготовки
-предлагает прикрепить Router Preparation; начните новый запрос после исправления.
-
-Оба фильтра доступны в этой версии. Обязательный набор содержит Router Preparation,
-Subagent Preparation, Pipe и delegate Tool. Предварительная проверка смешанных
-новых и прежних attachments и полный migration deliverable остаются отдельной
-задачей: здесь замените соответствующие attachments вручную по указанным ролям.
+Pipe проверяет полное свидетельство подготовки текущего запроса перед отправкой
+оркестратору или сабагенту. После исправления неполной либо устаревшей Router
+подготовки начните новый запрос.
 
 Самостоятельные фильтры для обычных моделей и прежние адаптеры находятся
 в [отдельном каталоге `optional_filters/`](../optional_filters/README.md).
+Версия с отдельным Subagent Preparation сохранена тегом
+[`subagent-preparation-filter`](https://github.com/otvall/owui-tools/tree/subagent-preparation-filter).
 
 ## Поток запроса
 
@@ -127,7 +103,8 @@ Subagent Preparation, Pipe и delegate Tool. Предварительная пр
 
 Подготовку дочернего запроса целиком ведёт `ChildRequestBuilder` внутри файла
 Router: он получает типизированные данные маршрутизации, вызывает подготовку
-Workspace Model и запускает фильтры адресата.
+Workspace Model, формирует Tool history и Skill context, затем запускает
+дополнительные фильтры адресата.
 Pipe получает готовый запрос и выбранного агента, отправляет status и вызывает
 completion adapter.
 
@@ -168,8 +145,8 @@ Router не добавляет сабагенту поведенческий с�
 builtin Tools. Для Web Search, Image Generation, Code Interpreter и
 Memory дополнительно учитываются features текущего запроса, глобальные настройки
 сервера, native function calling и права пользователя. Прикреплённые Knowledge
-передаются builtin Tools и описываются в системном контексте. Skills обрабатывает
-Subagent Preparation. Встроенные
+передаются builtin Tools и описываются в системном контексте. Skills готовит
+Pipe перед дополнительными фильтрами. Встроенные
 `delegate_task` и `timer`
 исключаются, чтобы сабагент не запускал параллельную систему вложенной
 оркестрации поверх Lite Handoff Router.
@@ -195,7 +172,7 @@ Tool Context). В Router-цепочке даже в этом режиме ста
 - изображения результатов, которые Open WebUI вынес в служебное user-сообщение.
 
 Запись использует те же правила сопоставления конкретных Tool exchanges, что
-Router и фильтры сабагента: неоднозначные пары и противоречивые результаты
+Router и подготовка сабагента: неоднозначные пары и противоречивые результаты
 исключаются, идентичные повторы результата сохраняются один раз. Завершённые
 пары с неизвестным Tool executor остаются в справочной записи, хотя нативная
 история выбранного сабагента их исключает.
@@ -213,12 +190,12 @@ Router и фильтры сабагента: неоднозначные пары
 Если непосредственно предыдущий запрос не вызывал инструменты, дополнительный
 блок не создаётся. Результаты более старого запроса вместо него не подставляются.
 
-## Фильтры сабагента
+## Подготовка сабагента
 
 Сабагент не получает строковый блок оркестратора. Перед его вызовом Router готовит
-свежие capabilities, Skills и доступность loader, затем запускает прикреплённый
-Subagent Preparation. Один Function выполняет следующие этапы в фиксированном
-порядке:
+свежие capabilities, Skills и доступность loader. `ChildRequestBuilder` внутри
+Pipe выполняет следующие этапы в фиксированном порядке, перед дополнительными
+inlet-фильтрами:
 
 1. Проекция Tool context удаляет вызовы и ответы инструментов, которых нет среди
    реальных Tools, MCP и builtin Tools модели адресата. Разрешение проверяется
@@ -251,17 +228,18 @@ Subagent Preparation. Один Function выполняет следующие э
    сохраняется независимо от исторических лимитов, в том числе на продолжениях.
    Служебные user-сообщения с изображениями Tools не начинают новый запрос.
 3. Установка Skill context использует уже подготовленные Router Skills из свежих
-   `skillIds` дочерней модели, прочитанных из базы перед запуском фильтра.
-   При доступных builtin Tools она устанавливает manifest и добавляет
-   разрешённый только для этих Skills `view_skill`, если
-   есть session и builtin loader. Иначе полное содержимое Skills добавляется в
+   `skillIds` дочерней модели, прочитанных из базы перед подготовкой.
+   При доступных builtin Tools она устанавливает manifest и добавляет штатный
+   `view_skill`, если есть session и builtin loader. Иначе полное содержимое Skills
+   добавляется в
    системный промпт. Эти же правила действуют для оркестратора и обычных моделей.
 
 В дочернем pipeline этот выбор — единственный источник прикреплённых Skills,
 включая пустой список. Удаление или замена Skills в базе обновляет контекст,
-собственный loader, его схему и allowlist уже при следующей подготовке в lazy
-и full режимах. Устаревшие `skillIds` из runtime-кэша Open WebUI, внешнего body,
-настроек Router или прежнего loader не восстанавливают отсоединённые Skills.
+подключение loader и его схему уже при следующей подготовке в lazy и full
+режимах. Устаревшие `skillIds` из runtime-кэша Open WebUI, внешнего body,
+настроек Router или прежнего loader не восстанавливают отсоединённые Skills
+в manifest или системном Skill context.
 Вне дочернего pipeline источники выбора Skills оркестратора и обычной модели
 сохраняют прежнее поведение.
 
@@ -270,16 +248,19 @@ Subagent Preparation. Один Function выполняет следующие э
 исключаются уже при следующей подготовке, включая продолжение текущего запроса.
 При доступном loader завершённые вызовы сохраняются по обычным правилам истории.
 
-Идентификаторы Skills приводятся к lowercase, пробелы по краям и повторы
-удаляются с сохранением порядка. Отсутствующий или неактивный Skill вызывает
+Прикреплённые идентификаторы Skills приводятся к lowercase; пробелы по краям
+и повторы удаляются с сохранением порядка. Отсутствующий или неактивный Skill вызывает
 ошибку. На каждом запуске подготовки Skills перечитываются, поэтому изменения
 инструкций и доступности отражаются в следующем запросе. Обычные Tools и MCP
 продолжают использовать request-scoped cache с прежними критериями модели и
 прикреплённых Tool/Skill IDs.
 
 Оркестратор передаёт builtin loader контекст Workspace Model owner. Для
-сабагента и обычной модели используется Execution user. Allowlist ограничивает
-выбор Skills, а штатный builtin сохраняет собственные проверки доступа.
+сабагента и обычной модели используется Execution user. Во всех трёх путях
+используется штатный builtin без дополнительной allowlist-обёртки: он проверяет
+существование, активность Skill и права переданного пользователя. Вызов может
+загрузить доступный этому пользователю Skill вне текущего manifest. Аргументы
+`view_skill` передаются штатному загрузчику без дополнительной нормализации.
 Module `BuiltinSkillLoader` в `handoff_router/shared/skill_preparation.py` предоставляет
 interface `load(skill_ids)`, используемый как существующий `load_builtin`
 в `SkillPreparation.prepare`. На каждую подготовку создаётся loader с
@@ -291,23 +272,22 @@ Lookup Workspace Model owner выполняется после проверки 
 вызывает переданный `get_builtin_tools` и применяет history adapter для Router.
 Standalone сохраняет сокращённый набор injections без Router history binding.
 Профили child и standalone передают `features` из metadata; orchestrator
-сохраняет вызов без аргумента `features`. Eligibility, allowlist, rendering,
+сохраняет вызов без аргумента `features`. Eligibility, rendering,
 fallback и установка loader остаются в `SkillPreparation`; нового кеша нет.
-Генератор встраивает общий module в Router, Skill Context и Subagent Preparation,
+Генератор встраивает общий module в Router и самостоятельный Skill Context,
 поэтому готовые Functions по-прежнему загружаются независимо.
 
 Чужой callable или schema с именем `view_skill` вызывает явный конфликт при
 подключении loader. Повторная подготовка заменяет собственный loader и Skill
 context; переход к полным инструкциям или очистка Skills удаляет старый loader.
 
-Настройки находятся в Valves **Subagent Preparation**:
+Настройки находятся в Valves **Lite Handoff Router**:
 
 | Параметр | По умолчанию | Назначение |
 |---|---:|---|
 | `history_turns` | `0` | Последние N прошлых пар «вопрос — ответ» |
 | `history_tool_calls` | `0` | Последние N завершённых вызовов этого агента с результатами |
-| `priority` | `-30` | Порядок относительно дополнительных inlet-фильтров |
-| `debug` | `False` | Диагностические сообщения фильтра |
+| `debug` | `False` | Общие логи маршрутизации и подготовки |
 
 Например, `history_turns=1` и `history_tool_calls=5` сохраняют один прошлый вопрос,
 итоговый ответ и не более пяти последних разрешённых завершённых Tool Calls
@@ -315,19 +295,18 @@ context; переход к полным инструкциям или очист
 независимо от исполнителя, а Tool-история принадлежит конкретному сабагенту.
 Текущий запрос и уже начатая Tool-цепочка сохраняются целиком независимо от лимитов.
 
-Valves хранятся на уровне экземпляра Function. Прикрепляйте один экземпляр
-Subagent Preparation ко всем сабагентам: изменение лимитов применяется к каждой
-модели. Per-model overrides, policy profiles и клонирование фильтра для разных
-лимитов в этой конфигурации не предусмотрены.
+Valves хранятся на уровне экземпляра Pipe Function. Изменение лимитов
+применяется ко всем его сабагентам. Per-model overrides и policy profiles
+в этой конфигурации не предусмотрены.
 
 ## Локальная проверка
 
 Общий исходник подготовки Skills находится в `handoff_router/shared/skill_preparation.py`.
 Блоки между `BEGIN GENERATED SKILL PREPARATION` и `END GENERATED SKILL PREPARATION`
-в `lite_handoff_router.py`, `subagent_preparation.py` и самостоятельном
+в `lite_handoff_router.py` и самостоятельном
 [Skill Context](../optional_filters/skill_context.py) генерируются из него. `SkillPreparation.install_context` заменяет прежний Skill
 context и устанавливает loader, сохраняя инструкции Workspace Model owner;
-эту операцию используют оба Skill inlet-адаптера. Меняйте общие правила в
+эту операцию используют Pipe и самостоятельный Skill Context. Меняйте общие правила в
 исходнике, затем обновляйте и коммитьте готовые Function-файлы:
 
 Команды ниже выполняются из корня репозитория.
@@ -338,7 +317,7 @@ python3 handoff_router/tools/generate_skill_preparation.py
 
 Жизненным циклом запроса управляет `RequestRuntime` из
 `handoff_router/shared/request_runtime.py`. Этот же генератор встраивает его в Router Preparation,
-Subagent Preparation, Registry, Router и самостоятельные контекстные фильтры
+Registry, Router и самостоятельные контекстные фильтры
 в блоках `GENERATED REQUEST RUNTIME`.
 Стадия Registry начинает новый запрос только после проверки конфигурации: сбрасывает
 состояние предыдущего Handoff, кэши, историю, флаги и свидетельство Router-цепочки,
@@ -387,7 +366,7 @@ exchanges в порядке Tool Results, их Tool executor, свидетель
 и оформление справочной записи остаются отдельно от разбора фактов.
 
 Генератор встраивает общий разбор в Router, Previous Tool Context, Tool Call
-Filter, Subagent Context, Router Preparation и Subagent Preparation в блоках `GENERATED TOOL HISTORY`.
+Filter, Subagent Context и Router Preparation в блоках `GENERATED TOOL HISTORY`.
 Общий исходник нужен только для разработки: каждый готовый Function по-прежнему
 загружается независимо.
 
@@ -404,9 +383,9 @@ Module `ToolContextProjection` предоставляет две независ�
 Операции не изменяют входные сообщения или metadata и не сохраняют состояние
 между вызовами. Каждая заново анализирует свои входные сообщения: после Tool Call
 Filter исходные позиции уже изменены. Subagent Context может вызываться отдельно,
-без предварительного ограничения Tools. Проверки входного body, Valves, порядок
-фильтров и lifecycle trace остаются в inlet adapter-ах. Генератор встраивает
-общий module в Tool Call Filter, Subagent Context и Subagent Preparation в блоках
+без предварительного ограничения Tools. Pipe задаёт порядок подготовки
+кодом; самостоятельные фильтры сохраняют свои inlet adapter-ы и Valves.
+Генератор встраивает общий module в Pipe, Tool Call Filter и Subagent Context в блоках
 `GENERATED TOOL CONTEXT`.
 
 Подготовка оркестратора и дочерней модели выполняется в обратимом переходе.
@@ -471,14 +450,15 @@ IDs, с прежней политикой кеша и совместимость
 При обновлении с 0.20.3 до **0.20.4** обновите Router и Skill Context:
 общий builtin Skill loader сохраняет пользователей, injections и историю
 каждого пути, с прежними Skill-политиками и свежей загрузкой.
-При обновлении до **0.21.0** используйте замену attachments обеих ролей из
-раздела установки: Router Preparation на Router, общий Subagent Preparation
-на адресатах. Все девять Functions с `GENERATED REQUEST RUNTIME` актуальны;
-для самостоятельных обычных моделей обновите соответствующие контекстные
-фильтры из `optional_filters/`.
-При обновлении с 0.21.0 до **0.21.1** достаточно обновить Pipe из
-`lite_handoff_router.py`: исправлена модель для вложенных запросов из Tools.
-Настройки, оба Preparation attachment-а и `lite_delegate` сохраняются.
+В **0.21.0** отдельные stages были объединены в Router Preparation и
+Subagent Preparation; **0.21.1** исправила модель для вложенных запросов из Tools.
+Эта конфигурация сохранена тегом `subagent-preparation-filter`.
+В **0.22.0** подготовка сабагента перенесена в Pipe, общие лимиты находятся в
+его Valves, а загрузку Skills выполняет штатный `view_skill` без allowlist.
+Восемь Functions с `GENERATED REQUEST RUNTIME` обновлены; при использовании
+самостоятельных обычных моделей обновите соответствующие фильтры из
+`optional_filters/`, прежде всего Skill Context с новым поведением загрузчика.
+Attachments и значения лимитов перенесите вручную по разделу установки.
 
 В `optional_filters/lite_subagent_registry.py` и `router_preparation.py`
 генератор встраивает только функцию
@@ -521,15 +501,14 @@ Skills и фильтров, публикацию до status, rollback и native
 binding и refresh: устаревшая внешняя история не заменяет подготовленный контекст,
 а `__files__` продолжает обновляться для синхронных и асинхронных Tools.
 Одна матрица Skill-политики проверяет `Pipe.pipe` и `Filter.inlet`: lazy/full
-eligibility, fallback, canonical IDs, ownership, allowlist, конфликты и freshness.
+eligibility, fallback, canonical attachment IDs, ownership, штатную загрузку и freshness.
 Тесты генератора проверяют read-only freshness check, воспроизводимость,
 сохранение независимого кода и импорт каждого Function без соседних модулей.
-`test_subagent_preparation.py` запускает реальные Router inlets и `Pipe.pipe`
-с единственным Subagent Preparation у адресата: общие лимиты двух моделей,
-Tool/executor isolation, Skills freshness, loader eligibility, callable-visible
-контекст после дополнительных фильтров, продолжения и rollback.
-`test_preparation_integration.py` выполняет оба новых фильтра вместе: Router
-получает только Router Preparation, а адресаты — общий Subagent Preparation.
+`test_inline_subagent_preparation.py` вызывает `Pipe.pipe` без обязательных
+фильтров сабагента: общие лимиты двух моделей, подготовка перед дополнительными
+фильтрами, окончательный callable-visible контекст и продолжения.
+`test_preparation_integration.py` запускает Router Preparation и Pipe с адресатами
+без preparation attachments.
 Проверяются переход оркестратор → Handoff, справочная запись и сохранение
 источника при её отключении, общие лимиты двух моделей, свежий выбор Skills,
 продолжения, сброс нового запроса и восстановление при ошибках.

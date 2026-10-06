@@ -1,4 +1,4 @@
-"""Select and reconstruct Tool context for independently uploaded Filters."""
+"""Select and reconstruct Tool context for independently uploaded Functions."""
 
 import copy
 from dataclasses import dataclass
@@ -124,7 +124,7 @@ class ToolContextProjection:
     def available_tools(body: dict) -> AvailableToolContext:
         """Select completed exchanges allowed by the current model context.
 
-        The inlet adapter validates the body first. Read its Tool schemas and
+        Preparation supplies a valid body. Read its Tool schemas and
         metadata without changing either; retain current copy/field semantics.
         """
         metadata = body.get("metadata", {})
@@ -182,7 +182,7 @@ class ToolContextProjection:
     ) -> list[dict]:
         """Limit past completed turns and exchanges without limiting the current request.
 
-        Counts are nonnegative, as enforced by the inlet Valves. This operation
+        Counts are nonnegative, as enforced by the caller's Valves. This operation
         also works without available-Tools selection having run beforehand.
         """
         history = analyze_history(messages)

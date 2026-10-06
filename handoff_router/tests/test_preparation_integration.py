@@ -1,4 +1,4 @@
-"""Both preparation Functions together through the public inlets and Pipe."""
+"""Router Preparation and automatic child preparation through the public Pipe."""
 
 import types
 from unittest.mock import AsyncMock
@@ -8,16 +8,9 @@ import test_router_preparation as router_preparation
 from test_capability_context import owui_callable, owui_refresh
 from test_handoff_history import assistant, call, marker, result, router
 from test_previous_turn_context import unpack_record
-from test_subagent_preparation import preparation_module
 
 
 class CombinedPreparationTests(router_preparation.RouterPreparationTests):
-    async def asyncSetUp(self):
-        await super().asyncSetUp()
-        self.child_preparation = preparation_module.Filter()
-        self.context_filter = self.child_preparation
-        self.filters = [self.child_preparation]
-
     async def load_nested_model_tool(self, request, ids, owner, extra_params):
         self.loaded_model_ids.append(extra_params["__metadata__"].get("model_id"))
 
@@ -220,8 +213,8 @@ class CombinedPreparationTests(router_preparation.RouterPreparationTests):
 
     async def test_both_roles_apply_common_history_limits_to_two_children_with_record_disabled(self):
         self.preparation.valves.enabled = False
-        self.child_preparation.valves.history_turns = 1
-        self.child_preparation.valves.history_tool_calls = 1
+        self.pipe.valves.history_turns = 1
+        self.pipe.valves.history_tool_calls = 1
         previous = [
             {"role": "user", "content": "Previous question"},
             assistant(call("delegate-a", "lite_delegate", agent_id="agent-a")),
@@ -272,7 +265,7 @@ class CombinedPreparationTests(router_preparation.RouterPreparationTests):
         self.assertEqual(self.routed["model"], "agent-a")
         loader = self.metadata["tools"]["view_skill"]["callable"]
         self.assertEqual(await loader(id="specialist"), "Loaded")
-        self.assertIn("error", await loader(id="route-a"))
+        self.assertEqual(await loader(id="route-a"), "Loaded")
         lookup = self.metadata["tools"]["lookup"]["callable"]
         self.assertEqual(self.loader.await_count, 2)
 

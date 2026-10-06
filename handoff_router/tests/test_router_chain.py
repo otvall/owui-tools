@@ -468,8 +468,8 @@ class RouterChainTests(PipeTestCase):
         self.assertEqual(self.metadata["platform"], "keep Pipe state")
 
     async def test_valid_chain_captures_history_and_survives_child_continuations(self):
-        self.context_filter.valves.history_turns = 1
-        self.context_filter.valves.history_tool_calls = 1
+        self.pipe.valves.history_turns = 1
+        self.pipe.valves.history_tool_calls = 1
         await self.router_inlets(self.body, registry=self.registry)
         pipeline = self.metadata["lite_router_filter_pipeline"]
         raw_history = self.metadata["lite_unfiltered_messages"]

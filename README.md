@@ -1,7 +1,7 @@
 # Инструменты для Open WebUI
 
 - [Handoff Router](handoff_router/README.md) — комплект маршрутизации между
-  оркестратором и сабагентами: один Pipe, два Preparation-фильтра и Tool
+  оркестратором и сабагентами: один Pipe, Router Preparation и Tool
   `lite_delegate`. Исходники, генератор и тесты находятся рядом в `handoff_router/`.
 - [Самостоятельные и прежние фильтры](optional_filters/README.md) — дополнительные
   Functions для обычных моделей и прежние адаптеры.
@@ -12,5 +12,5 @@
 Настройка модели в интерфейсе и готовый системный промпт находятся в
 [ROUTER_SETUP.md](handoff_router/ROUTER_SETUP.md).
 Сам промпт: [ROUTER_SYSTEM_PROMPT.md](handoff_router/ROUTER_SYSTEM_PROMPT.md).
-Четыре актуальных `.py`-файла для загрузки в Open WebUI лежат непосредственно
+Три актуальных `.py`-файла для загрузки в Open WebUI лежат непосредственно
 в `handoff_router/`.

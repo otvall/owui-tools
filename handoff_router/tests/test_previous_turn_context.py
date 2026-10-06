@@ -428,7 +428,6 @@ class ToolCallFilterTests(unittest.IsolatedAsyncioTestCase):
                 "tools": {"lookup": {}},
                 "lite_target_agent_id": "agent-a",
                 "lite_subagent_filter_run": True,
-                "lite_subagent_filter_pipeline": [],
             },
         }
         original = copy.deepcopy(body["messages"])
@@ -517,7 +516,6 @@ class SubagentContextFilterTests(unittest.IsolatedAsyncioTestCase):
             "metadata": {
                 "tool_call_filter_applied": True,
                 "lite_subagent_filter_run": True,
-                "lite_subagent_filter_pipeline": ["tool_call_filter"],
             },
         }
         await instance.inlet(body)
@@ -662,7 +660,7 @@ class SplitFilterPipelineTests(PipeTestCase):
         self.assertEqual({key: value for key, value in body.items() if key != "metadata"}, filtered)
         return self.routed
 
-    async def test_priorities_define_required_order(self):
+    async def test_standalone_filter_priorities(self):
         self.assertEqual(
             [
                 self.previous.valves.priority,
@@ -790,8 +788,8 @@ class SplitFilterPipelineTests(PipeTestCase):
             ]
 
     async def test_same_child_receives_native_history_after_cleanup(self):
-        self.child_context_filter.valves.history_turns = 1
-        self.child_context_filter.valves.history_tool_calls = 1
+        self.pipe.valves.history_turns = 1
+        self.pipe.valves.history_tool_calls = 1
         self.models["agent-b"].meta["toolIds"] = ["catalog-tools"]
         raw = previous_turn()
         raw[3]["content"] = marker("agent-b")

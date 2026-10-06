@@ -1,12 +1,12 @@
 # Настройка Router-модели и системный промпт
 
-Инструкция для актуального комплекта Handoff Router 0.21.1, рассчитанного на
+Инструкция для актуального комплекта Handoff Router 0.22.0, рассчитанного на
 Open WebUI 0.11.1. Пользователь выбирает одну Workspace Model `Router`, а Pipe
 вызывает модель-оркестратор или передаёт текущий запрос одному сабагенту.
 
 ## 1. Установите компоненты
 
-В **Admin Panel → Functions → Create** создайте три Functions, вставляя целиком
+В **Admin Panel → Functions → Create** создайте две Functions, вставляя целиком
 содержимое соответствующих файлов. Включите их после сохранения.
 Тип определяется по коду автоматически. Это стандартная установка
 [Functions в Open WebUI](https://docs.openwebui.com/features/extensibility/plugin/functions/).
@@ -15,7 +15,6 @@ Open WebUI 0.11.1. Пользователь выбирает одну Workspace 
 |---|---|---|
 | [lite_handoff_router.py](lite_handoff_router.py) | `lite_handoff_router` | Pipe |
 | [router_preparation.py](router_preparation.py) | `router_preparation` | Filter |
-| [subagent_preparation.py](subagent_preparation.py) | `subagent_preparation` | Filter |
 
 В **Workspace → Tools** создайте Tool с ID `lite_delegate` и вставьте код
 из [lite_delegate.py](lite_delegate.py). Tools устанавливаются в отдельном
@@ -23,7 +22,7 @@ Open WebUI 0.11.1. Пользователь выбирает одну Workspace 
 Если Tool уже установлен под другим ID, укажите этот ID в `base_tool_ids` ниже;
 имя вызываемого метода остаётся `lite_delegate`.
 
-У обоих Preparation-фильтров оставьте **Global выключенным**.
+У Router Preparation оставьте **Global выключенным**.
 Подкаталоги `shared/`, `tools/`, `tests/` в Open WebUI загружать не требуется.
 
 ## 2. Укажите модель-оркестратор в Valves Pipe
@@ -34,7 +33,9 @@ Open WebUI 0.11.1. Пользователь выбирает одну Workspace 
 |---|---|
 | `orchestrator_model_id` | Точный ID подключённой модели, поддерживающей native Tool calls |
 | `emit_handoff_status` | `true` — показывать статус передачи сабагенту |
-| `debug` | `false` для обычной работы |
+| `history_turns` | `0` — прошлые диалоговые туры сабагента отключены |
+| `history_tool_calls` | `0` — прошлые Tool exchanges отключены |
+| `debug` | `false` для обычной работы; включает логи маршрутизации и подготовки |
 
 `orchestrator_model_id` — модель, которая принимает решение о маршрутизации.
 Это отдельный ID реальной модели, а не ID Pipe `lite_handoff_router` и не ID
@@ -73,8 +74,11 @@ Open WebUI 0.11.1. Пользователь выбирает одну Workspace 
 
 - выберите его реальную Base Model;
 - задайте его собственный системный промпт и рабочие Tools, Skills, MCP, Knowledge;
-- прикрепите **Subagent Preparation**;
 - настройте доступ для пользователей Router.
+
+Подготовку сабагента автоматически выполняет Pipe. Прикреплять preparation
+фильтр к сабагенту не требуется. Дополнительные фильтры модели выполняются после
+подготовки, в их штатном порядке.
 
 В [Workspace → Skills](https://docs.openwebui.com/features/workspace/skills/)
 создайте активный routing Skill для каждого сабагента.
@@ -113,7 +117,7 @@ Model ID сабагента**, справа — **Routing Skill ID**. Добав
 Routing Skills Router получает из `SUBAGENTS` автоматически. Рабочие Skills
 сабагента выбираются отдельно в его карточке модели.
 
-## 5. Настройте Preparation-фильтры
+## 5. Настройте Router Preparation
 
 Для минимального запуска задайте Valves **Router Preparation**:
 
@@ -146,11 +150,10 @@ Routing Skills Router получает из `SUBAGENTS` автоматическ
 не создаются автоматически; оставлять их в Valves можно только при наличии
 соответствующих активных Skills.
 
-У **Subagent Preparation** оставьте начальные значения:
+Лимиты истории находятся в Valves **Lite Handoff Router**; начальные значения:
 
 ```json
 {
-  "priority": -30,
   "history_turns": 0,
   "history_tool_calls": 0,
   "debug": false
@@ -163,13 +166,14 @@ Routing Skills Router получает из `SUBAGENTS` автоматическ
 
 Если обновляете прежнюю установку, снимите с Router фильтры **Lite Subagent
 Registry**, **Previous Tool Context**, **History Cleanup**, а с сабагентов —
-**Tool Call Filter**, **Subagent Context**, **Skill Context**. Снимите также
+**Subagent Preparation**, **Tool Call Filter**, **Subagent Context**, **Skill Context**.
+Перенесите прежние `history_turns` и `history_tool_calls` в Valves Pipe. Снимите также
 их Global attachments. Таблица attachments актуального комплекта:
 
 | Workspace Model | Preparation-фильтр |
 |---|---|
 | Router | Router Preparation |
-| Каждый сабагент | Subagent Preparation |
+| Каждый сабагент | Подготовка автоматически внутри Pipe |
 
 ## Готовый системный промпт
 

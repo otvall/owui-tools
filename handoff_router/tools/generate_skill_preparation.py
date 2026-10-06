@@ -12,13 +12,13 @@ OPTIONAL_TARGETS = (
     "skill_context.py", "lite_subagent_registry.py", "previous_tool_context.py",
     "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
 )
-TARGETS = ("lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py", "router_preparation.py", "subagent_preparation.py")
+TARGETS = ("lite_handoff_router.py", "skill_context.py", "lite_subagent_registry.py", "router_preparation.py")
 NORMALIZATION_TARGETS = ("lite_subagent_registry.py", "router_preparation.py")
 RUNTIME_TARGETS = TARGETS + (
     "previous_tool_context.py", "history_cleanup.py", "tool_call_filter.py", "subagent_context.py",
 )
-HISTORY_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py", "previous_tool_context.py", "router_preparation.py", "subagent_preparation.py")
-CONTEXT_TARGETS = ("tool_call_filter.py", "subagent_context.py", "subagent_preparation.py")
+HISTORY_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py", "previous_tool_context.py", "router_preparation.py")
+CONTEXT_TARGETS = ("tool_call_filter.py", "subagent_context.py", "lite_handoff_router.py")
 STAGE_TARGETS = {
     "REGISTRY PREPARATION": ("shared/registry_preparation.py", ("lite_subagent_registry.py", "router_preparation.py")),
     "PREVIOUS TOOL CONTEXT": ("shared/previous_tool_context.py", ("previous_tool_context.py", "router_preparation.py")),

@@ -1,7 +1,7 @@
 """
 title: Lite Handoff Router
 description: Stateless same-response subagent handoff router.
-version: 0.21.1
+version: 0.22.0
 required_open_webui_version: 0.11.1
 """
 
@@ -124,7 +124,7 @@ class RequestRuntime:
         "lite_router_filter_pipeline", "lite_router_request_key", "lite_context_filter_request_key",
         "previous_tool_context_applied", "history_cleanup_applied",
         "tool_call_filter_applied", "subagent_context_applied", "skill_context_applied",
-        "lite_subagent_filter_pipeline", "lite_subagent_filter_run",
+        "lite_subagent_filter_run",
         "lite_target_agent_id", "lite_target_model_id", "lite_target_skill_ids",
         "lite_view_skill_available", "lite_view_skill_model_id", "lite_skill_loader",
     )
@@ -141,11 +141,6 @@ class RequestRuntime:
         "lite_registry": "Lite Subagent Registry",
         "previous_tool_context": "Previous Tool Context",
         "history_cleanup": "History Cleanup",
-    }
-    CHILD_FILTERS = {
-        "tool_call_filter": "Tool Call Filter",
-        "subagent_context": "Subagent Context",
-        "skill_context": "Skill Context",
     }
 
     def __init__(self, request, metadata: dict):
@@ -332,22 +327,12 @@ class RequestRuntime:
 
     @contextmanager
     def child_filters(self) -> Iterator[None]:
-        self.discard(*(name + "_applied" for name in self.CHILD_FILTERS))
-        self.sync(lite_subagent_filter_pipeline=[], lite_subagent_filter_run=True)
+        """Scope destination inlets without changing the Router's inlet evidence."""
+        self.sync(lite_subagent_filter_run=True)
         try:
             yield
         finally:
             self.discard("lite_subagent_filter_run")
-        missing = [label for name, label in self.CHILD_FILTERS.items() if not self.metadata.get(name + "_applied")]
-        if missing:
-            raise ValueError(
-                "Required subagent filters are not attached to the destination model: " + ", ".join(missing)
-            )
-        actual_order = self.metadata.get("lite_subagent_filter_pipeline")
-        if actual_order != list(self.CHILD_FILTERS):
-            raise ValueError(
-                "Subagent filters ran in the wrong order: " + " -> ".join(str(item) for item in actual_order or [])
-            )
 
     def before_filter(self, name: str) -> None:
         if name in self.ROUTER_FILTERS:
@@ -373,20 +358,10 @@ class RequestRuntime:
                 required = " and ".join(self.ROUTER_FILTERS[item] for item in prior)
                 raise ValueError(f"{required} must run before {self.ROUTER_FILTERS[name]} in the Router inlet chain")
             return
-        if not self.metadata.get("lite_subagent_filter_run"):
-            return
-        sequence = list(self.CHILD_FILTERS)
-        prior = sequence[:sequence.index(name)]
-        pipeline = self.metadata.get("lite_subagent_filter_pipeline") or []
-        if prior and pipeline[-len(prior):] != prior:
-            required = " and ".join(self.CHILD_FILTERS[item] for item in prior)
-            raise ValueError(f"{required} must run before {self.CHILD_FILTERS[name]}")
 
     def finish_filter(self, name: str, **values) -> None:
         self.metadata.update(values)
         self.metadata[name + "_applied"] = True
-        if name in self.CHILD_FILTERS and self.metadata.get("lite_subagent_filter_run"):
-            self.metadata.setdefault("lite_subagent_filter_pipeline", []).append(name)
         if (
             name in self.ROUTER_FILTERS and self.metadata.get("lite_registry_applied")
             and not self.metadata.get("lite_subagent_filter_run")
@@ -660,6 +635,222 @@ def analyze_history(messages: list[dict], *, registry: dict | None = None) -> To
     return ToolHistory(tuple(user_indices), tuple(exchanges))
 # END GENERATED TOOL HISTORY
 
+# BEGIN GENERATED TOOL CONTEXT
+# Edit handoff_router/shared/tool_context.py; run python3 handoff_router/tools/generate_skill_preparation.py
+"""Select and reconstruct Tool context for independently uploaded Functions."""
+
+import copy
+from dataclasses import dataclass
+
+
+
+@dataclass(frozen=True)
+class AvailableToolContext:
+    messages: list[dict]
+    allowed_tool_names: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _CompletedTurn:
+    start: int
+    end: int
+    final_answer: int
+
+
+@dataclass(frozen=True)
+class _ContextSelection:
+    exchanges: tuple[ToolExchange, ...]
+    current_user: int
+    handoff_end: int = -1
+    # None selects available Tools; a tuple selects completed historical turns.
+    turns: tuple[_CompletedTurn, ...] | None = None
+
+
+def _visible_assistant(message: dict) -> bool:
+    content = message.get("content")
+    return bool(
+        (content.strip() if isinstance(content, str) else content)
+        or message.get("tool_calls")
+        or message.get("reasoning_content")
+        or message.get("thinking")
+    )
+
+
+def _render_context(messages: list[dict], selection: _ContextSelection) -> list[dict]:
+    """Emit selected occurrences in source order with two fixed text profiles.
+
+    Available-Tools selection preserves ordinary messages and assistant fields.
+    Historical selection emits only chosen questions, final answers and minimal
+    Tool messages, then copies the whole current continuation without filtering.
+    """
+    selected_calls = {(item.message_index, item.call_index) for item in selection.exchanges}
+    selected_results = {item.result_index for item in selection.exchanges}
+    historical = selection.turns is not None
+    current_user = selection.current_user
+    marker_index = selection.handoff_end
+    questions = {turn.start for turn in selection.turns or ()}
+    answers = {turn.final_answer for turn in selection.turns or ()}
+    message_indices = (
+        (index for turn in selection.turns or () for index in range(turn.start, turn.end))
+        if historical else range(len(messages))
+    )
+    recovered_calls = [
+        messages[item.message_index]["tool_calls"][item.call_index]
+        for item in sorted(selection.exchanges, key=lambda item: (item.message_index, item.call_index))
+        if current_user < item.message_index < marker_index
+    ]
+    rendered = (
+        [copy.deepcopy(message) for message in messages[:current_user] if message.get("role") == "system"]
+        if historical else []
+    )
+
+    for index in message_indices:
+        original = messages[index]
+        if not historical and current_user < index <= marker_index:
+            # OWUI may group child calls before the selected Handoff result.
+            if index == marker_index and recovered_calls:
+                rendered.append({"role": "assistant", "content": "", "tool_calls": recovered_calls})
+            continue
+
+        role = original.get("role")
+        if role == "assistant" and original.get("tool_calls"):
+            kept = [
+                call for call_index, call in enumerate(original["tool_calls"])
+                if (index, call_index) in selected_calls
+            ]
+            if historical:
+                if kept:
+                    rendered.append({
+                        "role": "assistant", "content": "",
+                        "tool_calls": [copy.deepcopy(call) for call in kept],
+                    })
+            else:
+                message = dict(original)
+                message["tool_calls"] = kept
+                if not kept:
+                    if index < current_user:
+                        # Excluded Tool narration must not become a final answer.
+                        continue
+                    message.pop("tool_calls", None)
+                    message.pop("reasoning_items", None)
+                if _visible_assistant(message):
+                    rendered.append(message)
+        elif role == "tool":
+            if index in selected_results:
+                rendered.append(copy.deepcopy(original) if historical else original)
+        elif historical:
+            if index in questions and role == "user":
+                rendered.append(copy.deepcopy(original))
+            elif index in answers:
+                rendered.append({"role": "assistant", "content": copy.deepcopy(original.get("content"))})
+        else:
+            rendered.append(original)
+
+    if historical:
+        rendered.extend(copy.deepcopy(messages[current_user:]))
+    return rendered
+
+
+class ToolContextProjection:
+    """Two pure transformations; neither retains state or changes its input.
+
+    Each operation analyzes its own input. Occurrence indices never escape this
+    module or survive a transformation of the messages they refer to.
+    """
+
+    @staticmethod
+    def available_tools(body: dict) -> AvailableToolContext:
+        """Select completed exchanges allowed by the current model context.
+
+        Preparation supplies a valid body. Read its Tool schemas and
+        metadata without changing either; retain current copy/field semantics.
+        """
+        metadata = body.get("metadata", {})
+        messages = body["messages"]
+        allowed_names = {
+            str(((schema or {}).get("function") or {}).get("name") or "").strip()
+            for schema in body.get("tools") or []
+        }
+        allowed_names.update(str(name or "").strip() for name in (metadata.get("tools") or {}))
+        if (
+            metadata.get("lite_view_skill_available")
+            and metadata.get("lite_view_skill_model_id") == metadata.get("lite_target_model_id")
+        ):
+            allowed_names.add("view_skill")
+        allowed_names.discard("")
+        registry = metadata.get("lite_agents")
+        registry = registry if isinstance(registry, dict) else {}
+        target_agent = str(metadata.get("lite_target_agent_id") or "").strip()
+        history = analyze_history(messages, registry=registry)
+        current_user = history.current_user_index
+        selected_agent = resolve_agent_id(target_agent, registry)
+        marker_index = -1
+        if current_user >= 0 and target_agent:
+            for exchange in history.exchanges:
+                if exchange.message_index <= current_user or exchange.handoff is None:
+                    continue
+                destination = exchange.handoff.agent_id if registry else exchange.handoff.declared_agent_id
+                if destination and destination == (selected_agent or target_agent):
+                    marker_index = max(marker_index, exchange.result_index)
+
+        accepted = []
+        for exchange in history.exchanges:
+            call = messages[exchange.message_index]["tool_calls"][exchange.call_index]
+            name = str((call.get("function") or {}).get("name") or "").strip()
+            if name not in allowed_names:
+                continue
+            if registry and target_agent and exchange.executor.kind == "unknown":
+                continue
+            if exchange.message_index < current_user:
+                if target_agent and (
+                    name == "lite_delegate" or exchange.executor.kind != "subagent"
+                    or exchange.executor.agent_id != selected_agent
+                ):
+                    continue
+            elif exchange.result_index <= marker_index:
+                continue
+            accepted.append(exchange)
+
+        selection = _ContextSelection(tuple(accepted), current_user, marker_index)
+        return AvailableToolContext(_render_context(messages, selection), frozenset(allowed_names))
+
+    @staticmethod
+    def completed_history(
+        messages: list[dict], *, history_turns: int, history_tool_calls: int,
+    ) -> list[dict]:
+        """Limit past completed turns and exchanges without limiting the current request.
+
+        Counts are nonnegative, as enforced by the caller's Valves. This operation
+        also works without available-Tools selection having run beforehand.
+        """
+        history = analyze_history(messages)
+        indices = history.user_indices
+        if not indices:
+            return list(messages)
+
+        completed = []
+        for start, end in zip(indices[:-1], indices[1:]):
+            final_answer = next(
+                (
+                    index for index in range(end - 1, start - 1, -1)
+                    if messages[index].get("role") == "assistant"
+                    and messages[index].get("content")
+                    and not messages[index].get("tool_calls")
+                ),
+                -1,
+            )
+            if final_answer >= 0:
+                completed.append(_CompletedTurn(start, end, final_answer))
+        turns = tuple(completed[-history_turns:]) if history_turns else ()
+        exchanges = [
+            exchange for exchange in history.exchanges
+            if any(turn.start <= exchange.message_index < exchange.result_index < turn.end for turn in turns)
+        ]
+        exchanges = exchanges[-history_tool_calls:] if history_tool_calls else []
+        selection = _ContextSelection(tuple(exchanges), indices[-1], turns=turns)
+        return _render_context(messages, selection)
+# END GENERATED TOOL CONTEXT
+
 # BEGIN GENERATED SKILL PREPARATION
 # Edit handoff_router/shared/skill_preparation.py; run python3 handoff_router/tools/generate_skill_preparation.py
 """Authoritative Skill preparation, embedded into independently uploaded Functions."""
@@ -883,19 +1074,7 @@ class SkillPreparation:
             and (metadata.get("params") or {}).get("function_calling") != "legacy"
             and (meta.get("capabilities") or {}).get("builtin_tools", True) is not False
         )
-        builtin = (await load_builtin(ids)).get("view_skill") if ids and eligible else None
-        loader = None
-        if builtin is not None:
-            allowed = frozenset(ids)
-            builtin_callable = builtin["callable"]
-
-            async def allowlisted_view_skill(id: str):
-                requested_id = next(iter(normalize_skill_ids([id])), "")
-                if requested_id not in allowed:
-                    return '{"error":"Skill is not available in the current model context"}'
-                return await builtin_callable(id=requested_id)
-
-            loader = {**builtin, "callable": allowlisted_view_skill}
+        loader = (await load_builtin(ids)).get("view_skill") if ids and eligible else None
 
         entries = []
         for skill_id, skill in skills:
@@ -1439,7 +1618,6 @@ class ChildFilterPipeline:
         runtime_model: dict,
         runtime: RequestRuntime,
         context: InvocationContext,
-        prepared_skills: PreparedSkills,
     ) -> dict:
         metadata = runtime.metadata
         user_data = (
@@ -1455,7 +1633,6 @@ class ChildFilterPipeline:
             "__oauth_token__": context.oauth_token,
             "__request__": context.request,
             "__model__": runtime_model,
-            "__prepared_skills__": prepared_skills,
             "__chat_id__": metadata.get("chat_id"),
             "__message_id__": metadata.get("message_id"),
         }
@@ -1482,13 +1659,14 @@ class ChildFilterPipeline:
 class ChildRequestBuilder:
     """Prepare a destination request, including capabilities, reuse and filters."""
 
-    def __init__(self):
+    def __init__(self, debug: Callable[..., None]):
         self._capabilities = ModelCapabilityResolver(McpRuntime())
         self._workspace_models = WorkspaceModelPreparation(
             lookup_model=lambda model_id: Models.get_model_by_id(model_id),
             capability_resolver=self._capabilities,
         )
         self._filters = ChildFilterPipeline()
+        self._debug = debug
 
     @staticmethod
     def agent_registry(metadata: dict) -> dict[str, AgentSpec]:
@@ -1517,6 +1695,8 @@ class ChildRequestBuilder:
         registry: dict[str, AgentSpec],
         runtime: RequestRuntime,
         context: InvocationContext,
+        history_turns: int,
+        history_tool_calls: int,
     ) -> tuple[dict, AgentSpec]:
         agent_id = resolve_agent_id(marker.agent_id, runtime.metadata.get("lite_agents") or {})
         agent = registry.get(agent_id) if agent_id is not None else None
@@ -1588,12 +1768,23 @@ class ChildRequestBuilder:
             lite_view_skill_available=prepared_skills.loader is not None,
             lite_view_skill_model_id=agent.model_id if prepared_skills.loader is not None else None,
         )
+        before_count = len(routed_body["messages"])
+        projection = ToolContextProjection.available_tools(routed_body)
+        routed_body["messages"] = ToolContextProjection.completed_history(
+            projection.messages, history_turns=history_turns,
+            history_tool_calls=history_tool_calls,
+        )
+        SkillPreparation.install_context(prepared_skills, routed_body, runtime_model)
+        self._debug(
+            "child preparation model=%s allowed=%s turns=%s tools=%s messages before=%s after=%s",
+            agent.model_id, sorted(projection.allowed_tool_names), history_turns,
+            history_tool_calls, before_count, len(routed_body["messages"]),
+        )
         routed_body = await self._filters.run(
             body=routed_body,
             runtime_model=runtime_model,
             runtime=runtime,
             context=context,
-            prepared_skills=prepared_skills,
         )
         prepared.body = routed_body
         return routed_body, agent
@@ -1665,13 +1856,21 @@ class Pipe:
             default=True,
             description="Emit visible status on subagent handoff.",
         )
+        history_turns: int = Field(
+            default=0, ge=0,
+            description="Completed previous user/assistant turns to retain for every subagent.",
+        )
+        history_tool_calls: int = Field(
+            default=0, ge=0,
+            description="Maximum completed Tool call occurrences inside retained previous turns; repeated IDs count separately.",
+        )
         debug: bool = Field(default=False, description="Enable debug logs.")
 
     def __init__(self):
         self.valves = self.Valves()
         self._protocol = HandoffProtocol()
         self._capabilities = ModelCapabilityResolver(McpRuntime())
-        self._child_builder = ChildRequestBuilder()
+        self._child_builder = ChildRequestBuilder(self._debug)
         self._gateway = CompletionGateway()
 
     def _debug(self, message: str, *args) -> None:
@@ -1812,6 +2011,8 @@ class Pipe:
                 registry=registry,
                 runtime=runtime,
                 context=context,
+                history_turns=self.valves.history_turns,
+                history_tool_calls=self.valves.history_tool_calls,
             )
         if self.valves.emit_handoff_status and context.event_emitter:
             try:

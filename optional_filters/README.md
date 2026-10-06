@@ -2,7 +2,7 @@
 
 В этой папке находятся дополнительные Functions для обычных моделей и прежний
 адаптер Registry. Актуальный [Handoff Router](../handoff_router/README.md)
-содержит один Pipe, Router Preparation, Subagent Preparation и Tool `lite_delegate`.
+содержит один Pipe, Router Preparation и Tool `lite_delegate`.
 
 Все `.py`-файлы загружаются в Open WebUI независимо, без соседних Python-модулей.
 
@@ -19,7 +19,10 @@
 
 Skill Context можно прикреплять к обычным моделям без Router Pipe.
 Tool Call Filter, Subagent Context и Skill Context сохраняют свои самостоятельные
-Valves. В актуальном Router их обязанности выполняет Subagent Preparation.
+Valves. В актуальном Router подготовка сабагентов выполняется внутри Pipe.
+Skill Context использует штатный `view_skill` Open WebUI: доступность загрузки
+Skill определяется его активностью и правами пользователя, без дополнительной
+проверки принадлежности текущему manifest.
 
 ## Прежний адаптер Registry
 
@@ -61,8 +64,9 @@ Tool-цепочка не повреждается.
 ходов задаётся Valve `history_turns` (по умолчанию `5`).
 
 Не подключайте Tool Call Tombstone Context одновременно с History Cleanup или
-Subagent Context или Subagent Preparation: они реализуют взаимоисключающие
-политики истории. Фильтр
+Subagent Context: они реализуют взаимоисключающие политики истории. В Router
+подготовку истории выполняет Pipe; Tombstone Context предназначен для обычных
+чатов. Фильтр
 предоставляет модели старые ID как контекст, но продолжение числового счётчика
 остаётся поведением конкретной модели или backend. Если ID всё равно повторяются,
 их нужно переназначать на UUID до исполнения и сохранения Tool Call.
