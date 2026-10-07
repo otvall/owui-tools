@@ -1,111 +1,111 @@
-"try{"
+import json
+from typing import Any
 
-            "if(window.parent && window.parent!==window){"
 
-                "var host=window.parent;"
+def _build_tool_data_bridge(
+    result: Any,
+    title: str,
+    tool_id: str,
+) -> str:
+    data_json = _safe_json_for_html(result)
+    title_json = json.dumps(title, ensure_ascii=False)
+    tool_id_json = json.dumps(tool_id, ensure_ascii=False)
 
-                # Создаем registry один раз на уровне OWUI
+    return (
+        '<script id="iv-tool-data" type="application/json">'
+        f"{data_json}"
+        "</script>"
+
+        "<script>(function(){"
+
+        # -------------------------
+        # getToolData
+        # -------------------------
+        "function read(id){"
+            "var el=document.getElementById(id);"
+            "if(!el)return null;"
+            "try{return JSON.parse(el.textContent);}"
+            "catch(e){return null;}"
+        "}"
+
+        "var data=read('iv-tool-data');"
+        "window.getToolData=function(){return data;};"
+
+        # -------------------------
+        # metadata
+        # -------------------------
+        f"var title={title_json};"
+        f"var toolId={tool_id_json};"
+
+        # -------------------------
+        # registry
+        # -------------------------
+        "try{"
+            "var host=window.parent;"
+
+            "if(host && host!==window){"
+
+                # создаём registry один раз
                 "if(!host.__OWUI_VIZ_REGISTRY__){"
-
                     "var items=new Map();"
 
                     "host.__OWUI_VIZ_REGISTRY__={"
 
                         "register:function(entry){"
-                            "items.set(entry.id,entry);"
-                        "},"
-
-                        "unregister:function(id,sourceWindow){"
-                            "var current=items.get(id);"
-                            "if(current && current.sourceWindow===sourceWindow){"
-                                "items.delete(id);"
-                            "}"
+                            "var key=entry.messageId+':'+entry.toolId;"
+                            "items.set(key,entry);"
                         "},"
 
                         "list:function(){"
-                            "return Array.from(items.values()).map(function(entry){"
-                                "return {"
-                                    "id:entry.id,"
-                                    "messageId:entry.messageId,"
-                                    "embedIndex:entry.embedIndex"
-                                "};"
-                            "});"
-                        "},"
-
-                        "getData:function(id){"
-                            "var entry=items.get(id);"
-                            "if(!entry){"
-                                "throw new Error('Visualization not found: '+id);"
-                            "}"
-                            "return entry.getToolData();"
+                            "return Array.from(items.values());"
                         "}"
 
                     "};"
                 "}"
 
+                # -------------------------
+                # получаем messageId
+                # -------------------------
+                "var frame=window.frameElement;"
 
-                # -------------------------------------------------
-                # Ищем id текущего embed
-                # OWUI: {messageId}-embeds-{N}
-                # -------------------------------------------------
+                "var msgEl="
+                    "frame && "
+                    "frame.closest && "
+                    "frame.closest('[id^=\"message-\"]');"
 
-                "function resolveEmbed(){"
+                "var messageId=null;"
 
-                    "try{"
-
-                        "var el=window.frameElement;"
-
-                        "while(el){"
-
-                            "var id=el.id||'';"
-
-                            "var match=id.match(/^(.*)-embeds-(\\d+)$/);"
-
-                            "if(match){"
-                                "return {"
-                                    "id:id,"
-                                    "messageId:match[1],"
-                                    "embedIndex:Number(match[2])"
-                                "};"
-                            "}"
-
-                            "el=el.parentElement;"
-                        "}"
-
-                    "}catch(e){}"
-
-                    "return null;"
+                "if(msgEl && msgEl.id){"
+                    "messageId=msgEl.id.replace(/^message-/,'');"
                 "}"
 
-
-                "var info=resolveEmbed();"
-
-                "if(info){"
+                # -------------------------
+                # регистрация
+                # -------------------------
+                "if(messageId){"
 
                     "host.__OWUI_VIZ_REGISTRY__.register({"
-                        "id:info.id,"
-                        "messageId:info.messageId,"
-                        "embedIndex:info.embedIndex,"
-                        "sourceWindow:window,"
-                        "getToolData:function(){"
-                            "return window.getToolData();"
-                        "}"
+                        "title:title,"
+                        "messageId:messageId,"
+                        "toolId:toolId"
                     "});"
 
-                    # cleanup
-                    "window.addEventListener('pagehide',function(){"
-                        "host.__OWUI_VIZ_REGISTRY__.unregister("
-                            "info.id,"
-                            "window"
-                        ");"
-                    "},{once:true});"
+                    "console.debug("
+                        "'[viz-registry] registered',"
+                        "{title:title,messageId:messageId,toolId:toolId}"
+                    ");"
 
                 "}else{"
-                    "console.warn('[viz-registry] Could not resolve embed id');"
+                    "console.warn("
+                        "'[viz-registry] messageId not found'"
+                    ");"
                 "}"
 
             "}"
 
         "}catch(e){"
-            "console.warn('[viz-registry] Registration failed',e);"
+            "console.error('[viz-registry]',e);"
         "}"
+
+        "})();</script>"
+    )
