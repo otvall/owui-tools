@@ -1,0 +1,111 @@
+"try{"
+
+            "if(window.parent && window.parent!==window){"
+
+                "var host=window.parent;"
+
+                # Создаем registry один раз на уровне OWUI
+                "if(!host.__OWUI_VIZ_REGISTRY__){"
+
+                    "var items=new Map();"
+
+                    "host.__OWUI_VIZ_REGISTRY__={"
+
+                        "register:function(entry){"
+                            "items.set(entry.id,entry);"
+                        "},"
+
+                        "unregister:function(id,sourceWindow){"
+                            "var current=items.get(id);"
+                            "if(current && current.sourceWindow===sourceWindow){"
+                                "items.delete(id);"
+                            "}"
+                        "},"
+
+                        "list:function(){"
+                            "return Array.from(items.values()).map(function(entry){"
+                                "return {"
+                                    "id:entry.id,"
+                                    "messageId:entry.messageId,"
+                                    "embedIndex:entry.embedIndex"
+                                "};"
+                            "});"
+                        "},"
+
+                        "getData:function(id){"
+                            "var entry=items.get(id);"
+                            "if(!entry){"
+                                "throw new Error('Visualization not found: '+id);"
+                            "}"
+                            "return entry.getToolData();"
+                        "}"
+
+                    "};"
+                "}"
+
+
+                # -------------------------------------------------
+                # Ищем id текущего embed
+                # OWUI: {messageId}-embeds-{N}
+                # -------------------------------------------------
+
+                "function resolveEmbed(){"
+
+                    "try{"
+
+                        "var el=window.frameElement;"
+
+                        "while(el){"
+
+                            "var id=el.id||'';"
+
+                            "var match=id.match(/^(.*)-embeds-(\\d+)$/);"
+
+                            "if(match){"
+                                "return {"
+                                    "id:id,"
+                                    "messageId:match[1],"
+                                    "embedIndex:Number(match[2])"
+                                "};"
+                            "}"
+
+                            "el=el.parentElement;"
+                        "}"
+
+                    "}catch(e){}"
+
+                    "return null;"
+                "}"
+
+
+                "var info=resolveEmbed();"
+
+                "if(info){"
+
+                    "host.__OWUI_VIZ_REGISTRY__.register({"
+                        "id:info.id,"
+                        "messageId:info.messageId,"
+                        "embedIndex:info.embedIndex,"
+                        "sourceWindow:window,"
+                        "getToolData:function(){"
+                            "return window.getToolData();"
+                        "}"
+                    "});"
+
+                    # cleanup
+                    "window.addEventListener('pagehide',function(){"
+                        "host.__OWUI_VIZ_REGISTRY__.unregister("
+                            "info.id,"
+                            "window"
+                        ");"
+                    "},{once:true});"
+
+                "}else{"
+                    "console.warn('[viz-registry] Could not resolve embed id');"
+                "}"
+
+            "}"
+
+        "}catch(e){"
+            "console.warn('[viz-registry] Registration failed',e);"
+        "}"
